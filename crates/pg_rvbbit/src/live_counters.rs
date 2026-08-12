@@ -23,9 +23,9 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use pgrx::prelude::*;
 use pgrx::atomics::PgAtomic;
 use pgrx::lwlock::PgLwLock;
+use pgrx::prelude::*;
 use pgrx::shmem::PGRXSharedMemory;
 
 /// Max backends tracked. ProcNumber indexes this array; sized comfortably above
@@ -57,8 +57,15 @@ struct Slot {
 }
 unsafe impl PGRXSharedMemory for Slot {}
 
-const EMPTY_OP: OpEntry = OpEntry { name: [0u8; NAMELEN], calls: 0 };
-const EMPTY_SLOT: Slot = Slot { pid: 0, stmt_start: 0, ops: [EMPTY_OP; NOPS] };
+const EMPTY_OP: OpEntry = OpEntry {
+    name: [0u8; NAMELEN],
+    calls: 0,
+};
+const EMPTY_SLOT: Slot = Slot {
+    pid: 0,
+    stmt_start: 0,
+    ops: [EMPTY_OP; NOPS],
+};
 
 static LIVE: PgLwLock<[Slot; NSLOTS]> = unsafe { PgLwLock::new(c"rvbbit_live_call_counts") };
 
@@ -181,14 +188,8 @@ pub fn tick(op_name: &str, n: u64) {
 /// specific running query. Counts persist after a query ends until that backend
 /// starts its next query (so filter by the active pid on the read side).
 #[pg_extern]
-fn live_call_counts() -> TableIterator<
-    'static,
-    (
-        name!(pid, i32),
-        name!(operator, String),
-        name!(calls, i64),
-    ),
-> {
+fn live_call_counts(
+) -> TableIterator<'static, (name!(pid, i32), name!(operator, String), name!(calls, i64))> {
     if !SHMEM_READY.load(Ordering::Relaxed) {
         return TableIterator::new(Vec::new());
     }

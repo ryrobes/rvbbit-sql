@@ -3,9 +3,15 @@
 
   const $ = (selector, root = document) => root.querySelector(selector);
   const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
+  const SETUP_MODE = document.body.dataset.calliopeMode === "setup";
   const els = {
     sessionList: $("#session-list"),
     sessionSearch: $("#session-search"),
+    setupRail: $("#setup-rail"),
+    setupTodoList: $("#setup-todo-list"),
+    setupProgressLabel: $("#setup-progress-label"),
+    setupProgressBar: $("#setup-progress-bar"),
+    setupStageControls: $("#setup-stage-controls"),
     inboxOpen: $("#work-inbox-open"),
     inboxCount: $("#work-inbox-count"),
     inboxDialog: $("#work-inbox-dialog"),
@@ -13,6 +19,12 @@
     inboxRefresh: $("#work-inbox-refresh"),
     inboxAck: $("#work-inbox-ack"),
     inboxSchedule: $("#work-inbox-schedule"),
+    inboxTitle: $("#work-inbox-title"),
+    inboxCopy: $("#work-inbox-copy"),
+    inboxModes: $("#work-inbox-modes"),
+    inboxModeCount: $("#work-inbox-mode-count"),
+    assignedModeCount: $("#work-assigned-mode-count"),
+    playbookModeCount: $("#work-playbook-mode-count"),
     inboxFilters: $("#work-inbox-filters"),
     inboxSummary: $("#work-inbox-summary"),
     inboxList: $("#work-inbox-list"),
@@ -142,9 +154,14 @@
     sessionResizer: $("#session-resizer"),
     chatResizer: $("#chat-resizer"),
     stageScroll: $("#stage-scroll"),
+    sketchShelf: $("#sketch-shelf"),
+    sketchDialog: $("#sketch-workspace-dialog"),
+    sketchWorkspace: $("#sketch-workspace-content"),
     stage: $("#stage"),
     stageEmpty: $("#stage-empty"),
     stageEmptyHeadline: $("#stage-empty-headline"),
+    stageEmptyCopy: $("#stage-empty-copy"),
+    stageEyebrow: $("#stage-eyebrow"),
     surfaceCount: $("#surface-count"),
     googleSheetImport: $("#google-sheet-import"),
     googleDocumentImport: $("#google-document-import"),
@@ -179,6 +196,8 @@
     evidenceSearchSubmit: $("#evidence-search-submit"),
     messages: $("#messages"),
     chatEmpty: $("#chat-empty"),
+    chatEmptyCopy: $("#chat-empty-copy"),
+    chatEyebrow: $("#chat-eyebrow"),
     status: $("#calliope-status"),
     avatar: $("#calliope-avatar"),
     toolActivity: $("#tool-activity"),
@@ -357,6 +376,8 @@
   const VOICE_STORAGE_KEY = "rvbbit-calliope-voice-v1";
   const TURN_COMPLETED_EVENT = "calliope.turn.completed";
   const ACTIVE_TURN_STORAGE_KEY = "rvbbit-calliope-active-turn-v1";
+  const SKETCH_COLLAPSE_STORAGE_KEY = "rvbbit-calliope-sketch-collapse-v1";
+  const SKETCH_COLLAPSE_INITIALIZED_STORAGE_KEY = "rvbbit-calliope-sketch-collapse-initialized-v1";
   const TURN_STREAM_RECONNECT_ATTEMPTS = 2;
   const CALLIOPE_PAGE_ID = freshClientTurnId();
   const SQL_KEYWORDS = new Set(`
@@ -405,6 +426,7 @@
     sessionTab: "chats",
     lastSessionId: null,
     lastSessionsByTab: {},
+    workOrderGroupsCollapsed: readCollapsedWorkOrderGroups(),
     sessionRefreshTimer: null,
     sessionEvents: null,
     sessionEventRefreshTimer: null,
@@ -420,14 +442,28 @@
     artifactFrameObserver: null,
     artifactFrameUnloadTimers: new Map(),
     artifactFrameHeights: new Map(),
+    sketchCollapsed: readCollapsedSketches(),
+    sketchCollapseInitialized: readInitializedSketchCollapses(),
+    sketchPendingCollapse: null,
+    sketchExpandedId: null,
     attachments: [],
     evidenceSelections: [],
+    playbookSourceTurnId: null,
+    playbookSavingTurns: new Set(),
+    playbookApproving: new Set(),
     composerEditor: null,
     composerObjectCache: new Map(),
     evidenceSearching: false,
     inbox: {
       items: [],
       counts: { unread: 0, open: 0, shown: 0, by_kind: {} },
+      workOrders: [],
+      workOrderCounts: { total: 0, active: 0, draft: 0, paused: 0, attention: 0 },
+      workOrderError: "",
+      playbooks: [],
+      playbookCounts: { drafts: 0, approved: 0, shared: 0, archived: 0, total: 0 },
+      playbookError: "",
+      mode: "inbox",
       filter: "open",
       loading: false,
       timer: null,
@@ -479,6 +515,7 @@
       loading: false,
       running: false,
       viewedIds: new Set(),
+      acceptingPlaybooks: new Set(),
     },
     pages: {
       items: [],
@@ -546,6 +583,71 @@
     chatAtLiveEdge: true,
     newSurfaceCount: 0,
     config: null,
+    setup: {
+      items: [],
+      progress: { completed: 0, total: 0, ready: false, launched: false },
+      facts: {},
+      identity: null,
+      launchState: null,
+      activeItem: "",
+      canManage: false,
+      mutationToken: "",
+      loading: false,
+      error: "",
+      preflight: {
+        snapshot: null,
+        loading: false,
+        busy: false,
+        error: "",
+      },
+      company: {
+        profile: null,
+        draft: null,
+        plan: null,
+        planToken: "",
+        loading: false,
+        busy: "",
+        error: "",
+      },
+      proof: {
+        snapshot: null,
+        selectedSurface: "",
+        question: "",
+        verificationNote: "",
+        plan: null,
+        planToken: "",
+        loading: false,
+        busy: "",
+        error: "",
+      },
+      launch: {
+        plan: null,
+        planToken: "",
+        busy: "",
+        error: "",
+      },
+      database: {
+        snapshot: null,
+        selectedConnection: "",
+        showConnectionForm: false,
+        connectionFormMode: "",
+        discovery: null,
+        schemaDiscovery: null,
+        schemaConnection: "",
+        schemasLoading: false,
+        selections: {},
+        sourceSchema: "",
+        destinationSchema: "",
+        scheduleSeconds: "3600",
+        plan: null,
+        planToken: "",
+        appliedRunId: "",
+        loading: false,
+        busy: "",
+        error: "",
+        pollTimer: null,
+      },
+    },
     libraryMode: "inventory",
     libraryReady: false,
     libraryBootstrapping: false,
@@ -642,6 +744,57 @@
       ready: false,
     },
   };
+
+  function readCollapsedSketches() {
+    try {
+      const values = JSON.parse(localStorage.getItem(SKETCH_COLLAPSE_STORAGE_KEY) || "[]");
+      return new Set(Array.isArray(values) ? values.filter((value) => typeof value === "string") : []);
+    } catch {
+      return new Set();
+    }
+  }
+
+  function persistCollapsedSketches() {
+    try {
+      localStorage.setItem(
+        SKETCH_COLLAPSE_STORAGE_KEY,
+        JSON.stringify([...state.sketchCollapsed].slice(-100)),
+      );
+    } catch {}
+  }
+
+  function readInitializedSketchCollapses() {
+    try {
+      const values = JSON.parse(
+        localStorage.getItem(SKETCH_COLLAPSE_INITIALIZED_STORAGE_KEY) || "[]",
+      );
+      return new Set(Array.isArray(values) ? values.filter((value) => typeof value === "string") : []);
+    } catch {
+      return new Set();
+    }
+  }
+
+  function persistInitializedSketchCollapses() {
+    try {
+      localStorage.setItem(
+        SKETCH_COLLAPSE_INITIALIZED_STORAGE_KEY,
+        JSON.stringify([...state.sketchCollapseInitialized].slice(-100)),
+      );
+    } catch {}
+  }
+
+  function initializeDefaultSketchCollapse(surface) {
+    const sketchId = sketchIdForSurface(surface);
+    if (
+      !sketchId
+      || surface?.payload?.default_collapsed !== true
+      || state.sketchCollapseInitialized.has(sketchId)
+    ) return;
+    state.sketchCollapseInitialized.add(sketchId);
+    state.sketchCollapsed.add(sketchId);
+    persistInitializedSketchCollapses();
+    persistCollapsedSketches();
+  }
 
   const THINKING_STATES = ["working", "composing", "solving"];
   const ARTIFACT_FRAME_UNLOAD_DELAY_MS = 900;
@@ -775,8 +928,24 @@
     const name = personName(person);
     return `<span class="${escapeHtml(className)}" title="${escapeHtml(name)}" aria-label="${escapeHtml(name)}">
       <b aria-hidden="true">${escapeHtml(personInitials(person))}</b>
-      ${url ? `<img src="${escapeHtml(url)}" alt="" loading="lazy" decoding="async">` : ""}
+      ${url ? `<img data-avatar-src="${escapeHtml(url)}" alt="" loading="lazy" decoding="async">` : ""}
     </span>`;
+  }
+
+  const personAvatarLoads = new Map();
+
+  function loadPersonAvatar(url) {
+    if (!url) return Promise.resolve("");
+    if (personAvatarLoads.has(url)) return personAvatarLoads.get(url);
+    const pending = fetch(url, { credentials: "same-origin" })
+      .then(async (response) => {
+        if (!response.ok) return "";
+        const blob = await response.blob();
+        return blob.type.startsWith("image/") ? URL.createObjectURL(blob) : "";
+      })
+      .catch(() => "");
+    personAvatarLoads.set(url, pending);
+    return pending;
   }
 
   function hydratePersonAvatars(root = document) {
@@ -788,9 +957,15 @@
         image.parentElement?.classList.remove("has-image");
         image.remove();
       });
-      if (image.complete && image.naturalWidth > 0) {
-        image.parentElement?.classList.add("has-image");
-      }
+      loadPersonAvatar(String(image.dataset.avatarSrc || "")).then((source) => {
+        if (!image.isConnected) return;
+        if (!source) {
+          image.parentElement?.classList.remove("has-image");
+          image.remove();
+          return;
+        }
+        image.src = source;
+      });
     });
   }
 
@@ -1163,6 +1338,9 @@
     if (item.source === "watch") {
       return item.event_kind === "recovered" ? "Watch recovered" : "Semantic watch";
     }
+    if (item.origin === "calliope_playbook") {
+      return item.context?.status === "approved" ? "Playbook ready" : "Playbook draft";
+    }
     return ({
       suggestion: "Suggestion",
       scheduled: "Scheduled work",
@@ -1175,7 +1353,9 @@
   function inboxOriginLabel(value) {
     return ({
       calliope_workflow: "Calliope Workflow",
+      calliope_work_order: "Assigned to Callie",
       calliope_instrument: "Calliope Instrument",
+      calliope_playbook: "Calliope Playbook",
       calliope_brief: "Daily Brief",
       calliope_work: "Calliope",
       hermes: "Hermes",
@@ -1254,6 +1434,171 @@
     });
   }
 
+  function workOrderStatusLabel(value) {
+    return ({
+      draft: "Ready for review",
+      active: "Active",
+      paused: "Paused",
+      completed: "Completed",
+      cancelled: "Cancelled",
+      error: "Needs attention",
+    })[value] || String(value || "Draft");
+  }
+
+  function workOrderScheduleMarkup(workOrder) {
+    const schedule = workOrder.schedule || {};
+    const facts = [
+      ["Schedule", schedule.display || schedule.value || "On demand"],
+      ["Timezone", schedule.timezone],
+      ["Next", schedule.next_run_at ? new Date(schedule.next_run_at).toLocaleString() : null],
+      ["Last", schedule.last_run_at ? `${relativeTime(schedule.last_run_at)} · ${schedule.last_status || "run"}` : null],
+    ].filter(([, value]) => value);
+    return `<dl class="work-order-facts">${facts.map(([label, value]) =>
+      `<div><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(String(value))}</dd></div>`
+    ).join("")}</dl>`;
+  }
+
+  function renderAssignedWork() {
+    const workOrders = state.inbox.workOrders || [];
+    const counts = state.inbox.workOrderCounts || {};
+    els.inboxSummary.textContent = `${Number(counts.active || 0)} active · ${Number(counts.draft || 0)} awaiting review`;
+    if (state.inbox.workOrderError) {
+      els.inboxList.innerHTML = `<div class="work-inbox-error"><strong>Assigned work unavailable.</strong><span>${escapeHtml(state.inbox.workOrderError)}</span></div>`;
+      return;
+    }
+    if (!workOrders.length) {
+      els.inboxList.innerHTML = `<div class="work-inbox-empty work-order-empty">
+        <strong>Nothing assigned yet.</strong>
+        <span>Tell Calliope what to investigate, watch, or prepare—and when. She will save a private draft here for you to review before anything runs.</span>
+        <button type="button" data-work-order-new>Assign something to Callie →</button>
+      </div>`;
+      return;
+    }
+    els.inboxList.innerHTML = `<div class="work-order-grid">${workOrders.map((workOrder) => {
+      const status = String(workOrder.status || "draft");
+      const runs = Array.isArray(workOrder.runs) ? workOrder.runs.slice(0, 3) : [];
+      const latest = runs[0];
+      const controls = [];
+      if (["draft", "error"].includes(status)) controls.push(["activate", status === "error" ? "Try activation again" : "Activate"]);
+      if (status === "active") controls.push(["run_now", "Run now"], ["pause", "Pause"]);
+      if (status === "paused") controls.push(["resume", "Resume"]);
+      if (!["completed", "cancelled"].includes(status)) controls.push(["cancel", "Cancel"]);
+      return `<article class="work-order-card status-${escapeHtml(status)}" data-work-order-id="${escapeHtml(workOrder.id)}">
+        <i class="work-order-rail" aria-hidden="true"></i>
+        <header>
+          <span>${escapeHtml(workOrderStatusLabel(status))}</span>
+          <time datetime="${escapeHtml(workOrder.updated_at || "")}">${escapeHtml(relativeTime(workOrder.updated_at))}</time>
+        </header>
+        <div class="work-order-body">
+          <h3>${escapeHtml(workOrder.title || "Calliope assignment")}</h3>
+          <p>${escapeHtml(workOrder.instruction || "")}</p>
+          ${workOrderScheduleMarkup(workOrder)}
+          <div class="work-order-policy"><span>${escapeHtml(String(workOrder.approval_policy || "read_only").replaceAll("_", " "))}</span><span>Inbox · ${escapeHtml(String(workOrder.notification_policy || "attention"))}</span><span>No overlap</span></div>
+          ${workOrder.schedule?.error ? `<p class="work-order-error">${escapeHtml(workOrder.schedule.error)}</p>` : ""}
+          ${runs.length ? `<div class="work-order-runs"><strong>Recent runs</strong>${runs.map((run) =>
+            `<a href="${escapeHtml(run.url || "#")}" class="status-${escapeHtml(run.status || "running")}"><span>${escapeHtml(run.status || "running")}</span><b>${escapeHtml(run.summary || (run.status === "running" ? "Calliope is working…" : "Saved run"))}</b><time>${escapeHtml(relativeTime(run.completed_at || run.started_at))}</time></a>`
+          ).join("")}</div>` : ""}
+        </div>
+        <footer>
+          ${latest?.url ? `<a href="${escapeHtml(latest.url)}">Open latest run ↗</a>` : ""}
+          ${controls.map(([action, label]) => `<button type="button" data-work-order-action="${escapeHtml(action)}"${action === "cancel" ? ' class="work-order-cancel"' : ""}>${escapeHtml(label)}</button>`).join("")}
+        </footer>
+      </article>`;
+    }).join("")}</div>`;
+  }
+
+  function personalPlaybookCard(item) {
+    const playbook = item?.playbook || {};
+    const contract = playbook.contract || {};
+    const method = Array.isArray(contract.method) ? contract.method.slice(0, 4) : [];
+    const useWhen = Array.isArray(contract.when_to_use) ? contract.when_to_use.slice(0, 3) : [];
+    const capabilities = [
+      ...(Array.isArray(contract.required_capabilities) ? contract.required_capabilities : []),
+      ...(Array.isArray(contract.preferred_capabilities) ? contract.preferred_capabilities : []),
+    ].slice(0, 6);
+    const category = String(item?.category || "drafts");
+    const isOwner = item?.is_owner === true;
+    const status = category === "shared"
+      ? `Shared by ${playbook.owner_email || "a teammate"}`
+      : category === "approved" ? "Ready to use" : "Needs review";
+    const visualUrl = playbook.has_sketch
+      ? `/calliope/playbooks/${encodeURIComponent(playbook.id || "")}/sketch?version=${encodeURIComponent(playbook.version || 1)}&theme=${currentSketchThemeMode()}`
+      : "";
+    return `<article class="personal-playbook-card ${escapeHtml(category)}" data-personal-playbook-id="${escapeHtml(playbook.id || "")}">
+      <i class="personal-playbook-rail" aria-hidden="true"></i>
+      <header><span><i aria-hidden="true">≋</i>${escapeHtml(status)} · v${escapeHtml(playbook.version || 1)}</span><time>${escapeHtml(relativeTime(playbook.updated_at || playbook.created_at))}</time></header>
+      <div class="personal-playbook-body">
+        <h3>${escapeHtml(playbook.title || "Untitled Playbook")}</h3>
+        <p>${escapeHtml(playbook.synopsis || contract.outcome || "A reusable Calliope method.")}</p>
+        ${contract.outcome ? `<dl><dt>Outcome</dt><dd>${escapeHtml(contract.outcome)}</dd></dl>` : ""}
+        ${useWhen.length ? `<div class="personal-playbook-chips">${useWhen.map((value) => `<span>${escapeHtml(value)}</span>`).join("")}</div>` : ""}
+        ${method.length ? `<ol>${method.map((step) => `<li>${escapeHtml(step)}</li>`).join("")}</ol>` : ""}
+        ${capabilities.length ? `<div class="personal-playbook-capabilities"><b>Capability fit</b>${capabilities.map((value) => `<span>${escapeHtml(value)}</span>`).join("")}</div>` : ""}
+      </div>
+      <footer>
+        ${visualUrl ? `<a href="${escapeHtml(visualUrl)}" target="_blank" rel="noopener">Visual method ↗</a>` : ""}
+        ${category === "drafts" ? `<button class="primary" type="button" data-personal-playbook-action="approve" data-playbook-version="${escapeHtml(playbook.version || 1)}">Approve v${escapeHtml(playbook.version || 1)}</button>` : ""}
+        ${category !== "drafts" ? `<button class="primary" type="button" data-personal-playbook-action="use">Use</button>` : ""}
+        ${isOwner ? `<button type="button" data-personal-playbook-action="revise">Revise</button>${category !== "drafts" ? `<button type="button" data-personal-playbook-action="share">Share</button>` : ""}` : ""}
+        ${isOwner && playbook.source_session_id ? `<button type="button" data-personal-playbook-action="source">Open source</button>` : ""}
+      </footer>
+    </article>`;
+  }
+
+  function renderPersonalPlaybooks() {
+    const playbooks = Array.isArray(state.inbox.playbooks) ? state.inbox.playbooks : [];
+    const counts = state.inbox.playbookCounts || {};
+    els.inboxSummary.textContent = `${Number(counts.drafts || 0)} to review · ${Number(counts.approved || 0)} ready · ${Number(counts.shared || 0)} shared`;
+    if (state.inbox.playbookError) {
+      els.inboxList.innerHTML = `<div class="work-inbox-error"><strong>Playbooks unavailable.</strong><span>${escapeHtml(state.inbox.playbookError)}</span></div>`;
+      return;
+    }
+    if (!playbooks.length) {
+      els.inboxList.innerHTML = `<div class="work-inbox-empty personal-playbook-empty">
+        <strong>No personal Playbooks yet.</strong>
+        <span>Turn a useful Calliope response into a private Playbook, or let Dreams suggest a repeated method worth keeping.</span>
+      </div>`;
+      return;
+    }
+    const groups = [
+      ["drafts", "Needs review", "Private drafts stay out of capability search until you approve them."],
+      ["approved", "Ready to use", "Your approved methods are available to Calliope whenever the situation fits."],
+      ["shared", "Shared with you", "Methods another owner explicitly made available to you or one of your Teams."],
+    ];
+    els.inboxList.innerHTML = `<div class="personal-playbook-sections">${groups.map(([key, title, copy]) => {
+      const items = playbooks.filter((item) => item.category === key);
+      if (!items.length) return "";
+      return `<section class="personal-playbook-section" data-playbook-category="${key}">
+        <header><div><span>${escapeHtml(title)}</span><p>${escapeHtml(copy)}</p></div><b>${items.length}</b></header>
+        <div class="personal-playbook-grid">${items.map(personalPlaybookCard).join("")}</div>
+      </section>`;
+    }).join("")}</div>`;
+  }
+
+  async function handlePersonalPlaybookAction(button) {
+    const card = button.closest("[data-personal-playbook-id]");
+    const playbookId = card?.dataset.personalPlaybookId;
+    const item = state.inbox.playbooks.find((entry) => (
+      String(entry?.playbook?.id || "") === String(playbookId || "")
+    ));
+    if (!item) return;
+    const playbook = item.playbook || {};
+    const action = button.dataset.personalPlaybookAction;
+    if (action === "approve") {
+      await approvePlaybook(playbook.id, button.dataset.playbookVersion || playbook.version, button);
+      return;
+    }
+    if (action === "source") {
+      els.inboxDialog.close();
+      await openPlaybookSource(playbook);
+      return;
+    }
+    if (["use", "revise", "share"].includes(action)) {
+      els.inboxDialog.close();
+      preparePlaybookPrompt(playbook, action);
+    }
+  }
+
   function renderInbox() {
     const counts = state.inbox.counts || {};
     const unread = Number(counts.unread || 0);
@@ -1263,6 +1608,32 @@
       "aria-label",
       unread ? `Work Inbox · ${unread} unread` : "Work Inbox",
     );
+    els.inboxModeCount.textContent = String(Number(counts.open || 0));
+    els.assignedModeCount.textContent = String(Number(state.inbox.workOrderCounts?.total || 0));
+    els.playbookModeCount.textContent = String(Number(state.inbox.playbookCounts?.total || 0));
+    $$('[data-inbox-mode]', els.inboxModes).forEach((button) => {
+      button.setAttribute("aria-pressed", String(button.dataset.inboxMode === state.inbox.mode));
+    });
+    const assigned = state.inbox.mode === "assigned";
+    const playbooks = state.inbox.mode === "playbooks";
+    els.inboxTitle.textContent = playbooks ? "My Playbooks" : assigned ? "Assigned to Callie" : "Work Inbox";
+    els.inboxCopy.textContent = playbooks
+      ? "Personal methods Calliope can find and reuse—private until you deliberately share them."
+      : assigned
+      ? "Private delegated work, its schedule, and every saved run—without mixing the machinery into your conversations."
+      : "What changed, why it matters, and the next useful move—without another feed to babysit.";
+    els.inboxFilters.hidden = assigned || playbooks;
+    els.inboxAck.hidden = assigned || playbooks;
+    els.inboxSchedule.hidden = playbooks;
+    els.inboxSchedule.textContent = assigned ? "＋ Assign something" : "＋ Schedule something";
+    if (playbooks) {
+      renderPersonalPlaybooks();
+      return;
+    }
+    if (assigned) {
+      renderAssignedWork();
+      return;
+    }
     $$("[data-inbox-filter]", els.inboxFilters).forEach((button) => {
       button.setAttribute("aria-pressed", String(button.dataset.inboxFilter === state.inbox.filter));
     });
@@ -1314,9 +1685,23 @@
       els.inboxList.innerHTML = '<div class="work-inbox-loading"><i></i><span>Resolving your work surface…</span></div>';
     }
     try {
-      const data = await api("/api/calliope/inbox?include_resolved=true&limit=100");
+      const [data, assigned, playbooks] = await Promise.all([
+        api("/api/calliope/inbox?include_resolved=true&limit=100"),
+        api("/api/calliope/work-orders").catch((error) => ({
+          work_orders: [], counts: {}, load_error: error.message,
+        })),
+        api("/api/calliope/playbooks?limit=100").catch((error) => ({
+          playbooks: [], counts: {}, load_error: error.message,
+        })),
+      ]);
       state.inbox.items = data.items || [];
       state.inbox.counts = data.counts || { unread: 0, open: 0, shown: 0, by_kind: {} };
+      state.inbox.workOrders = assigned.work_orders || [];
+      state.inbox.workOrderCounts = assigned.counts || { total: 0, active: 0, draft: 0, paused: 0, attention: 0 };
+      state.inbox.workOrderError = assigned.load_error || "";
+      state.inbox.playbooks = playbooks.playbooks || [];
+      state.inbox.playbookCounts = playbooks.counts || { drafts: 0, approved: 0, shared: 0, archived: 0, total: 0 };
+      state.inbox.playbookError = playbooks.load_error || "";
       renderInbox();
     } catch (error) {
       if (els.inboxDialog.open) {
@@ -2309,6 +2694,31 @@
     }
   }
 
+  async function mutateWorkOrder(card, action, button) {
+    if (!card || !action || button.disabled) return;
+    if (action === "cancel" && !window.confirm(
+      "Cancel this assignment? Its saved run notebooks will remain available."
+    )) return;
+    button.disabled = true;
+    try {
+      await api(`/api/calliope/work-orders/${encodeURIComponent(card.dataset.workOrderId)}/actions`, {
+        method: "POST",
+        body: JSON.stringify({ action }),
+      });
+      toast(({
+        activate: "Assignment activated",
+        pause: "Assignment paused",
+        resume: "Assignment resumed",
+        run_now: "Run queued with Hermes",
+        cancel: "Assignment cancelled",
+      })[action] || "Assignment updated");
+      await loadInbox({ silent: true });
+    } catch (error) {
+      button.disabled = false;
+      toast(error.message, true);
+    }
+  }
+
   async function acknowledgeInbox() {
     els.inboxAck.disabled = true;
     try {
@@ -2482,11 +2892,13 @@
     const inWings = dream.portfolio_state === "backlog";
     const waitingLabel = personalDreamScope() ? "On deck" : "In the wings";
     const editorialScore = Math.round(Number(dream.rank_score || 0) * 100);
+    const playbookDraft = String(dream.output?.artifact_type || "").toLowerCase() === "playbook"
+      && Boolean(dream.output?.playbook);
     return `<button class="calliope-dream-card ${selected ? "active" : ""}" type="button"
       data-dream-id="${escapeHtml(dream.id)}" data-impact="${escapeHtml(dream.impact || "medium")}" data-portfolio-state="${inWings ? "backlog" : "promoted"}">
-      <span class="calliope-dream-card-mark" aria-hidden="true">${dream.output_kind === "project_plan" ? "◇" : dream.output_kind === "question" ? "?" : "✦"}</span>
+      <span class="calliope-dream-card-mark" aria-hidden="true">${playbookDraft ? "≋" : dream.output_kind === "project_plan" ? "◇" : dream.output_kind === "question" ? "?" : "✦"}</span>
       <span class="calliope-dream-card-copy">
-        <small>${inWings ? `${waitingLabel} · ` : ""}${escapeHtml(dreamTypeLabel(dream.dream_type))} · ${escapeHtml(dreamOutputLabel(dream.output_kind))}</small>
+        <small>${inWings ? `${waitingLabel} · ` : ""}${escapeHtml(dreamTypeLabel(dream.dream_type))} · ${escapeHtml(playbookDraft ? "Playbook draft" : dreamOutputLabel(dream.output_kind))}</small>
         <strong>${escapeHtml(dream.title || "Untitled Dream")}</strong>
         <p>${escapeHtml(dream.thesis || "")}</p>
         <em>${escapeHtml(relativeTime(dream.updated_at))}${recurrence > 1 ? ` · returned ${recurrence}×` : ""}${inWings && editorialScore ? ` · ${editorialScore}% signal` : ""}</em>
@@ -2497,6 +2909,9 @@
 
   function dreamOutputMarkup(dream) {
     const output = dream.output && typeof dream.output === "object" ? dream.output : {};
+    if (String(output.artifact_type || "").toLowerCase() === "playbook" && output.playbook) {
+      return dreamPlaybookMarkup(dream);
+    }
     const sections = Array.isArray(output.sections) ? output.sections.slice(0, 8) : [];
     const phases = Array.isArray(output.phases) ? output.phases.slice(0, 8) : [];
     const metrics = Array.isArray(output.suggested_metrics) ? output.suggested_metrics.slice(0, 10) : [];
@@ -2511,6 +2926,33 @@
         ${metrics.map((item) => `<span><b>Metric</b>${escapeHtml(item)}</span>`).join("")}
         ${measures.map((item) => `<span><b>Success</b>${escapeHtml(item)}</span>`).join("")}
       </div>` : ""}
+    </section>`;
+  }
+
+  function dreamPlaybookMarkup(dream) {
+    const output = dream.output && typeof dream.output === "object" ? dream.output : {};
+    const playbook = output.playbook && typeof output.playbook === "object" ? output.playbook : {};
+    const contract = playbook.contract && typeof playbook.contract === "object" ? playbook.contract : {};
+    const useWhen = Array.isArray(contract.when_to_use) ? contract.when_to_use.slice(0, 5) : [];
+    const method = Array.isArray(contract.method) ? contract.method.slice(0, 8) : [];
+    const guardrails = Array.isArray(contract.guardrails) ? contract.guardrails.slice(0, 5) : [];
+    const completion = Array.isArray(contract.completion_criteria) ? contract.completion_criteria.slice(0, 5) : [];
+    const required = Array.isArray(contract.required_capabilities) ? contract.required_capabilities.slice(0, 6) : [];
+    const preferred = Array.isArray(contract.preferred_capabilities) ? contract.preferred_capabilities.slice(0, 5) : [];
+    const accepted = Boolean(dream.accepted_playbook?.id);
+    return `<section class="calliope-dream-output calliope-dream-playbook ${escapeHtml(playbook.readiness || "ready")}" data-output-kind="playbook">
+      <header><span><i aria-hidden="true">≋</i> Dreamed Playbook</span><b>${accepted ? "Accepted · private" : "Reviewable private proposal"}</b></header>
+      <h4>${escapeHtml(playbook.title || output.headline || dream.title || "Dreamed Playbook")}</h4>
+      <p>${escapeHtml(playbook.synopsis || output.summary || dream.thesis || "A reusable method Calliope noticed in the work already underway.")}</p>
+      ${contract.outcome ? `<section class="dream-playbook-outcome"><label>Outcome</label><strong>${escapeHtml(contract.outcome)}</strong></section>` : ""}
+      ${useWhen.length ? `<section class="dream-playbook-use"><label>Use when</label><div>${useWhen.map((item) => `<em>${escapeHtml(item)}</em>`).join("")}</div></section>` : ""}
+      ${method.length ? `<div class="dream-playbook-method"><span>Adaptive method</span><ol>${method.map((step) => `<li>${escapeHtml(step)}</li>`).join("")}</ol></div>` : ""}
+      ${required.length || preferred.length ? `<section class="dream-playbook-capabilities"><label>Capability fit</label><div>${required.map((item) => `<em class="required">${escapeHtml(item)}</em>`).join("")}${preferred.map((item) => `<em>${escapeHtml(item)}</em>`).join("")}</div></section>` : ""}
+      ${guardrails.length || completion.length ? `<div class="dream-playbook-boundaries">
+        ${guardrails.length ? `<article><span>Guardrails</span><p>${escapeHtml(guardrails.join(" · "))}</p></article>` : ""}
+        ${completion.length ? `<article><span>Done when</span><p>${escapeHtml(completion.join(" · "))}</p></article>` : ""}
+      </div>` : ""}
+      <footer><span>${accepted ? "The accepted immutable version is now available through My Playbooks and capability search." : "Accepting creates and approves one private immutable Playbook. It is not shared with anyone else."}</span></footer>
     </section>`;
   }
 
@@ -2573,6 +3015,10 @@
     const personal = personalDreamScope();
     const waitingLabel = personal ? "On deck" : "In the wings";
     const entities = Array.isArray(dream.entities) ? dream.entities.slice(0, 12) : [];
+    const dreamedPlaybook = String(dream.output?.artifact_type || "").toLowerCase() === "playbook"
+      && Boolean(dream.output?.playbook);
+    const acceptedPlaybook = dream.accepted_playbook?.id ? dream.accepted_playbook : null;
+    const acceptingPlaybook = state.dreams.acceptingPlaybooks.has(dream.id);
     els.dreamsDetail.innerHTML = `<article class="calliope-dream-detail-card" data-dream-status="${escapeHtml(dream.status || "proposed")}">
       <header class="calliope-dream-detail-head">
         <div><span>${inWings ? `${waitingLabel} · ` : ""}${escapeHtml(dreamTypeLabel(dream.dream_type))}</span><h3>${escapeHtml(dream.title)}</h3><p>${escapeHtml(dream.thesis || "")}</p></div>
@@ -2584,11 +3030,14 @@
       ${dreamProbeMarkup(dream)}
       ${dreamEvidenceMarkup(dream)}
       <footer class="calliope-dream-actions">
-        <p>${adopted ? (personal ? "Adopted into your private working memory." : "Adopted into the company’s working memory.") : asleep ? "Sleeping until more time or evidence passes." : dismissed ? (personal ? "Hidden from your private Dream shelf." : "Hidden for you; the company Dream remains intact.") : inWings ? "A credible candidate held quietly outside the three-item shelf. Exploring it promotes it into active work." : "The Dream is a hypothesis. Calliope will verify it again before building."}</p>
+        <p>${acceptedPlaybook ? "Accepted as an approved private Playbook. Sharing remains a separate deliberate action." : adopted ? (personal ? "Adopted into your private working memory." : "Adopted into the company’s working memory.") : asleep ? "Sleeping until more time or evidence passes." : dismissed ? (personal ? "Hidden from your private Dream shelf." : "Hidden for you; the company Dream remains intact.") : dreamedPlaybook ? "This is a complete method proposal, grounded in the Dream evidence and ready for your review." : inWings ? "A credible candidate held quietly outside the three-item shelf. Exploring it promotes it into active work." : "The Dream is a hypothesis. Calliope will verify it again before building."}</p>
         ${asleep || dismissed ? `<button type="button" data-dream-action="reopen">Wake it</button>` : `
           <button type="button" data-dream-action="sleep">Sleep on it</button>
           <button type="button" data-dream-action="dismiss">Not useful</button>`}
-        ${adopted ? "" : `<button type="button" data-dream-action="adopt">Adopt</button>`}
+        ${dreamedPlaybook ? (acceptedPlaybook
+          ? `<a class="dream-playbook-open" href="${escapeHtml(acceptedPlaybook.url || `/calliope?session=${encodeURIComponent(acceptedPlaybook.session_id || "")}`)}">Open Playbook →</a>`
+          : `<button class="dream-playbook-accept" type="button" data-dream-playbook-accept ${acceptingPlaybook ? "disabled" : ""}>${acceptingPlaybook ? "Accepting…" : "Accept private Playbook →"}</button>`)
+          : adopted ? "" : `<button type="button" data-dream-action="adopt">Adopt</button>`}
         <button class="primary-action" type="button" data-dream-handoff>Explore with Calliope →</button>
       </footer>
     </article>`;
@@ -2727,6 +3176,36 @@
     toast(action === "adopt" ? "Dream adopted" : action === "sleep" ? "Dream is sleeping" : action === "dismiss" ? "Dream hidden for you" : "Dream awakened");
   }
 
+  async function acceptDreamPlaybook() {
+    const id = state.dreams.selectedId;
+    if (!id || state.dreams.acceptingPlaybooks.has(id)) return;
+    state.dreams.acceptingPlaybooks.add(id);
+    renderDreamDetail();
+    try {
+      const data = await api(`/api/calliope/dreams/${encodeURIComponent(id)}/playbook`, {
+        method: "POST", body: "{}",
+      });
+      const dream = state.dreams.items.find((item) => item.id === id);
+      if (dream) {
+        dream.status = "adopted";
+        dream.viewer_state = "adopted";
+        dream.accepted_playbook = {
+          id: data.playbook?.id,
+          session_id: data.session?.id,
+          status: "complete",
+          url: data.url,
+          updated_at: new Date().toISOString(),
+        };
+      }
+      state.dreams.counts.adopted = Number(state.dreams.counts.adopted || 0) + 1;
+      await loadInbox({ silent: true });
+      toast(`Playbook accepted · ${data.playbook?.title || "private and ready to use"}`);
+    } finally {
+      state.dreams.acceptingPlaybooks.delete(id);
+      renderDreams();
+    }
+  }
+
   async function handoffDream() {
     const id = state.dreams.selectedId;
     if (!id) return;
@@ -2845,7 +3324,9 @@
   }
 
   async function loadPages({ selectId = state.pages.selectedId, silent = false } = {}) {
-    if (state.config?.pages === false) return;
+    // Treat an omitted flag as unsupported. This keeps a newer browser bundle
+    // from aborting all notebook bootstrap against an older Warehouse service.
+    if (!state.config?.pages) return;
     const requestId = ++state.pages.requestId;
     state.pages.loading = true;
     if (!silent) renderPageList();
@@ -2887,7 +3368,7 @@
   }
 
   async function openPages(selectId = null) {
-    if (state.config?.pages === false) {
+    if (!state.config?.pages) {
       toast("Living Pages are not enabled on this installation", true);
       return;
     }
@@ -3117,9 +3598,1040 @@
       error.code = data?.error?.code || "REQUEST_FAILED";
       error.stage = data?.error?.stage || "";
       error.status = response.status;
+      error.payload = data;
       throw error;
     }
     return data;
+  }
+
+  function setupMutationOptions(body = {}) {
+    return {
+      method: "POST",
+      headers: { "X-Calliope-Setup-Token": state.setup.mutationToken },
+      body: JSON.stringify(body),
+    };
+  }
+
+  function setupDatabaseConnection() {
+    const connections = state.setup.database.snapshot?.connections || [];
+    return connections.find((item) => item.connection_name === state.setup.database.selectedConnection)
+      || connections[0]
+      || null;
+  }
+
+  function setupDatabaseJobs(connection = setupDatabaseConnection()) {
+    return Array.isArray(connection?.jobs) ? connection.jobs : [];
+  }
+
+  function setupLatestMirrorRun(connection = setupDatabaseConnection()) {
+    return setupDatabaseJobs(connection)
+      .filter((job) => job.run_id)
+      .sort((left, right) => new Date(right.latest_run_requested_at || 0) - new Date(left.latest_run_requested_at || 0))[0]
+      || null;
+  }
+
+  function setupDestinationName(value, fallback = "company_data") {
+    let name = String(value || "").trim().toLowerCase()
+      .replace(/[^a-z0-9_]+/g, "_")
+      .replace(/_+/g, "_")
+      .replace(/^_+|_+$/g, "");
+    if (!name || !/^[a-z]/.test(name)) name = `${fallback}_${name}`.replace(/_+$/g, "");
+    if (["public", "rvbbit", "pg_catalog", "information_schema", "pg_toast"].includes(name) || name.startsWith("pg_")) {
+      name = `${name}_data`;
+    }
+    return name.slice(0, 48) || fallback;
+  }
+
+  function setupDefaultDestinationSchema(connection) {
+    return setupDestinationName(
+      connection?.metadata?.database || connection?.connection_name,
+      "company_data",
+    );
+  }
+
+  function setupDefaultDestinationTable(name) {
+    let destination = String(name || "").trim().normalize("NFKD")
+      .replace(/[\u0300-\u036f]/g, "")
+      .replace(/([A-Z]+)([A-Z][a-z])/g, "$1_$2")
+      .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+      .replace(/[^A-Za-z0-9]+/g, "_")
+      .replace(/^_+|_+$/g, "")
+      .replace(/_+/g, "_")
+      .toLowerCase();
+    if (!destination) destination = "source_table";
+    if (/^[0-9]/.test(destination)) destination = `source_${destination}`;
+    return destination.slice(0, 63).replace(/_+$/g, "") || "source_table";
+  }
+
+  function setupScheduleLabel(value) {
+    return ({
+      "": "Manual only",
+      900: "Every 15 minutes",
+      1800: "Every 30 minutes",
+      3600: "Every hour",
+      21600: "Every 6 hours",
+      43200: "Every 12 hours",
+      86400: "Every day",
+      604800: "Every week",
+    })[String(value ?? "")] || "Custom schedule";
+  }
+
+  function setupMirrorRunMarkup(connection) {
+    const jobs = setupDatabaseJobs(connection);
+    if (!jobs.length) return "";
+    return `<section class="setup-existing-jobs">
+      <header><span>Configured local mirrors</span><b>${jobs.length}</b></header>
+      ${jobs.map((job) => {
+        const status = String(job.latest_run_status || "configured");
+        const relation = `${job.destination_schema} · ${Number(job.table_count || 0)} table${Number(job.table_count || 0) === 1 ? "" : "s"}`;
+        const detail = job.run_id
+          ? `${Number(job.latest_run_rows_loaded || 0).toLocaleString()} rows · ${relativeTime(job.latest_run_finished_at || job.latest_run_requested_at)}`
+          : "First run has not been queued";
+        return `<article data-run-status="${escapeHtml(status)}">
+          <i aria-hidden="true"></i><div><strong>${escapeHtml(relation)}</strong><small>${escapeHtml(detail)}</small></div>
+          <span>${escapeHtml(status.replaceAll("_", " "))}</span>
+        </article>`;
+      }).join("")}
+    </section>`;
+  }
+
+  function setupConnectionFormMarkup(connection = null) {
+    const replacing = state.setup.database.connectionFormMode === "replace" && connection;
+    return `<form class="setup-connection-form" data-setup-connection-form autocomplete="off">
+      <header>
+        <div><span>Secure source credential</span><h3>Add a read-only database</h3></div>
+        ${state.setup.database.snapshot?.connections?.length ? '<button type="button" data-setup-cancel-connection>Cancel</button>' : ""}
+      </header>
+      <div class="setup-form-grid">
+        <label><span>Connection name <b>required</b></span><input name="connection_name" required maxlength="63" pattern="[a-z](?:[a-z0-9_]|-){2,62}" placeholder="erp_prod" autocomplete="off" value="${escapeHtml(replacing ? connection.connection_name : "")}" ${replacing ? "readonly" : ""}><small>Short internal key. It is not a table prefix.</small></label>
+        <label><span>Display label <b>required</b></span><input name="label" required maxlength="160" placeholder="Production ERP · read only" autocomplete="off" value="${escapeHtml(replacing ? connection.label : "")}"></label>
+        <label><span>Database type <b>required</b></span><select name="dialect" required>
+          <option value="postgresql" ${replacing && connection.dialect === "postgresql" ? "selected" : ""}>PostgreSQL</option><option value="mysql" ${replacing && connection.dialect === "mysql" ? "selected" : ""}>MySQL</option><option value="mariadb" ${replacing && connection.dialect === "mariadb" ? "selected" : ""}>MariaDB</option>
+          <option value="mssql" ${replacing && connection.dialect === "mssql" ? "selected" : ""}>Microsoft SQL Server</option><option value="oracle" ${replacing && connection.dialect === "oracle" ? "selected" : ""}>Oracle</option><option value="db2" ${replacing && connection.dialect === "db2" ? "selected" : ""}>IBM Db2</option>
+        </select></label>
+        <label><span>Environment</span><input name="environment" maxlength="80" placeholder="production" autocomplete="off" value="${escapeHtml(replacing ? connection.metadata?.environment || "" : "")}"></label>
+        <label class="wide setup-secret-field"><span>Read-only connection URL <b>secure · required</b></span>
+          <input name="source_dsn" type="password" required maxlength="12000" autocomplete="new-password" autocapitalize="off" spellcheck="false" placeholder="database+driver://read_only_user:••••@host/database">
+          <small>This value goes directly to the mirror controller and encrypted canonical store. It is cleared immediately and never enters chat, Stage receipts, or browser storage.</small>
+        </label>
+      </div>
+      <footer><span>Use credentials that cannot write to the source system.</span><button class="primary" type="submit">Save securely →</button></footer>
+    </form>`;
+  }
+
+  function setupTablePickerMarkup(discovery) {
+    const tables = Array.isArray(discovery?.tables) ? discovery.tables : [];
+    const selections = state.setup.database.selections;
+    const chosen = tables.filter((table) => selections[table.name]?.selected);
+    const connection = setupDatabaseConnection();
+    return `<section class="setup-table-picker">
+      <header>
+        <div><span>Remote catalog · credential-free</span><h3>Choose the useful tables</h3><p>${tables.length.toLocaleString()} ${discovery?.truncated ? "shown" : "found"} in ${escapeHtml(discovery?.schema || "the default schema")}. Table names stay recognizable in RVBBIT.</p></div>
+        <div><button type="button" data-setup-tables="all">Select all</button><button type="button" data-setup-tables="none">Clear</button></div>
+      </header>
+      <div class="setup-table-config">
+        <label><span>RVBBIT destination schema</span><input data-setup-destination-schema value="${escapeHtml(state.setup.database.destinationSchema || setupDefaultDestinationSchema(connection))}" maxlength="48" pattern="[a-z][a-z0-9_]{0,47}" required><small>One short source-shaped schema; no mirror_ table names.</small></label>
+        <label><span>Refresh schedule</span><select data-setup-schedule>
+          ${[["", "Manual only"], ["900", "Every 15 minutes"], ["1800", "Every 30 minutes"], ["3600", "Every hour"], ["21600", "Every 6 hours"], ["43200", "Every 12 hours"], ["86400", "Every day"], ["604800", "Every week"]]
+            .map(([value, label]) => `<option value="${value}" ${String(state.setup.database.scheduleSeconds) === value ? "selected" : ""}>${label}</option>`).join("")}
+        </select></label>
+      </div>
+      <div class="setup-table-list" role="list">
+        ${tables.map((table) => {
+          const selection = selections[table.name] || {};
+          const columns = Array.isArray(table.columns) ? table.columns : [];
+          const primaryKey = Array.isArray(table.primary_key) ? table.primary_key : [];
+          const incremental = selection.load_mode === "incremental_upsert";
+          return `<article class="setup-table-row ${selection.selected ? "selected" : ""}" role="listitem" data-setup-table-row="${escapeHtml(table.name)}">
+            <label class="setup-table-check"><input type="checkbox" data-setup-table-toggle="${escapeHtml(table.name)}" ${selection.selected ? "checked" : ""}><i></i></label>
+            <div class="setup-table-copy"><strong>${escapeHtml(table.name)}</strong><span>${columns.length} columns${primaryKey.length ? ` · PK ${escapeHtml(primaryKey.join(", "))}` : " · no primary key found"}</span>
+              <details><summary>Columns</summary><p>${escapeHtml(columns.slice(0, 40).map((column) => column.name).join(" · "))}${columns.length > 40 ? " …" : ""}</p></details>
+            </div>
+            <label><span>Local table</span><input data-setup-table-destination="${escapeHtml(table.name)}" value="${escapeHtml(selection.destination_table || table.destination_table || setupDefaultDestinationTable(table.name))}" maxlength="63" pattern="_?[a-z0-9]+(?:_[a-z0-9]+)*" title="Use a lowercase Postgres table name" ${selection.selected ? "" : "disabled"}></label>
+            <div class="setup-table-load"><label><span>Load behavior</span><select data-setup-table-mode="${escapeHtml(table.name)}" ${selection.selected ? "" : "disabled"}>
+              <option value="snapshot" ${incremental ? "" : "selected"}>Snapshot replace</option>
+              <option value="incremental_upsert" ${incremental ? "selected" : ""} ${primaryKey.length ? "" : "disabled"}>Incremental upsert</option>
+            </select></label>
+            ${incremental ? `<label><span>Update cursor</span><select data-setup-table-cursor="${escapeHtml(table.name)}" ${selection.selected ? "" : "disabled"}><option value="">Choose column</option>${columns.map((column) => `<option value="${escapeHtml(column.name)}" ${selection.cursor_column === column.name ? "selected" : ""}>${escapeHtml(column.name)}</option>`).join("")}</select></label>` : ""}</div>
+          </article>`;
+        }).join("") || '<div class="setup-control-empty">No tables were returned for this schema.</div>'}
+      </div>
+      <footer><span><b>${chosen.length}</b> selected · ordinary Postgres heap tables in the RVBBIT database</span><button class="primary" type="button" data-setup-review-plan ${chosen.length ? "" : "disabled"}>Review mirror plan →</button></footer>
+    </section>`;
+  }
+
+  function setupSourceSchemaControl(connection) {
+    const database = state.setup.database;
+    const discovery = database.schemaConnection === connection?.connection_name
+      ? database.schemaDiscovery : null;
+    const schemas = Array.isArray(discovery?.schemas) ? discovery.schemas : [];
+    if (database.schemasLoading) {
+      return '<label><span>Source schema</span><select name="source_schema" required disabled><option>Reading schemas…</option></select></label>';
+    }
+    if (discovery?.introspection_supported && schemas.length) {
+      const selected = database.sourceSchema || discovery.default_schema || schemas[0];
+      return `<label><span>Source schema</span><select name="source_schema" required>${schemas.map((schema) => `<option value="${escapeHtml(schema)}" ${schema === selected ? "selected" : ""}>${escapeHtml(schema)}</option>`).join("")}</select><small>${schemas.length.toLocaleString()} available schema${schemas.length === 1 ? "" : "s"}</small></label>`;
+    }
+    return `<label><span>Source schema</span><input name="source_schema" required maxlength="255" value="${escapeHtml(database.sourceSchema)}" placeholder="${connection?.dialect === "mssql" ? "dbo" : "public"}" autocomplete="off"><small>${discovery?.introspection_supported === false ? "This database driver does not expose schema introspection." : "Enter the schema used by this source."}</small></label>`;
+  }
+
+  function setupPlanMarkup(plan) {
+    const rows = plan.tables || [];
+    return `<section class="setup-plan-review">
+      <header><span>Exact change · nothing applied yet</span><h3>Review the first mirror</h3><p>The dlt worker alone reads the remote source. Calliope and Hermes will query only these local RVBBIT relations after the run finishes.</p></header>
+      <div class="setup-plan-route"><strong>${escapeHtml(plan.connection_name)} · ${escapeHtml(plan.source_schema)}</strong><i>→</i><strong>${escapeHtml(plan.destination_schema)}</strong></div>
+      <div class="setup-plan-table"><header><span>Source table</span><span>RVBBIT relation</span><span>Load</span></header>${rows.map((table) => `<div><code>${escapeHtml(table.source_table)}</code><code>${escapeHtml(`${plan.destination_schema}.${table.destination_table}`)}</code><span>${escapeHtml(table.load_mode === "incremental_upsert" ? `upsert · ${table.cursor_column}` : "snapshot replace")}</span></div>`).join("")}</div>
+      <footer><span>${rows.length} table${rows.length === 1 ? "" : "s"} · ${escapeHtml(setupScheduleLabel(plan.schedule_seconds))} · first run will queue now</span><div><button type="button" data-setup-edit-plan>Back</button><button class="primary" type="button" data-setup-apply-plan>Approve & queue first mirror →</button></div></footer>
+    </section>`;
+  }
+
+  function setupServiceStatusLabel(status) {
+    return ({ ready: "ready", configured: "registered", needs_test: "testing", blocked: "attention" })[status]
+      || String(status || "unknown");
+  }
+
+  function setupPreflightMarkup() {
+    const preflight = state.setup.preflight;
+    const snapshot = preflight.snapshot;
+    const checks = Array.isArray(snapshot?.checks) ? snapshot.checks : [];
+    const lastPassed = Boolean(state.setup.facts.preflight_ready);
+    return `<div class="setup-control-shell setup-first-boot" aria-busy="${preflight.loading || preflight.busy}">
+      <header class="setup-control-head"><div><p class="eyebrow">Hosted stack · active preflight</p><h2>Test the managed services</h2><p>This is operator-owned setup: Postgres, Calliope, Hermes, local Hermes memory, Clover, the MCP gateway, and dlt should work before the customer supplies company configuration.</p></div><button type="button" data-setup-run-preflight ${preflight.busy || !state.setup.canManage ? "disabled" : ""}>${preflight.busy ? "Testing…" : "Run active tests"}</button></header>
+      ${lastPassed && !snapshot?.active ? '<div class="setup-control-success"><strong>Latest active receipt passed</strong><span>Run again after a deployment or managed-provider change.</span></div>' : ""}
+      ${preflight.error ? `<div class="setup-control-error" role="alert"><strong>Preflight stopped</strong><span>${escapeHtml(preflight.error)}</span></div>` : ""}
+      ${preflight.loading && !snapshot ? '<div class="setup-control-loading"><i></i><span>Reading the registered appliance services…</span></div>' : ""}
+      <div class="setup-preflight-grid">${checks.map((check) => `<article class="status-${escapeHtml(check.status || "blocked")}"><header><i></i><strong>${escapeHtml(check.label || check.id)}</strong><b>${escapeHtml(setupServiceStatusLabel(check.status))}</b></header><p>${escapeHtml(check.summary || "")}</p>${check.remediation && check.status === "blocked" ? `<small>${escapeHtml(check.remediation)}</small>` : ""}${check.detail?.error ? `<small>${escapeHtml(check.detail.error)}</small>` : ""}</article>`).join("") || '<div class="setup-control-empty">No managed-service inventory is available yet.</div>'}</div>
+      <footer class="setup-controller-footer"><span>${snapshot?.active ? `${Number(snapshot.summary?.ready || 0)} of ${Number(snapshot.summary?.required || 0)} active checks passed` : "Active tests create a credential-free Stage receipt."}</span><b>${snapshot?.ready ? "ready for company setup" : "no customer secrets required"}</b></footer>
+    </div>`;
+  }
+
+  function setupAdministratorMarkup() {
+    const identity = state.setup.identity || {};
+    const assurance = ({
+      federated_email: "provider-verified email",
+      database_identity: "database identity",
+      single_email_bootstrap: "one-email hosted bootstrap",
+      shared_password: "interim shared-password identity",
+    })[identity.assurance] || "signed-in identity";
+    return `<div class="setup-control-shell setup-first-boot">
+      <header class="setup-control-head"><div><p class="eyebrow">Identity · protected Admins Team</p><h2>${identity.can_manage ? "Administrator ready" : "Administrator access required"}</h2><p>The bootstrap uses one human administrator. Organization-wide Google Workspace delegation remains a separate, optional project.</p></div></header>
+      <section class="setup-identity-card ${identity.can_manage ? "ready" : "attention"}"><div class="setup-identity-mark">${identity.can_manage ? "✓" : "!"}</div><div><span>Signed in as</span><strong>${escapeHtml(identity.display_name || identity.email || "Unknown")}</strong><code>${escapeHtml(identity.email || "")}</code><p>${escapeHtml(identity.summary || "")}</p></div><dl><div><dt>Assurance</dt><dd>${escapeHtml(assurance)}</dd></div><div><dt>Admins Team</dt><dd>${identity.can_manage ? "member" : "not a member"}</dd></div><div><dt>Auth path</dt><dd>${escapeHtml(identity.auth_mode || "unknown")}</dd></div></dl></section>
+      ${identity.assurance === "shared_password" ? '<div class="setup-control-warning"><strong>Keep bootstrap narrow</strong><span>Restrict WAREHOUSE_ALLOWED_EMAILS to this address and convert to Google/SSO before adding people.</span></div>' : ""}
+    </div>`;
+  }
+
+  function setupCompanyDraft(profile = null) {
+    const calendar = profile?.reporting_calendar || {};
+    return {
+      company_name: profile?.company_name || "",
+      summary: profile?.summary || "",
+      timezone: profile?.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
+      fiscal_year_start_month: Number(calendar.fiscal_year_start_month || 1),
+      week_starts_on: calendar.week_starts_on || "monday",
+      reporting_calendar_notes: calendar.notes || "",
+      terminology: (profile?.terminology || []).map((item) => `${item.term} = ${item.meaning}`).join("\n"),
+    };
+  }
+
+  function setupCompanyPlanMarkup(plan) {
+    const calendar = plan.reporting_calendar || {};
+    return `<section class="setup-plan-review setup-company-review"><header><span>Reviewed company context · nothing secret</span><h3>${escapeHtml(plan.company_name)}</h3><p>${escapeHtml(plan.summary)}</p></header><dl class="setup-review-facts"><div><dt>Timezone</dt><dd>${escapeHtml(plan.timezone)}</dd></div><div><dt>Fiscal year</dt><dd>starts month ${Number(calendar.fiscal_year_start_month || 1)}</dd></div><div><dt>Reporting week</dt><dd>${escapeHtml(calendar.week_starts_on || "monday")}</dd></div><div><dt>Terminology</dt><dd>${Number(plan.terminology?.length || 0)} definitions</dd></div></dl><footer><span>This becomes durable company configuration, not Hermes memory. You will ask the first real business question after data is mirrored.</span><div><button type="button" data-setup-edit-company>Back</button><button class="primary" type="button" data-setup-apply-company>Approve & save profile →</button></div></footer></section>`;
+  }
+
+  function setupCompanyMarkup() {
+    const company = state.setup.company;
+    if (company.plan) return `<div class="setup-control-shell setup-first-boot">${setupCompanyPlanMarkup(company.plan)}</div>`;
+    const draft = company.draft || setupCompanyDraft(company.profile);
+    const months = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+    return `<div class="setup-control-shell setup-first-boot" aria-busy="${company.loading || Boolean(company.busy)}"><header class="setup-control-head"><div><p class="eyebrow">Company context · reviewed configuration</p><h2>Describe the company</h2><p>Talk this through with Calliope, then put the agreed facts here. She sees the saved profile after approval; these fields contain no credentials.</p></div></header>${company.error ? `<div class="setup-control-error" role="alert"><strong>Profile needs attention</strong><span>${escapeHtml(company.error)}</span></div>` : ""}<form data-setup-company-form class="setup-company-form"><div class="setup-form-grid"><label><span>Company name</span><input name="company_name" required maxlength="160" value="${escapeHtml(draft.company_name)}" autocomplete="organization"></label><label><span>Timezone</span><input name="timezone" required maxlength="100" value="${escapeHtml(draft.timezone)}" placeholder="America/New_York"></label><label class="wide"><span>What the company does</span><textarea name="summary" required maxlength="4000" rows="4" placeholder="Products, customers, operating model, and the reporting context that matters.">${escapeHtml(draft.summary)}</textarea></label><label><span>Fiscal year starts</span><select name="fiscal_year_start_month">${months.map((month, index) => `<option value="${index + 1}" ${Number(draft.fiscal_year_start_month) === index + 1 ? "selected" : ""}>${month}</option>`).join("")}</select></label><label><span>Reporting week starts</span><select name="week_starts_on">${["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"].map((day) => `<option value="${day}" ${draft.week_starts_on === day ? "selected" : ""}>${day[0].toUpperCase() + day.slice(1)}</option>`).join("")}</select></label><label class="wide"><span>Reporting calendar notes</span><textarea name="reporting_calendar_notes" maxlength="1000" rows="2" placeholder="4-4-5 calendar, close timing, important periods…">${escapeHtml(draft.reporting_calendar_notes)}</textarea></label><label class="wide"><span>Company terminology <b>one “term = meaning” per line</b></span><textarea name="terminology" maxlength="36000" rows="5" placeholder="Active account = a customer with billable activity in the last 30 days">${escapeHtml(draft.terminology)}</textarea></label></div><footer><span>${company.profile ? `Editing reviewed profile v${Number(company.profile.version || 1)}` : "Calliope can help phrase this before review."}</span><button class="primary" type="submit" ${company.busy ? "disabled" : ""}>${company.busy === "plan" ? "Preparing review…" : "Review company profile →"}</button></footer></form></div>`;
+  }
+
+  function setupProofPlanMarkup(plan) {
+    return `<section class="setup-plan-review setup-proof-review"><header><span>Evidence receipt · exact local query surface</span><h3>${escapeHtml(plan.question)}</h3><p>You are approving the selected non-empty result and its recorded local mirror lineage.</p></header><div class="setup-plan-route"><strong>${escapeHtml((plan.mirrored_relations || []).join(" · "))}</strong><i>→</i><strong>${Number(plan.row_count || 0).toLocaleString()} returned rows</strong></div><div class="setup-review-list"><strong>Result provenance</strong><p>${escapeHtml(plan.surface_title || "Query result")}</p><code>${escapeHtml(plan.sql_hash || "")}</code></div><footer><span>This stores hashes, relation lineage, and counts—not the result rows.</span><div><button type="button" data-setup-edit-proof>Back</button><button class="primary" type="button" data-setup-apply-proof>Approve proof receipt →</button></div></footer></section>`;
+  }
+
+  function setupProofMarkup() {
+    const proof = state.setup.proof;
+    if (proof.plan) return `<div class="setup-control-shell setup-first-boot">${setupProofPlanMarkup(proof.plan)}</div>`;
+    const candidates = proof.snapshot?.candidates || [];
+    return `<div class="setup-control-shell setup-first-boot" aria-busy="${proof.loading || Boolean(proof.busy)}"><header class="setup-control-head"><div><p class="eyebrow">First answer · source-backed proof</p><h2>Verify a useful local-data answer</h2><p>Ask Calliope one real business question. A result qualifies only when Warehouse recorded non-empty rows and direct lineage to a successfully mirrored local relation.</p></div><button type="button" data-setup-refresh-proof ${proof.loading ? "disabled" : ""}>Refresh results</button></header>${proof.error ? `<div class="setup-control-error" role="alert"><strong>Proof needs attention</strong><span>${escapeHtml(proof.error)}</span></div>` : ""}${!proof.snapshot?.available ? '<div class="setup-control-warning"><strong>Finish the first mirror</strong><span>No successfully mirrored local relations are available for proof yet.</span></div>' : ""}${proof.snapshot?.available && !candidates.length ? '<div class="setup-control-warning"><strong>Ask Calliope a question</strong><span>No eligible query result is on this setup Stage yet. The result must directly use a mirrored relation and return at least one row.</span></div>' : ""}${candidates.length ? `<form data-setup-proof-form class="setup-proof-form"><div class="setup-proof-results" role="radiogroup" aria-label="Eligible local query results">${candidates.map((candidate, index) => `<label class="${proof.selectedSurface === candidate.surface_id || (!proof.selectedSurface && index === 0) ? "selected" : ""}"><input type="radio" name="surface_id" value="${escapeHtml(candidate.surface_id)}" ${proof.selectedSurface === candidate.surface_id || (!proof.selectedSurface && index === 0) ? "checked" : ""}><i></i><span><strong>${escapeHtml(candidate.question || candidate.title)}</strong><small>${Number(candidate.row_count || 0).toLocaleString()} rows · ${escapeHtml((candidate.mirrored_relations || []).join(" · "))}</small><code>${escapeHtml(candidate.query_excerpt || "")}</code></span></label>`).join("")}</div><footer><span>Choose the result you inspected; its originating question and lineage are already recorded.</span><button class="primary" type="submit" ${proof.busy ? "disabled" : ""}>${proof.busy === "plan" ? "Preparing review…" : "Review evidence proof →"}</button></footer></form>` : ""}</div>`;
+  }
+
+  function setupKnowledgeMarkup() {
+    const google = state.config?.google_workspace || {};
+    const googleDocs = Boolean(google.enabled && google.documents_import && google.picker?.enabled);
+    const googleSheets = Boolean(google.enabled && google.sheets_import && google.picker?.enabled);
+    const cards = [
+      {
+        title: "Company documents",
+        copy: "Policies, operating guides, customer context, and other durable reference material for the company Brain.",
+        prompt: "Help me add the most useful company documents to the company Brain. Start by explaining the available installed ingestion path and what document set would be highest value.",
+      },
+      {
+        title: "Task, meeting, or service data",
+        copy: "Connect an installed MCP service such as Linear, meeting notes, or another company system, then test what Calliope can actually use.",
+        prompt: "Help me connect a company service. Search the installed capability catalog, reuse any saved credential, install and test the reversible integration directly, and tell me only if a missing secret needs the secure form.",
+      },
+      ...(googleDocs ? [{
+        title: "Google Docs",
+        copy: "The Google document picker is installed on this appliance.",
+        prompt: "Help me choose and add useful Google Docs to the company knowledge system using the installed Google integration.",
+      }] : []),
+      ...(googleSheets ? [{
+        title: "Google Sheets",
+        copy: "The Google Sheet picker is installed on this appliance.",
+        prompt: "Help me bring in a useful Google Sheet using the installed Google integration and verify the resulting snapshot.",
+      }] : []),
+    ];
+    return `<div class="setup-control-shell setup-first-boot"><header class="setup-control-head"><div><p class="eyebrow">Optional context · Calliope-guided</p><h2>Add documents and services</h2><p>These are useful follow-up projects, not launch blockers. Calliope can inspect what is installed, connect and test reversible integrations, and put only missing secret fields in a secure control.</p></div></header><div class="setup-preflight-grid">${cards.map((card) => `<article class="status-ready"><header><i></i><strong>${escapeHtml(card.title)}</strong><b>optional</b></header><p>${escapeHtml(card.copy)}</p><button type="button" data-setup-ask="${escapeHtml(card.prompt)}">Work through this with Calliope →</button></article>`).join("")}</div>${!googleDocs && !googleSheets ? '<div class="setup-control-warning"><strong>Google integration not installed</strong><span>Google Docs and Sheets choices stay hidden until their picker and OAuth integration are configured.</span></div>' : ""}<footer class="setup-controller-footer"><span>You can return to any of these from normal Calliope chat after launch.</span><b>no setup form required</b></footer></div>`;
+  }
+
+  function setupLaunchMarkup() {
+    const launch = state.setup.launch;
+    const status = state.setup.launchState || {};
+    if (status.launched) return `<div class="setup-control-shell setup-first-boot"><header class="setup-control-head"><div><p class="eyebrow">Hosted appliance · first boot complete</p><h2>${escapeHtml(state.setup.company.profile?.company_name || "Company brain")} is launched</h2><p>The hidden setup notebook remains the durable audit trail. Future changes can start in ordinary Calliope chat using the same reviewed controls.</p></div><button type="button" data-setup-open-calliope>Open Calliope →</button></header><section class="setup-launch-complete"><i>✓</i><div><strong>Launch revision ${Number(status.revision || 1)}</strong><span>${escapeHtml(status.launched_at ? `Approved ${relativeTime(status.launched_at)} by ${status.launched_by || "an administrator"}` : "First boot complete")}</span></div></section></div>`;
+    if (launch.plan) return `<div class="setup-control-shell setup-first-boot"><section class="setup-plan-review setup-launch-review"><header><span>Final approval · hosted first boot</span><h3>${escapeHtml(launch.plan.company_name || "Company brain")}</h3><p>Managed services passed, the company profile is reviewed, ${Number(launch.plan.successful_runs || 0)} mirror run${Number(launch.plan.successful_runs || 0) === 1 ? "" : "s"} succeeded, and a local-data result was verified.</p></header><dl class="setup-review-facts"><div><dt>Administrator</dt><dd>${escapeHtml(launch.plan.administrator)}</dd></div><div><dt>Profile</dt><dd>v${Number(launch.plan.profile_version || 1)}</dd></div><div><dt>Mirror jobs</dt><dd>${Number(launch.plan.mirror_jobs || 0)}</dd></div><div><dt>Deferred</dt><dd>documents & services</dd></div></dl><footer><span>Optional Google, documents, and MCP projects remain reopenable after launch.</span><div><button type="button" data-setup-edit-launch>Back</button><button class="primary" type="button" data-setup-apply-launch>Approve launch →</button></div></footer></section></div>`;
+    const facts = state.setup.facts || {};
+    const gates = [["preflight_ready", "Managed services"], ["company_ready", "Company profile"], ["database_ready", "Local mirror"], ["proof_ready", "Evidence proof"]];
+    return `<div class="setup-control-shell setup-first-boot"><header class="setup-control-head"><div><p class="eyebrow">Final review · reversible setup projects</p><h2>Review and launch</h2><p>Launch closes first boot; it does not hide this notebook or prevent any item from being reopened later.</p></div><button type="button" data-setup-review-launch ${!state.setup.progress.ready || launch.busy ? "disabled" : ""}>${launch.busy === "plan" ? "Preparing review…" : "Prepare launch review"}</button></header>${launch.error ? `<div class="setup-control-error" role="alert"><strong>Launch stopped</strong><span>${escapeHtml(launch.error)}</span></div>` : ""}<div class="setup-launch-gates">${gates.map(([key, label]) => `<article class="${facts[key] ? "ready" : "blocked"}"><i>${facts[key] ? "✓" : "·"}</i><span><strong>${label}</strong><small>${facts[key] ? "ready" : "not complete"}</small></span></article>`).join("")}</div><div class="setup-control-warning"><strong>Deferred by design</strong><span>Documents, task/meeting services, Google Workspace, and organization-wide Meet access are valuable follow-up projects—not first-boot blockers.</span></div></div>`;
+  }
+
+  function setupNonDatabaseMarkup(active) {
+    if (active === "preflight") return setupPreflightMarkup();
+    if (active === "administrator") return setupAdministratorMarkup();
+    if (active === "company") return setupCompanyMarkup();
+    if (active === "knowledge") return setupKnowledgeMarkup();
+    if (active === "proof") return setupProofMarkup();
+    if (active === "launch") return setupLaunchMarkup();
+    return "";
+  }
+
+  function renderSetupDatabaseStage() {
+    if (!SETUP_MODE || !els.setupStageControls) return;
+    const database = state.setup.database;
+    const active = state.setup.activeItem === "database";
+    if (!active) {
+      const markup = setupNonDatabaseMarkup(state.setup.activeItem);
+      els.setupStageControls.hidden = !markup;
+      els.setupStageControls.innerHTML = markup;
+      renderStageEmptyForSetupControls();
+      return;
+    }
+    els.setupStageControls.hidden = !active;
+    const snapshot = database.snapshot;
+    const connection = setupDatabaseConnection();
+    const worker = snapshot?.worker || {};
+    const runtimeReady = Boolean(worker.registered);
+    const authReady = Boolean(worker.authenticated);
+    const warehouseAuthReady = worker.warehouse_authenticated !== false;
+    const workerAuthReady = worker.worker_authenticated !== false;
+    const keyReady = Boolean(snapshot?.credential_store_ready);
+    const showConnectionForm = database.showConnectionForm || !connection;
+    const probeState = connection?.last_tested_at
+      ? connection.last_test_ok ? `Verified ${relativeTime(connection.last_tested_at)}` : "Last test needs attention"
+      : "Not tested yet";
+    const latestRun = setupLatestMirrorRun(connection);
+    els.setupStageControls.innerHTML = `<div class="setup-control-shell" aria-busy="${database.loading || Boolean(database.busy)}">
+      <header class="setup-control-head">
+        <div><p class="eyebrow">Company data · secure controller</p><h2>Connect and mirror a database</h2><p>Discover the source remotely, then copy only chosen tables into source-named schemas in this RVBBIT database.</p></div>
+        ${snapshot?.connections?.length ? '<button type="button" data-setup-add-connection>+ Add source</button>' : ""}
+      </header>
+      <div class="setup-controller-health">
+        <span class="${runtimeReady ? "ready" : "attention"}"><i></i>dlt worker ${runtimeReady ? "ready" : "missing"}</span>
+        <span class="${authReady ? "ready" : "attention"}"><i></i>controller auth ${authReady ? "ready" : "missing"}</span>
+        <span class="${keyReady ? "ready" : "attention"}"><i></i>encrypted store ${keyReady ? "ready" : "missing"}</span>
+        <b>Secrets never enter Calliope</b>
+      </div>
+      ${database.loading && !snapshot ? '<div class="setup-control-loading"><i></i><span>Reading the local mirror control plane…</span></div>' : ""}
+      ${!state.setup.canManage ? '<div class="setup-control-warning"><strong>Administrator access required</strong><span>The initial signed-in email must belong to the Admins Team before it can configure company-wide sources.</span></div>' : ""}
+      ${snapshot && !snapshot.installed ? '<div class="setup-control-warning"><strong>Mirror control plane not installed</strong><span>Apply the packaged RVBBIT migrations before connecting a source.</span></div>' : ""}
+      ${snapshot?.installed && !snapshot.available ? `<div class="setup-control-warning"><strong>One setup service still needs attention</strong><span>${!runtimeReady ? "Install or start data/dlt-mirror. " : ""}${!warehouseAuthReady ? "Set RVBBIT_MIRROR_TOKEN on Warehouse. " : ""}${!workerAuthReady ? "Set RVBBIT_MIRROR_TOKEN on the dlt worker and restart it. " : ""}${!authReady && warehouseAuthReady && workerAuthReady ? "Set the same RVBBIT_MIRROR_TOKEN on Warehouse and the worker. " : ""}${!keyReady ? "Configure the canonical RVBBIT credential key. " : ""}</span></div>` : ""}
+      ${database.error ? `<div class="setup-control-error" role="alert"><strong>Stopped safely</strong><span>${escapeHtml(database.error)}</span><button type="button" data-setup-dismiss-error>Dismiss</button></div>` : ""}
+      ${snapshot?.connections?.length ? `<nav class="setup-connection-tabs" aria-label="Database sources">${snapshot.connections.map((item) => `<button type="button" data-setup-use-connection="${escapeHtml(item.connection_name)}" aria-current="${item.connection_name === connection?.connection_name}"><i></i><span>${escapeHtml(item.label)}</span><small>${item.credential_configured ? "credential saved" : "credential missing"}</small></button>`).join("")}</nav>` : ""}
+      ${showConnectionForm && state.setup.canManage && snapshot?.installed ? setupConnectionFormMarkup(connection) : ""}
+      ${!showConnectionForm && connection ? `<section class="setup-source-workspace">
+        <header><div><span>${escapeHtml(connection.dialect)} source</span><h3>${escapeHtml(connection.label)}</h3><p><code>${escapeHtml(connection.credential_ref)}</code> · ${escapeHtml(probeState)}</p></div><button type="button" data-setup-replace-credential>Replace credential</button></header>
+        ${setupMirrorRunMarkup(connection)}
+        <div class="setup-source-actions">
+          <button type="button" data-setup-probe ${database.busy ? "disabled" : ""}>${database.busy === "probe" ? "Testing…" : "Test read-only connection"}</button>
+          <form data-setup-discovery-form>${setupSourceSchemaControl(connection)}<label class="setup-include-views"><input type="checkbox" name="include_views"><span>Include views</span></label><button class="primary" type="submit" ${database.busy || database.schemasLoading ? "disabled" : ""}>${database.busy === "discover" ? "Reading catalog…" : "Discover tables →"}</button></form>
+        </div>
+      </section>` : ""}
+      ${database.plan ? setupPlanMarkup(database.plan) : database.discovery ? setupTablePickerMarkup(database.discovery) : ""}
+      ${database.appliedRunId ? `<section class="setup-run-receipt"><i aria-hidden="true">✓</i><div><span>Local mirror queued</span><strong>${escapeHtml(database.appliedRunId)}</strong><small>${latestRun ? `Current state · ${escapeHtml(latestRun.latest_run_status || "queued")}` : "The dlt worker will claim this durable run."}</small></div><button type="button" data-setup-add-schema>Add another schema</button></section>` : ""}
+    </div>`;
+    renderStageEmptyForSetupControls();
+  }
+
+  function renderStageEmptyForSetupControls() {
+    if (!els.stageEmpty) return;
+    const hasControls = SETUP_MODE && !els.setupStageControls?.hidden;
+    const hasSurfaces = visibleStageSurfaces().filter((surface) => surface.kind !== "sketch").length > 0;
+    els.stageEmpty.hidden = Boolean(hasControls || hasSurfaces);
+    syncStageEmptyHeadlineRotation();
+  }
+
+  function setupStatusLabel(status) {
+    return ({ ready: "Complete", current: "In progress", optional: "Optional" })[status]
+      || "To do";
+  }
+
+  function renderSetupWorkspace() {
+    if (!SETUP_MODE || !els.setupTodoList) return;
+    const items = Array.isArray(state.setup.items) ? state.setup.items : [];
+    const progress = state.setup.progress || {};
+    const completed = Number(progress.completed || 0);
+    const total = Math.max(0, Number(progress.total || 0));
+    const percent = total ? Math.min(100, Math.round((completed / total) * 100)) : 0;
+    els.setupProgressLabel.textContent = progress.launched
+      ? "Setup complete"
+      : progress.ready
+        ? "Ready to launch"
+      : `${completed} of ${total}`;
+    els.setupProgressBar.style.width = `${percent}%`;
+    if (state.setup.loading && !items.length) {
+      els.setupTodoList.innerHTML = '<div class="setup-rail-state"><i></i><span>Checking this installation…</span></div>';
+      return;
+    }
+    if (state.setup.error && !items.length) {
+      els.setupTodoList.innerHTML = `<div class="setup-rail-state error"><span>${escapeHtml(state.setup.error)}</span></div>`;
+      return;
+    }
+    els.setupTodoList.innerHTML = items.map((item, index) => {
+      const status = String(item.status || "upcoming");
+      const marker = status === "ready" ? "✓" : status === "current" ? "→" : String(index + 1);
+      return `<button class="setup-todo status-${escapeHtml(status)}" type="button"
+          data-setup-item="${escapeHtml(item.id || "")}" data-setup-prompt="${escapeHtml(item.prompt || "")}"
+          ${state.setup.activeItem === item.id ? 'aria-current="step"' : ""}>
+        <span class="setup-todo-mark" aria-hidden="true">${escapeHtml(marker)}</span>
+        <span class="setup-todo-copy">
+          <span><strong>${escapeHtml(item.title || "Setup step")}</strong><b>${escapeHtml(setupStatusLabel(status))}</b></span>
+          <small>${escapeHtml(item.summary || "")}</small>
+        </span>
+      </button>`;
+    }).join("");
+  }
+
+  async function loadSetupWorkspace({ silent = false } = {}) {
+    if (!SETUP_MODE) return null;
+    if (!silent) state.setup.loading = true;
+    state.setup.error = "";
+    renderSetupWorkspace();
+    try {
+      const previousItems = Array.isArray(state.setup.items) ? state.setup.items : [];
+      const previousActiveItem = String(state.setup.activeItem || "");
+      const previousActiveStatus = previousItems.find(
+        (item) => String(item.id || "") === previousActiveItem,
+      )?.status;
+      const data = await api("/api/calliope/setup", { method: "POST", body: "{}" });
+      state.setup.items = data.items || [];
+      state.setup.progress = data.progress || { completed: 0, total: 0, ready: false, launched: false };
+      state.setup.facts = data.facts || {};
+      state.setup.identity = data.identity || null;
+      state.setup.launchState = data.launch || null;
+      state.setup.canManage = Boolean(data.can_manage);
+      state.setup.mutationToken = String(data.mutation_token || "");
+      if (data.company_profile) {
+        const changed = Number(state.setup.company.profile?.version || 0) !== Number(data.company_profile.version || 0);
+        state.setup.company.profile = data.company_profile;
+        if (!state.setup.company.draft || changed) {
+          state.setup.company.draft = setupCompanyDraft(data.company_profile);
+        }
+      }
+      const nextRequiredItem = state.setup.items.find(
+        (item) => item.required && item.status !== "ready",
+      );
+      const activeStillExists = state.setup.items.some(
+        (item) => String(item.id || "") === previousActiveItem,
+      );
+      const activeNowReady = state.setup.items.find(
+        (item) => String(item.id || "") === previousActiveItem,
+      )?.status === "ready";
+      if (
+        !previousActiveItem
+        || !activeStillExists
+        || (previousActiveStatus && previousActiveStatus !== "ready" && activeNowReady)
+      ) {
+        state.setup.activeItem = nextRequiredItem?.id
+          || (state.setup.progress.launched ? "launch" : "")
+          || state.setup.items.find((item) => item.status === "current")?.id
+          || state.setup.items[0]?.id
+          || "company";
+      }
+      renderSetupDatabaseStage();
+      return data;
+    } catch (error) {
+      state.setup.error = error.message || "Setup status is unavailable.";
+      throw error;
+    } finally {
+      state.setup.loading = false;
+      renderSetupWorkspace();
+    }
+  }
+
+  async function loadSetupPreflight({ silent = false } = {}) {
+    if (!SETUP_MODE || !state.setup.canManage) return null;
+    const preflight = state.setup.preflight;
+    if (!silent) preflight.loading = true;
+    preflight.error = "";
+    renderSetupDatabaseStage();
+    try {
+      const data = await api("/api/calliope/setup/preflight");
+      preflight.snapshot = data;
+      return data;
+    } catch (error) {
+      preflight.error = error.message || "Managed-service inventory is unavailable.";
+      throw error;
+    } finally {
+      preflight.loading = false;
+      renderSetupDatabaseStage();
+    }
+  }
+
+  async function runSetupPreflight() {
+    if (!state.setup.mutationToken) return;
+    const preflight = state.setup.preflight;
+    preflight.busy = true;
+    preflight.error = "";
+    renderSetupDatabaseStage();
+    try {
+      const data = await api("/api/calliope/setup/preflight", setupMutationOptions());
+      preflight.snapshot = data.preflight;
+      toast(data.preflight?.ready ? "Managed services passed active checks" : "Managed services need operator attention", !data.preflight?.ready);
+      await refreshSetupReceipts();
+    } catch (error) {
+      preflight.error = error.message;
+    } finally {
+      preflight.busy = false;
+      renderSetupDatabaseStage();
+    }
+  }
+
+  async function loadSetupCompany({ silent = false } = {}) {
+    if (!SETUP_MODE || !state.setup.canManage) return null;
+    const company = state.setup.company;
+    if (!silent) company.loading = true;
+    company.error = "";
+    renderSetupDatabaseStage();
+    try {
+      const data = await api("/api/calliope/setup/company");
+      const changed = Number(company.profile?.version || 0) !== Number(data.profile?.version || 0);
+      company.profile = data.profile || null;
+      if (!company.draft || changed) company.draft = setupCompanyDraft(company.profile);
+      return data;
+    } catch (error) {
+      company.error = error.message || "The company profile is unavailable.";
+      throw error;
+    } finally {
+      company.loading = false;
+      renderSetupDatabaseStage();
+    }
+  }
+
+  function rememberSetupCompanyControl(control) {
+    if (!control?.name) return false;
+    const editable = new Set([
+      "company_name", "summary", "timezone", "fiscal_year_start_month",
+      "week_starts_on", "reporting_calendar_notes", "terminology",
+    ]);
+    if (!editable.has(control.name)) return false;
+    const company = state.setup.company;
+    if (!company.draft) company.draft = setupCompanyDraft(company.profile);
+    company.draft[control.name] = control.name === "fiscal_year_start_month"
+      ? Number(control.value || 1)
+      : control.value;
+    company.plan = null;
+    company.planToken = "";
+    return true;
+  }
+
+  function setupCompanyFormBody(form) {
+    const terminologyText = String(form.elements.namedItem("terminology")?.value || "");
+    const terminology = terminologyText.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).map((line) => {
+      const separator = line.indexOf("=");
+      if (separator < 1 || !line.slice(separator + 1).trim()) {
+        throw new Error(`Use “term = meaning” for terminology: ${line.slice(0, 80)}`);
+      }
+      return { term: line.slice(0, separator).trim(), meaning: line.slice(separator + 1).trim() };
+    });
+    const body = {
+      expected_profile_version: Number(state.setup.company.profile?.version || 0),
+      company_name: form.elements.namedItem("company_name")?.value,
+      summary: form.elements.namedItem("summary")?.value,
+      timezone: form.elements.namedItem("timezone")?.value,
+      fiscal_year_start_month: Number(form.elements.namedItem("fiscal_year_start_month")?.value || 1),
+      week_starts_on: form.elements.namedItem("week_starts_on")?.value,
+      reporting_calendar_notes: form.elements.namedItem("reporting_calendar_notes")?.value,
+      terminology,
+      business_questions: state.setup.company.profile?.business_questions || [],
+    };
+    state.setup.company.draft = {
+      ...body,
+      terminology: terminologyText,
+    };
+    return body;
+  }
+
+  async function reviewSetupCompany(form) {
+    if (!form.reportValidity() || !state.setup.mutationToken) return;
+    const company = state.setup.company;
+    company.busy = "plan";
+    company.error = "";
+    try {
+      const body = setupCompanyFormBody(form);
+      renderSetupDatabaseStage();
+      const data = await api("/api/calliope/setup/company/plan", setupMutationOptions(body));
+      company.plan = data.plan;
+      company.planToken = data.plan_token;
+    } catch (error) {
+      company.error = error.message;
+    } finally {
+      company.busy = "";
+      renderSetupDatabaseStage();
+    }
+  }
+
+  async function applySetupCompany() {
+    const company = state.setup.company;
+    if (!company.plan || !company.planToken || !state.setup.mutationToken) return;
+    company.busy = "apply";
+    company.error = "";
+    renderSetupDatabaseStage();
+    try {
+      const data = await api("/api/calliope/setup/company/apply", setupMutationOptions({
+        plan: company.plan,
+        plan_token: company.planToken,
+      }));
+      company.profile = data.profile;
+      company.draft = setupCompanyDraft(data.profile);
+      company.plan = null;
+      company.planToken = "";
+      toast("Reviewed company profile saved");
+      await refreshSetupReceipts();
+    } catch (error) {
+      company.error = error.message;
+    } finally {
+      company.busy = "";
+      renderSetupDatabaseStage();
+    }
+  }
+
+  async function loadSetupProof({ silent = false } = {}) {
+    if (!SETUP_MODE || !state.setup.canManage) return null;
+    const proof = state.setup.proof;
+    if (!silent) proof.loading = true;
+    proof.error = "";
+    renderSetupDatabaseStage();
+    try {
+      const data = await api("/api/calliope/setup/proof");
+      proof.snapshot = data;
+      if (!data.candidates?.some((item) => item.surface_id === proof.selectedSurface)) {
+        proof.selectedSurface = data.candidates?.[0]?.surface_id || "";
+      }
+      return data;
+    } catch (error) {
+      proof.error = error.message || "Eligible local query results are unavailable.";
+      throw error;
+    } finally {
+      proof.loading = false;
+      renderSetupDatabaseStage();
+    }
+  }
+
+  async function reviewSetupProof(form) {
+    if (!form.reportValidity() || !state.setup.mutationToken) return;
+    const proof = state.setup.proof;
+    proof.busy = "plan";
+    proof.error = "";
+    renderSetupDatabaseStage();
+    try {
+      const data = await api("/api/calliope/setup/proof/plan", setupMutationOptions({
+        surface_id: form.elements.namedItem("surface_id")?.value,
+      }));
+      proof.plan = data.plan;
+      proof.planToken = data.plan_token;
+    } catch (error) {
+      proof.error = error.message;
+    } finally {
+      proof.busy = "";
+      renderSetupDatabaseStage();
+    }
+  }
+
+  async function applySetupProof() {
+    const proof = state.setup.proof;
+    if (!proof.plan || !proof.planToken || !state.setup.mutationToken) return;
+    proof.busy = "apply";
+    proof.error = "";
+    renderSetupDatabaseStage();
+    try {
+      await api("/api/calliope/setup/proof/apply", setupMutationOptions({
+        plan: proof.plan,
+        plan_token: proof.planToken,
+      }));
+      proof.plan = null;
+      proof.planToken = "";
+      toast("First local-data answer verified");
+      await refreshSetupReceipts();
+    } catch (error) {
+      proof.error = error.message;
+    } finally {
+      proof.busy = "";
+      renderSetupDatabaseStage();
+    }
+  }
+
+  async function reviewSetupLaunch() {
+    const launch = state.setup.launch;
+    if (!state.setup.mutationToken) return;
+    launch.busy = "plan";
+    launch.error = "";
+    renderSetupDatabaseStage();
+    try {
+      const data = await api("/api/calliope/setup/launch/plan", setupMutationOptions());
+      launch.plan = data.plan;
+      launch.planToken = data.plan_token;
+    } catch (error) {
+      launch.error = error.message;
+    } finally {
+      launch.busy = "";
+      renderSetupDatabaseStage();
+    }
+  }
+
+  async function applySetupLaunch() {
+    const launch = state.setup.launch;
+    if (!launch.plan || !launch.planToken || !state.setup.mutationToken) return;
+    launch.busy = "apply";
+    launch.error = "";
+    renderSetupDatabaseStage();
+    try {
+      await api("/api/calliope/setup/launch/apply", setupMutationOptions({
+        plan: launch.plan,
+        plan_token: launch.planToken,
+      }));
+      launch.plan = null;
+      launch.planToken = "";
+      toast("Hosted first boot complete");
+      await refreshSetupReceipts();
+    } catch (error) {
+      launch.error = error.message;
+    } finally {
+      launch.busy = "";
+      renderSetupDatabaseStage();
+    }
+  }
+
+  function setupDatabaseSelections(discovery) {
+    const next = {};
+    for (const table of discovery?.tables || []) {
+      const prior = state.setup.database.selections[table.name] || {};
+      next[table.name] = {
+        selected: Boolean(prior.selected),
+        destination_table: prior.destination_table || table.destination_table || setupDefaultDestinationTable(table.name),
+        load_mode: prior.load_mode || "snapshot",
+        cursor_column: prior.cursor_column || "",
+      };
+    }
+    state.setup.database.selections = next;
+  }
+
+  function setupRefreshPoll() {
+    clearTimeout(state.setup.database.pollTimer);
+    state.setup.database.pollTimer = null;
+    const latest = setupLatestMirrorRun();
+    if (!latest || !["queued", "running"].includes(String(latest.latest_run_status || ""))) return;
+    state.setup.database.pollTimer = setTimeout(async () => {
+      try {
+        await loadSetupDatabases({ silent: true });
+        const current = setupLatestMirrorRun();
+        if (current && !["queued", "running"].includes(String(current.latest_run_status || ""))) {
+          await Promise.allSettled([
+            loadSetupWorkspace({ silent: true }),
+            loadSetupProof({ silent: true }),
+            state.current?.id ? selectSession(state.current.id, { focusComposer: false, preserveActivity: true, allowDuringTurn: true }) : Promise.resolve(),
+          ]);
+          if (current.latest_run_status === "succeeded") toast("First database mirror finished locally");
+        }
+      } catch { /* the visible controller retains the last durable state */ }
+    }, 2_000);
+  }
+
+  async function loadSetupDatabases({ silent = false } = {}) {
+    if (!SETUP_MODE) return null;
+    const database = state.setup.database;
+    if (!state.setup.canManage) {
+      database.loading = false;
+      renderSetupDatabaseStage();
+      return null;
+    }
+    if (!silent) database.loading = true;
+    database.error = "";
+    renderSetupDatabaseStage();
+    try {
+      const snapshot = await api("/api/calliope/setup/databases");
+      database.snapshot = snapshot;
+      const connections = snapshot.connections || [];
+      if (!connections.some((item) => item.connection_name === database.selectedConnection)) {
+        database.selectedConnection = connections[0]?.connection_name || "";
+      }
+      const connection = setupDatabaseConnection();
+      if (!database.destinationSchema && connection) {
+        database.destinationSchema = setupDefaultDestinationSchema(connection);
+      }
+      if (
+        connection?.credential_configured
+        && connection.last_test_ok
+        && database.schemaConnection !== connection.connection_name
+      ) {
+        await loadSetupSchemas({ silent: true });
+      }
+      setupRefreshPoll();
+      return snapshot;
+    } catch (error) {
+      database.error = error.message || "Database setup state is unavailable.";
+      throw error;
+    } finally {
+      database.loading = false;
+      renderSetupDatabaseStage();
+    }
+  }
+
+  async function loadSetupSchemas({ silent = false } = {}) {
+    const connection = setupDatabaseConnection();
+    if (!connection || !state.setup.mutationToken) return null;
+    const database = state.setup.database;
+    if (!silent) database.schemasLoading = true;
+    database.schemaConnection = connection.connection_name;
+    renderSetupDatabaseStage();
+    try {
+      const data = await api(`/api/calliope/setup/databases/${encodeURIComponent(connection.connection_name)}/schemas`, setupMutationOptions());
+      if (setupDatabaseConnection()?.connection_name !== connection.connection_name) return null;
+      database.schemaDiscovery = data.schema_discovery || { introspection_supported: false, schemas: [] };
+      const schemas = database.schemaDiscovery.schemas || [];
+      if (!database.sourceSchema || !schemas.includes(database.sourceSchema)) {
+        database.sourceSchema = database.schemaDiscovery.default_schema || schemas[0] || "";
+      }
+      return database.schemaDiscovery;
+    } catch (error) {
+      if (setupDatabaseConnection()?.connection_name === connection.connection_name) {
+        database.schemaDiscovery = {
+          introspection_supported: false,
+          schemas: [],
+          error: error.message,
+        };
+      }
+      return null;
+    } finally {
+      database.schemasLoading = false;
+      renderSetupDatabaseStage();
+    }
+  }
+
+  async function refreshSetupReceipts() {
+    await Promise.allSettled([
+      loadSetupWorkspace({ silent: true }),
+      loadSetupProof({ silent: true }),
+      state.current?.id
+        ? selectSession(state.current.id, {
+          focusComposer: false,
+          preserveActivity: true,
+          allowDuringTurn: true,
+        })
+        : Promise.resolve(),
+    ]);
+  }
+
+  async function saveSetupConnection(form) {
+    if (!form.reportValidity() || !state.setup.mutationToken) return;
+    const database = state.setup.database;
+    const secretInput = form.elements.namedItem("source_dsn");
+    let sourceDsn = String(secretInput?.value || "");
+    let requestBody = JSON.stringify({
+      connection_name: form.elements.namedItem("connection_name")?.value,
+      label: form.elements.namedItem("label")?.value,
+      dialect: form.elements.namedItem("dialect")?.value,
+      environment: form.elements.namedItem("environment")?.value,
+      source_dsn: sourceDsn,
+    });
+    database.busy = "credential";
+    database.error = "";
+    renderSetupDatabaseStage();
+    const request = api("/api/calliope/setup/databases", {
+      method: "POST",
+      headers: { "X-Calliope-Setup-Token": state.setup.mutationToken },
+      body: requestBody,
+    });
+    if (secretInput) secretInput.value = "";
+    sourceDsn = "";
+    requestBody = "";
+    try {
+      const data = await request;
+      database.snapshot = data.database;
+      database.selectedConnection = data.connection_name;
+      database.showConnectionForm = false;
+      database.connectionFormMode = "";
+      database.discovery = null;
+      database.plan = null;
+      database.planToken = "";
+      database.destinationSchema = setupDefaultDestinationSchema(setupDatabaseConnection());
+      toast("Database credential saved securely");
+      await loadSetupSchemas({ silent: true });
+      await refreshSetupReceipts();
+    } catch (error) {
+      database.error = error.message;
+    } finally {
+      database.busy = "";
+      renderSetupDatabaseStage();
+    }
+  }
+
+  async function probeSetupConnection() {
+    const connection = setupDatabaseConnection();
+    if (!connection || !state.setup.mutationToken) return;
+    const database = state.setup.database;
+    database.busy = "probe";
+    database.error = "";
+    renderSetupDatabaseStage();
+    try {
+      const data = await api(`/api/calliope/setup/databases/${encodeURIComponent(connection.connection_name)}/probe`, setupMutationOptions());
+      database.snapshot = data.database;
+      toast(`Connection verified in ${Number(data.probe?.elapsed_ms || 0).toLocaleString()} ms`);
+      await loadSetupSchemas({ silent: true });
+      await refreshSetupReceipts();
+    } catch (error) {
+      database.error = error.message;
+      await Promise.allSettled([loadSetupDatabases({ silent: true }), refreshSetupReceipts()]);
+    } finally {
+      database.busy = "";
+      renderSetupDatabaseStage();
+    }
+  }
+
+  async function discoverSetupTables(form) {
+    const connection = setupDatabaseConnection();
+    if (!connection || !form.reportValidity() || !state.setup.mutationToken) return;
+    const database = state.setup.database;
+    database.sourceSchema = String(form.elements.namedItem("source_schema")?.value || "").trim();
+    database.busy = "discover";
+    database.error = "";
+    database.plan = null;
+    renderSetupDatabaseStage();
+    try {
+      const data = await api(`/api/calliope/setup/databases/${encodeURIComponent(connection.connection_name)}/discover`, setupMutationOptions({
+        source_schema: database.sourceSchema,
+        include_views: Boolean(form.elements.namedItem("include_views")?.checked),
+        limit: 500,
+      }));
+      database.discovery = data.discovery;
+      database.sourceSchema = data.discovery?.schema || database.sourceSchema;
+      setupDatabaseSelections(data.discovery);
+      toast(`${Number(data.discovery?.tables?.length || 0).toLocaleString()} source tables discovered`);
+      await refreshSetupReceipts();
+    } catch (error) {
+      database.error = error.message;
+    } finally {
+      database.busy = "";
+      renderSetupDatabaseStage();
+    }
+  }
+
+  function setupPlanBody() {
+    const database = state.setup.database;
+    const discoveryTables = database.discovery?.tables || [];
+    const tables = discoveryTables.flatMap((table) => {
+      const selection = database.selections[table.name];
+      if (!selection?.selected) return [];
+      return [{
+        source_table: table.name,
+        destination_table: selection.destination_table,
+        load_mode: selection.load_mode || "snapshot",
+        primary_key: table.primary_key || null,
+        cursor_column: selection.load_mode === "incremental_upsert" ? selection.cursor_column : null,
+        included_columns: null,
+      }];
+    });
+    return {
+      source_schema: database.sourceSchema || database.discovery?.schema,
+      destination_schema: database.destinationSchema,
+      schedule_seconds: database.scheduleSeconds || null,
+      run_now: true,
+      tables,
+    };
+  }
+
+  async function reviewSetupPlan() {
+    const connection = setupDatabaseConnection();
+    if (!connection || !state.setup.mutationToken) return;
+    const database = state.setup.database;
+    database.busy = "plan";
+    database.error = "";
+    renderSetupDatabaseStage();
+    try {
+      const data = await api(`/api/calliope/setup/databases/${encodeURIComponent(connection.connection_name)}/plan`, setupMutationOptions(setupPlanBody()));
+      database.plan = data.plan;
+      database.planToken = data.plan_token;
+    } catch (error) {
+      database.error = error.message;
+    } finally {
+      database.busy = "";
+      renderSetupDatabaseStage();
+    }
+  }
+
+  async function applySetupPlan() {
+    const connection = setupDatabaseConnection();
+    const database = state.setup.database;
+    if (!connection || !database.plan || !database.planToken || !state.setup.mutationToken) return;
+    database.busy = "apply";
+    database.error = "";
+    renderSetupDatabaseStage();
+    try {
+      const data = await api(`/api/calliope/setup/databases/${encodeURIComponent(connection.connection_name)}/apply`, setupMutationOptions({
+        plan: database.plan,
+        plan_token: database.planToken,
+      }));
+      database.snapshot = data.database;
+      database.appliedRunId = data.run_id || "configured";
+      database.plan = null;
+      database.planToken = "";
+      database.discovery = null;
+      database.sourceSchema = "";
+      database.selections = {};
+      toast(data.run_id ? "First local mirror queued" : "Mirror configuration saved");
+      await refreshSetupReceipts();
+      setupRefreshPoll();
+    } catch (error) {
+      database.error = error.message;
+    } finally {
+      database.busy = "";
+      renderSetupDatabaseStage();
+    }
+  }
+
+  function applySetupModeChrome() {
+    if (!SETUP_MODE) return;
+    const brand = $(".brand");
+    const switcher = $(".mobile-switcher");
+    if (brand) brand.setAttribute("aria-label", "Calliope setup");
+    if (switcher) switcher.setAttribute("aria-label", "Setup views");
+    els.setupRail?.closest("aside")?.setAttribute("aria-label", "Setup checklist");
+    if (els.stageEyebrow) els.stageEyebrow.textContent = "Guided setup stage";
+    if (els.chatEyebrow) els.chatEyebrow.textContent = "Your setup guide";
+    if (els.chatEmptyCopy) {
+      els.chatEmptyCopy.textContent = "Tell Calliope about the company or choose a setup step. She will test connections and put table choices, query results, and working controls on the stage.";
+    }
+    els.stageEmptyHeadline.textContent = "Setup work appears here.";
+    els.stageEmptyHeadline.dataset.length = "short";
+    if (els.stageEmptyCopy) {
+      els.stageEmptyCopy.textContent = "Connection tests, table pickers, query results, and other setup artifacts stay visible here while the conversation continues.";
+    }
+    composerSetPlaceholder("Tell Calliope about your company or choose a setup step…");
+    const mobileLabel = $("b", els.mobileSessions);
+    const mobileMark = $("span", els.mobileSessions);
+    if (mobileLabel) mobileLabel.textContent = "Setup";
+    if (mobileMark) mobileMark.textContent = "✓";
+    els.mobileSessions.setAttribute("aria-label", "Show setup checklist");
   }
 
   function setStatus(label, mode = "") {
@@ -3198,6 +4710,7 @@
       cube: "▦",
       metric: "◆",
       workflow: "⌘",
+      playbook: "≋",
       instrument: "⌁",
       watch: "◌",
       identity: "◎",
@@ -3812,13 +5325,15 @@
       const secretName = String(field.secret_name || key.replace(/^secret:/, ""));
       const savedNames = state.action?.secure_state?.saved_names || [];
       const saved = field.secret_group ? Boolean(savedNames.length) : savedNames.includes(secretName);
+      const reusable = field.allow_reuse !== false;
       const savedHelp = saved
         ? `<small class="action-secret-saved">${field.secret_group
-          ? `${savedNames.length} named ${savedNames.length === 1 ? "value" : "values"} already saved securely`
-          : `Saved securely for ${escapeHtml(state.action.secure_state?.server || "this connection")}`} · leave blank to reuse</small>`
+          ? `${savedNames.length} named ${savedNames.length === 1 ? "value" : "values"} ${reusable ? "already saved securely" : "currently saved securely"}`
+          : `Saved securely for ${escapeHtml(state.action.secure_state?.server || "this connection")}`}${reusable ? " · leave blank to reuse" : " · enter the replacement below"}</small>`
         : "";
-      const placeholder = saved ? "Saved — enter only to replace" : field.placeholder || "Enter securely when applying";
-      return `<label class="action-field"><span>${label}${marker}</span><input type="password" name="${escapeHtml(key)}" maxlength="12000" autocomplete="new-password" placeholder="${escapeHtml(placeholder)}">${savedHelp}${help}</label>`;
+      const placeholder = saved && reusable ? "Saved — enter only to replace" : field.placeholder || "Enter securely when applying";
+      const secureRequired = required && !(saved && reusable) ? "required" : "";
+      return `<label class="action-field"><span>${label}${marker}</span><input type="password" name="${escapeHtml(key)}" maxlength="12000" autocomplete="new-password" ${secureRequired} placeholder="${escapeHtml(placeholder)}">${savedHelp}${help}</label>`;
     }
     const pattern = field.pattern ? ` pattern="${escapeHtml(field.pattern)}"` : "";
     return `<label class="action-field"><span>${label}${marker}</span><input type="text" name="${escapeHtml(key)}" value="${escapeHtml(value ?? "")}" maxlength="12000" ${required ? "required" : ""}${pattern} placeholder="${escapeHtml(field.placeholder || "")}">${help}</label>`;
@@ -3872,7 +5387,7 @@
     const status = run.status || "planned";
     els.actionPlanSummary.textContent = plan.summary || state.action?.summary || "Review this change";
     els.actionPlanStatus.textContent = ({
-      planned: "Awaiting approval", running: "Applying now", complete: "Verified", failed: "Needs attention",
+      planned: "Ready to run", running: "Applying now", complete: "Verified", failed: "Needs attention",
     })[status] || status;
     els.actionPlanStatus.className = status;
     const steps = Array.isArray(run.steps) && run.steps.length ? run.steps : plan.steps || [];
@@ -3888,20 +5403,29 @@
     const action = state.action;
     const run = state.actionPlan;
     const guided = action?.executor === "conversation";
+    const receiptOnly = Boolean(action?.receipt_only);
     const running = state.actionExecuting || run?.status === "running";
-    els.actionOpenWithCalliope.hidden = !action;
+    els.actionOpenWithCalliope.hidden = !action || receiptOnly;
     els.actionOpenWithCalliope.disabled = running;
     els.actionOpenWithCalliope.textContent = guided ? "Open with Calliope →" : "Discuss with Calliope";
-    els.actionCreatePlan.hidden = !action || guided;
+    els.actionCreatePlan.hidden = !action || guided || receiptOnly;
     els.actionCreatePlan.disabled = running;
-    els.actionCreatePlan.textContent = run?.status && run.status !== "planned" ? "Review another change →" : "Review change →";
-    els.actionApply.hidden = !action || guided || run?.status !== "planned";
+    els.actionCreatePlan.textContent = running ? "Applying & testing…" : (
+      action?.executor === "mcp_connect" ? "Connect & verify →"
+        : action?.executor === "capability_install" ? "Install & verify →"
+          : "Apply & verify →"
+    );
+    // Kept in the DOM only so old planned receipts remain render-compatible.
+    // New and retried changes always use the one-step direct execution path.
+    els.actionApply.hidden = true;
     els.actionApply.disabled = running;
-    els.actionApply.textContent = running ? "Applying…" : "Approve & apply →";
+    els.actionApply.textContent = running ? "Applying…" : "Apply legacy receipt →";
     [...els.actionDetailForm.elements].forEach((control) => { control.disabled = running; });
     syncActionFieldVisibility(running);
     if (!action) return;
-    if (guided) {
+    if (receiptOnly && run?.status === "planned") {
+      els.actionDetailNote.textContent = "This exact SQL is waiting for explicit approval in its originating Calliope conversation.";
+    } else if (guided) {
       els.actionDetailNote.textContent = action.missing_requirements?.length
         ? "Calliope will help resolve the missing setup before using this outcome."
         : "Your structured choices seed a fresh Calliope notebook; nothing changes yet.";
@@ -3910,11 +5434,11 @@
     } else if (run?.status === "failed") {
       els.actionDetailNote.textContent = run.error || "The change stopped safely. Inspect the failed step before trying again.";
     } else if (running) {
-      els.actionDetailNote.textContent = "Applying the approved plan and checking each result…";
+      els.actionDetailNote.textContent = "Applying the requested change and checking each result…";
     } else if (run?.status === "planned") {
-      els.actionDetailNote.textContent = "This exact plan is frozen. Approve it to apply, or change an input to review a new plan.";
+      els.actionDetailNote.textContent = "This legacy receipt has not run. Submit the current fields to apply and verify a fresh change.";
     } else {
-      els.actionDetailNote.textContent = "Nothing changes until you review and approve the plan.";
+      els.actionDetailNote.textContent = "Submitting applies and verifies this change directly, with a durable redacted receipt.";
     }
   }
 
@@ -4093,20 +5617,37 @@
     }
   }
 
-  async function createActionPlan() {
+  async function executeActionDirect() {
     if (!state.action || state.action.executor === "conversation" || !els.actionDetailForm.reportValidity()) return;
-    els.actionCreatePlan.disabled = true;
+    if (state.actionExecuting) return;
+    state.actionExecuting = true;
+    syncActionControls();
+    const request = api(`/api/calliope/actions/${encodeURIComponent(state.action.id)}/execute`, {
+      method: "POST",
+      body: JSON.stringify({ inputs: actionInputs(true), session_id: state.current?.id || null }),
+    });
+    // Plaintext exists only in this native request envelope. Clear the DOM as
+    // soon as fetch has copied the body so it cannot linger in UI state.
+    $$('input[type="password"]', els.actionDetailForm)
+      .forEach((input) => { input.value = ""; });
+    let executionError = null;
     try {
-      const data = await api(`/api/calliope/actions/${encodeURIComponent(state.action.id)}/plan`, {
-        method: "POST",
-        body: JSON.stringify({ inputs: actionInputs(false), session_id: state.current?.id || null }),
-      });
+      const data = await request;
       state.actionPlan = data.run;
+    } catch (error) {
+      executionError = error;
+      if (error.payload?.run) state.actionPlan = error.payload.run;
+    } finally {
+      state.actionExecuting = false;
       renderActionPlan();
       syncActionControls();
-      await loadActionHistory();
-    } finally {
-      syncActionControls();
+      await Promise.allSettled([loadActionHistory(), loadActions()]);
+    }
+    if (state.actionPlan?.status === "complete") {
+      toast("Change applied and verified");
+      await retestRemediatedWorkflow();
+    } else if (executionError) {
+      throw executionError;
     }
   }
 
@@ -5966,12 +7507,18 @@
     return Boolean(session?.workflow_run_id && session?.workflow_id);
   }
 
+  function isWorkOrderRunSession(session) {
+    return Boolean(session?.work_order_run_id && session?.work_order_id);
+  }
+
   function isInstrumentRunSession(session) {
     return Boolean(session?.instrument_run_surface_id && session?.instrument_id);
   }
 
   function isRunSession(session) {
-    return isWorkflowRunSession(session) || isInstrumentRunSession(session);
+    return isWorkflowRunSession(session)
+      || isInstrumentRunSession(session)
+      || isWorkOrderRunSession(session);
   }
 
   function isActionSession(session) {
@@ -6009,6 +7556,8 @@
       session.brief_date,
       session.workflow_name,
       session.workflow_run_status,
+      session.work_order_title,
+      session.work_order_run_status,
       session.instrument_name,
       session.action_title,
       session.action_id,
@@ -6023,6 +7572,9 @@
     }
     if (isWorkflowRunSession(session)) {
       terms.push("workflow run", "workflow runs");
+    }
+    if (isWorkOrderRunSession(session)) {
+      terms.push("assigned to callie", "assignment run", "scheduled work");
     }
     if (isInstrumentRunSession(session)) {
       terms.push("instrument run", "instrument runs");
@@ -6044,8 +7596,10 @@
     }
     if (tab === "runs") {
       return sessions.sort((left, right) => String(
-        right.workflow_run_started_at || right.updated_at || ""
-      ).localeCompare(String(left.workflow_run_started_at || left.updated_at || "")));
+        right.work_order_run_started_at || right.workflow_run_started_at || right.updated_at || ""
+      ).localeCompare(String(
+        left.work_order_run_started_at || left.workflow_run_started_at || left.updated_at || ""
+      )));
     }
     if (tab === "actions") {
       return sessions.sort((left, right) => String(
@@ -6071,6 +7625,10 @@
 
   function rememberSession(session) {
     if (!session?.id) return;
+    if (SETUP_MODE) {
+      state.lastSessionId = session.id;
+      return;
+    }
     const tab = sessionTabFor(session);
     state.lastSessionId = session.id;
     state.lastSessionsByTab = { ...state.lastSessionsByTab, [tab]: session.id };
@@ -6102,7 +7660,9 @@
   async function loadSessions(selectId = null, refreshCurrent = false, options = {}) {
     const activityGeneration = state.turnActivityGeneration;
     const allowDuringTurn = options.allowDuringTurn === true;
-    const data = await api("/api/calliope/sessions");
+    const data = await api(
+      SETUP_MODE ? "/api/calliope/sessions?purpose=setup" : "/api/calliope/sessions",
+    );
     state.sessions = data.sessions || [];
     if (!visibleSessionTabs().some((tab) => tab.id === state.sessionTab)) {
       setSessionTabState("chats");
@@ -6187,19 +7747,21 @@
     const action = kind === "actions";
     const workflowRun = run && isWorkflowRunSession(session);
     const instrumentRun = run && isInstrumentRunSession(session);
+    const workOrderRun = run && isWorkOrderRunSession(session);
     const count = Number(session.surface_count || 0);
     const dots = Array.from({ length: Math.min(4, count) }, () => "<i></i>").join("");
     const title = brief
       ? briefDateLabel(session.brief_date)
       : run
         ? session.workflow_name
+          || session.work_order_title
           || session.instrument_name
           || String(session.title || "").replace(/^Run ·\s*/, "")
         : action
           ? session.action_title || String(session.title || "").replace(/^Action ·\s*/, "")
         : session.title;
     const detail = run
-      ? `${workflowRun ? session.workflow_run_status || "running" : instrumentRun ? "instrument" : "run"} · ${count} surface${count === 1 ? "" : "s"}`
+      ? `${workflowRun ? session.workflow_run_status || "running" : workOrderRun ? session.work_order_run_status || "running" : instrumentRun ? "instrument" : "run"} · ${count} surface${count === 1 ? "" : "s"}`
       : action
         ? `guided action · ${count} surface${count === 1 ? "" : "s"}`
       : `${count} surface${count === 1 ? "" : "s"}`;
@@ -6212,7 +7774,7 @@
       <button class="session-card ${shared ? "shared-session-card" : ""} ${brief ? "brief-session-card" : ""} ${run ? "run-session-card" : ""} ${action ? "action-session-card" : ""} ${state.current?.id === session.id ? "active" : ""}"
               type="button" role="listitem" data-session-id="${escapeHtml(session.id)}"
               ${brief ? `data-brief-date="${escapeHtml(session.brief_date)}"` : ""}
-              ${run ? `data-run-status="${escapeHtml(workflowRun ? session.workflow_run_status || "running" : "instrument")}"` : ""}
+              ${run ? `data-run-status="${escapeHtml(workflowRun ? session.workflow_run_status || "running" : workOrderRun ? session.work_order_run_status || "running" : "instrument")}"` : ""}
               ${action ? `data-session-action-id="${escapeHtml(session.action_id)}"` : ""}
               ${brief || run || action ? `title="${escapeHtml(session.title)}"` : ""}>
         <div class="session-card-title">${shared ? personAvatarMarkup(owner) : ""}<h3>${escapeHtml(title)}</h3>${shareMark}</div>
@@ -6221,6 +7783,50 @@
         <p class="session-meta"><span>${escapeHtml(relativeTime(session.updated_at))}</span><span>${escapeHtml(detail)}</span></p>
         <span class="session-glyphs" aria-hidden="true">${dots}</span>
       </button>`;
+  }
+
+  function readCollapsedWorkOrderGroups() {
+    try {
+      const value = JSON.parse(localStorage.getItem("rvbbit-calliope-work-order-run-groups-v1") || "[]");
+      return new Set(Array.isArray(value) ? value.map(String) : []);
+    } catch {
+      return new Set();
+    }
+  }
+
+  function persistCollapsedWorkOrderGroups() {
+    try {
+      localStorage.setItem(
+        "rvbbit-calliope-work-order-run-groups-v1",
+        JSON.stringify([...state.workOrderGroupsCollapsed]),
+      );
+    } catch {}
+  }
+
+  function runSessionsMarkup(sessions) {
+    const ordinary = [];
+    const grouped = new Map();
+    sessions.forEach((session) => {
+      if (!isWorkOrderRunSession(session)) {
+        ordinary.push(session);
+        return;
+      }
+      const key = String(session.work_order_id);
+      if (!grouped.has(key)) grouped.set(key, []);
+      grouped.get(key).push(session);
+    });
+    const assignmentGroups = [...grouped.entries()].sort(([, left], [, right]) => String(
+      right[0]?.work_order_run_started_at || right[0]?.updated_at || ""
+    ).localeCompare(String(left[0]?.work_order_run_started_at || left[0]?.updated_at || "")));
+    return `${assignmentGroups.map(([workOrderId, runs]) => {
+      const latest = runs[0] || {};
+      const containsCurrent = runs.some((run) => run.id === state.current?.id);
+      const open = containsCurrent || !state.workOrderGroupsCollapsed.has(workOrderId);
+      return `<details class="session-run-group" data-work-order-run-group="${escapeHtml(workOrderId)}" ${open ? "open" : ""}>
+        <summary><span><small>Assigned to Callie</small><strong>${escapeHtml(latest.work_order_title || "Scheduled work")}</strong></span><b>${runs.length}</b><i>${escapeHtml(latest.work_order_run_status || "saved")}</i></summary>
+        <div role="list">${runs.map((session) => sessionCardMarkup(session, "runs")).join("")}</div>
+      </details>`;
+    }).join("")}${ordinary.map((session) => sessionCardMarkup(session, "runs")).join("")}`;
   }
 
   function sessionTabsMarkup(groups, query, tabs) {
@@ -6257,9 +7863,9 @@
       <section id="session-tab-panel" class="session-tab-panel" role="tabpanel"
                aria-labelledby="session-tab-${escapeHtml(state.sessionTab)}" tabindex="0">
         ${active.length
-          ? `<div class="session-tab-items" role="list">${active.map((session) =>
-            sessionCardMarkup(session, state.sessionTab)
-          ).join("")}</div>`
+          ? `<div class="session-tab-items" role="list">${state.sessionTab === "runs"
+            ? runSessionsMarkup(active)
+            : active.map((session) => sessionCardMarkup(session, state.sessionTab)).join("")}</div>`
           : `<div class="session-list-empty">${escapeHtml(empty)}${
             !query && state.sessionTab === "chats"
               ? "<br>Start one and ask Calliope to make the first surface."
@@ -6276,6 +7882,7 @@
   function currentShareable() {
     return Boolean(
       state.current
+      && !SETUP_MODE
       && !currentReadOnly()
       && sessionTabFor(state.current) === "chats"
     );
@@ -6289,8 +7896,10 @@
     els.shareSession.disabled = !currentShareable() || state.busy;
     els.archiveSession.disabled = !current || readOnly || state.busy;
     els.archiveSession.hidden = readOnly;
-    els.sessionTitle.disabled = !current || readOnly || state.busy;
-    els.sessionTitle.title = readOnly ? "Shared notebook title" : "Rename session";
+    els.sessionTitle.disabled = SETUP_MODE || !current || readOnly || state.busy;
+    els.sessionTitle.title = SETUP_MODE
+      ? "Setup notebook"
+      : readOnly ? "Shared notebook title" : "Rename session";
     els.composer.hidden = readOnly;
     els.readOnlyNotice.hidden = !readOnly;
     els.sessionAccessMeta.hidden = !current;
@@ -6459,6 +8068,8 @@
     state.surfaces = [];
     state.selectedSurfaceId = null;
     state.evidenceSelections = [];
+    state.playbookSourceTurnId = null;
+    state.playbookSavingTurns.clear();
     state.chatAtLiveEdge = true;
     state.nextTurnDesignProfileVersionId = null;
     state.cubeBuilders.clear();
@@ -6514,6 +8125,8 @@
     state.surfaces = data.surfaces || [];
     state.selectedSurfaceId = null;
     state.evidenceSelections = [];
+    state.playbookSourceTurnId = null;
+    state.playbookSavingTurns.clear();
     state.nextTurnDesignProfileVersionId = null;
     state.cubeBuilders.clear();
     state.newSurfaceCount = 0;
@@ -6624,26 +8237,43 @@
   }
 
   function visibleStageSurfaces() {
-    const visible = state.surfaces.filter(
+    let visible = state.surfaces.filter(
       (surface) => !isArtifactCaptureCompanion(surface) || !artifactForCapture(surface),
     );
     const briefs = visible.filter(
       (surface) => surface.kind === "evidence" && surface.payload?.mode === "personal_brief",
     );
-    if (briefs.length <= 1) return visible;
-    const latest = [...briefs].sort((left, right) => {
-      const created = new Date(right.created_at || 0).getTime()
-        - new Date(left.created_at || 0).getTime();
-      return created || String(right.id || "").localeCompare(String(left.id || ""));
-    })[0];
-    return visible.filter(
-      (surface) => surface.payload?.mode !== "personal_brief" || surface.id === latest.id,
-    );
+    if (briefs.length > 1) {
+      const latest = [...briefs].sort((left, right) => {
+        const created = new Date(right.created_at || 0).getTime()
+          - new Date(left.created_at || 0).getTime();
+        return created || String(right.id || "").localeCompare(String(left.id || ""));
+      })[0];
+      visible = visible.filter(
+        (surface) => surface.payload?.mode !== "personal_brief" || surface.id === latest.id,
+      );
+    }
+    const sketches = visible.filter((surface) => surface.kind === "sketch");
+    if (sketches.length > 1) {
+      const latest = [...sketches].sort((left, right) => {
+        const revision = Number(right.payload?.revision || 0) - Number(left.payload?.revision || 0);
+        if (revision) return revision;
+        const created = new Date(right.created_at || 0).getTime()
+          - new Date(left.created_at || 0).getTime();
+        return created || String(right.id || "").localeCompare(String(left.id || ""));
+      })[0];
+      visible = visible.filter((surface) => surface.kind !== "sketch" || surface.id === latest.id);
+    }
+    return visible;
+  }
+
+  function activeSketchSurface() {
+    return visibleStageSurfaces().find((surface) => surface.kind === "sketch") || null;
   }
 
   function surfacesForTurn(turnId) {
     return visibleStageSurfaces()
-      .filter((surface) => surface.turn_id === turnId)
+      .filter((surface) => surface.kind !== "sketch" && surface.turn_id === turnId)
       .sort((left, right) => {
         const ordinal = Number(right.ordinal || 0) - Number(left.ordinal || 0);
         if (ordinal) return ordinal;
@@ -6663,7 +8293,7 @@
   function voiceWordRanges(scriptValue) {
     const script = String(scriptValue || "");
     const ignored = new Uint8Array(script.length);
-    for (const match of script.matchAll(/\[[^\[\]\r\n]{1,96}\]/g)) {
+    for (const match of script.matchAll(/\[[^\[\]\r\n]+\]/g)) {
       const start = Number(match.index || 0);
       for (let index = start; index < start + match[0].length; index += 1) {
         ignored[index] = 1;
@@ -6894,13 +8524,15 @@
     const objects = Array.isArray(receipt.objects) ? receipt.objects : [];
     const tools = Array.isArray(receipt.tools) ? receipt.tools : [];
     const outputs = Array.isArray(receipt.outputs) ? receipt.outputs : [];
+    const playbooks = Array.isArray(receipt.playbooks) ? receipt.playbooks : [];
     const toolCount = tools.reduce((total, item) => total + Number(item.count || 1), 0);
     const contextCount = evidence.length + objects.length;
-    if (!contextCount && !toolCount && !outputs.length) return "";
+    if (!contextCount && !toolCount && !outputs.length && !playbooks.length) return "";
     const summary = [
       contextCount ? `Used ${contextCount}` : "",
       toolCount ? `Ran ${toolCount}` : "",
       outputs.length ? `Made ${outputs.length}` : "",
+      playbooks.length ? `Method ${playbooks.length}` : "",
     ].filter(Boolean).join(" · ");
     const contextMarkup = [
       ...evidence.map((item) => `<button type="button" data-focus-evidence-surface="${escapeHtml(item.surface_id || "")}" title="${escapeHtml(item.source || item.title || "Selected evidence")}">${surfaceGlyph("evidence")} ${escapeHtml(item.title || "Evidence")}</button>`),
@@ -6908,14 +8540,45 @@
     ].join("");
     const toolMarkup = tools.map((item) => `<span class="${item.status === "failed" ? "failed" : ""}" title="${escapeHtml(item.status === "failed" ? "Tool reported a failure" : "Tool completed")}">${escapeHtml(friendlyTool(item.name))}${Number(item.count || 1) > 1 ? ` ×${Number(item.count)}` : ""}</span>`).join("");
     const outputMarkup = outputs.map((item) => `<button type="button" data-focus-surface="${escapeHtml(item.surface_id || "")}" title="${escapeHtml(item.effect === "changed" ? "Changed during this response" : "Created during this response")}">${surfaceGlyph(item.kind)} ${escapeHtml(item.title || "Output")}</button>`).join("");
+    const playbookMarkup = playbooks.map((item) => `<button type="button" data-focus-surface="${escapeHtml(item.surface_id || "")}" title="Exact Playbook version retained with this response">${surfaceGlyph("playbook")} ${escapeHtml(item.action || "used")} · ${escapeHtml(item.title || "Playbook")} · v${escapeHtml(item.version || 1)}</button>`).join("");
     return `<details class="message-receipt">
       <summary><span>Receipt</span><b>${escapeHtml(summary)}</b><i aria-hidden="true">›</i></summary>
       <div class="message-receipt-body">
         ${contextMarkup ? `<section><label>Context</label><div>${contextMarkup}</div></section>` : ""}
         ${toolMarkup ? `<section><label>Tools</label><div>${toolMarkup}</div></section>` : ""}
+        ${playbookMarkup ? `<section><label>Method</label><div>${playbookMarkup}</div></section>` : ""}
         ${outputMarkup ? `<section><label>Outputs</label><div>${outputMarkup}</div></section>` : ""}
       </div>
     </details>`;
+  }
+
+  function renderSavePlaybookAction(turn) {
+    if (currentReadOnly() || !["complete", "partial"].includes(String(turn.status || ""))) return "";
+    const turnId = String(turn.id || "");
+    if (!turnId || turnId.startsWith("pending-")) return "";
+    const receipt = turn.response_receipt && typeof turn.response_receipt === "object"
+      ? turn.response_receipt : {};
+    const tools = Array.isArray(receipt.tools) ? receipt.tools : [];
+    const outputs = Array.isArray(receipt.outputs) ? receipt.outputs : [];
+    const saved = Array.isArray(receipt.saved_playbooks) ? receipt.saved_playbooks : [];
+    const alreadyDrafted = tools.some((item) => String(item?.name || "").endsWith("draft_calliope_playbook"))
+      || outputs.some((item) => item?.kind === "playbook");
+    if (alreadyDrafted) return "";
+    if (saved.length) {
+      const latest = saved[0];
+      return `<div class="message-playbook-action is-saved">
+        <button type="button" data-open-saved-playbook="${escapeHtml(latest.id || "")}" title="Open the Playbook learned from this response">${surfaceGlyph("playbook")} Saved as ${escapeHtml(latest.title || "Playbook")} · v${escapeHtml(latest.version || 1)}</button>
+      </div>`;
+    }
+    const toolCount = tools.reduce((total, item) => total + Number(item?.count || 1), 0);
+    const contextCount = (receipt.evidence || []).length + (receipt.objects || []).length;
+    const proseLength = String(turn.assistant_message || "").trim().length;
+    const substantial = outputs.length > 0 || toolCount > 0 || contextCount > 0 || proseLength >= 500;
+    if (!substantial) return "";
+    const saving = state.playbookSavingTurns.has(turnId);
+    return `<div class="message-playbook-action">
+      <button type="button" data-save-playbook-turn="${escapeHtml(turnId)}" ${saving ? "disabled" : ""} title="Distill this successful work into a private reusable method">${surfaceGlyph("playbook")} ${saving ? "Distilling…" : "Save as Playbook"}</button>
+    </div>`;
   }
 
   function renderChat(initial = false) {
@@ -6958,6 +8621,7 @@
                  data-assistant-turn-id="${escapeHtml(turn.id)}">
           <div class="message-label"><span>Calliope</span>${renderVoiceControl(turn)}</div>
           <div class="message-body">${assistantBody(turn, failed)}</div>
+          ${failed ? "" : renderSavePlaybookAction(turn)}
           ${receipt || (links ? `<div class="surface-links">${links}</div>` : "")}
         </article>`;
     }).join("");
@@ -7233,7 +8897,7 @@
   }
 
   function surfaceGlyph(kind) {
-    return ({ query: "▤", metric: "◆", cube: "▦", artifact: "▦", image: "▧", document: "▱", selection: "⌖", evidence: "⌕", inventory: "◎", action: "✦", dream: "☾", instrument: "⌁", workflow: "⌘" })[kind] || "◇";
+    return ({ query: "▤", metric: "◆", cube: "▦", artifact: "▦", image: "▧", document: "▱", selection: "⌖", evidence: "⌕", inventory: "◎", action: "✦", dream: "☾", instrument: "⌁", workflow: "⌘", playbook: "≋", sketch: "✎" })[kind] || "◇";
   }
 
   function googleSheetsGlyph() {
@@ -7568,7 +9232,10 @@
 
   function renderQuery(surface, options = {}) {
     const rows = queryRows(surface);
-    const chart = classifyChart(surface);
+    const requestedView = options.defaultView || surface.payload?.default_view;
+    // Numeric columns make a result technically chartable, not meaningfully
+    // charted. Only an explicitly chart-authored query gets a chart surface.
+    const chart = requestedView === "chart" ? classifyChart(surface) : null;
     const sql = String(surface.source?.sql || "").trim();
     const importedSheet = surface.source?.origin === "google_sheet_import";
     const queriedSheet = surface.payload?.sheet && typeof surface.payload.sheet === "object"
@@ -7585,12 +9252,7 @@
           ? "Sheet snapshot"
           : "";
     const renderedSql = sql ? highlightSql(formatSql(sql)) : "SQL unavailable";
-    const requestedView = options.defaultView || surface.payload?.default_view;
-    const defaultView = requestedView === "chart" && chart
-      ? "chart"
-      : requestedView === "table"
-        ? "table"
-        : chart && !isMetadataQuery(surface) ? "chart" : "table";
+    const defaultView = chart ? "chart" : "table";
     const table = renderQueryTable(surface, Boolean(options.expanded));
     return `
       <div class="query-root ${options.expanded ? "expanded" : ""}" data-query-root>
@@ -8359,6 +10021,114 @@
     </div>`;
   }
 
+  function renderPlaybook(surface) {
+    const payload = surface.payload || {};
+    const playbook = payload.playbook || {};
+    const contract = playbook.contract || {};
+    const method = Array.isArray(contract.method) ? contract.method : [];
+    const useWhen = Array.isArray(contract.when_to_use) ? contract.when_to_use : [];
+    const guardrails = Array.isArray(contract.guardrails) ? contract.guardrails : [];
+    const required = Array.isArray(contract.required_capabilities) ? contract.required_capabilities : [];
+    const preferred = Array.isArray(contract.preferred_capabilities) ? contract.preferred_capabilities : [];
+    const evidence = Array.isArray(playbook.evidence_refs) ? playbook.evidence_refs : [];
+    const version = playbook.version || 1;
+    const isOwner = payload.is_owner === true;
+    const hasSketch = playbook.has_sketch === true || Boolean(playbook.sketch_revision);
+    const sketchRevision = playbook.sketch_revision
+      ? ` · r${escapeHtml(playbook.sketch_revision)}` : "";
+    const status = playbook.archived
+      ? "archived"
+      : playbook.approved ? "approved" : "private draft";
+    const approvalKey = `${playbook.id || ""}:${version}`;
+    const approving = state.playbookApproving.has(approvalKey);
+    const sourceRange = playbook.source_from_ordinal && playbook.source_through_ordinal
+      ? (Number(playbook.source_from_ordinal) === Number(playbook.source_through_ordinal)
+        ? `response ${playbook.source_through_ordinal}`
+        : `responses ${playbook.source_from_ordinal}–${playbook.source_through_ordinal}`)
+      : "source notebook";
+    const canApprove = isOwner && !playbook.archived && !playbook.approved
+      && Number(version) === Number(playbook.latest_version || version);
+    return `<div class="playbook-surface ${escapeHtml(playbook.readiness || "ready")}" data-playbook-id="${escapeHtml(playbook.id || "")}">
+      <header>
+        <span><i aria-hidden="true">≋</i> ${escapeHtml(status)} · v${escapeHtml(version)}</span>
+        <b>${escapeHtml(playbook.readiness || "ready")}</b>
+      </header>
+      <p>${escapeHtml(playbook.synopsis || contract.outcome || "A reusable method learned from this work.")}</p>
+      ${hasSketch ? `<section class="playbook-plan-sketch">
+        <header><label>Visual method</label><span>Read only${sketchRevision}</span></header>
+        <div class="playbook-plan-frame" data-sketch-frame data-sketch-ready="false">
+          <div class="playbook-plan-loader" aria-hidden="true"><i></i><span>Restoring pinned plan</span></div>
+          <iframe
+            src="/calliope/playbooks/${encodeURIComponent(playbook.id || "")}/sketch?version=${encodeURIComponent(version)}&theme=${currentSketchThemeMode()}"
+            title="${escapeHtml(`${playbook.title || "Playbook"} · visual method`)}"
+            data-sketch-id="${escapeHtml(`playbook:${playbook.id || ""}:v${version}`)}"
+            data-playbook-sketch="true"
+            loading="lazy"
+            referrerpolicy="same-origin"></iframe>
+        </div>
+      </section>` : ""}
+      ${contract.outcome ? `<section><label>Outcome</label><strong>${escapeHtml(contract.outcome)}</strong></section>` : ""}
+      ${useWhen.length ? `<section><label>Use when</label><div>${useWhen.slice(0, 4).map((item) => `<em>${escapeHtml(item)}</em>`).join("")}</div></section>` : ""}
+      ${method.length ? `<ol>${method.slice(0, 6).map((step) => `<li>${escapeHtml(step)}</li>`).join("")}</ol>` : ""}
+      ${required.length || preferred.length ? `<section class="playbook-capabilities">
+        <label>${playbook.readiness === "ready" ? "Capability fit" : "Needs attention"}</label>
+        <div>
+          ${required.slice(0, 6).map((item) => `<em class="required" title="Required capability">${escapeHtml(item)}</em>`).join("")}
+          ${preferred.slice(0, 4).map((item) => `<em title="Preferred capability">${escapeHtml(item)}</em>`).join("")}
+        </div>
+      </section>` : ""}
+      ${guardrails.length ? `<footer><label>Guardrails</label><span>${escapeHtml(guardrails.slice(0, 3).join(" · "))}</span></footer>` : ""}
+      ${playbook.source_session_id ? `<div class="playbook-provenance">
+        <span>Learned from ${escapeHtml(sourceRange)}${evidence.length ? ` · ${evidence.length} evidence pin${evidence.length === 1 ? "" : "s"}` : ""}${playbook.sketch_revision ? ` · Sketch r${escapeHtml(playbook.sketch_revision)}` : ""}</span>
+        <button type="button" data-playbook-source>Open source →</button>
+      </div>` : ""}
+      <div class="playbook-actions">
+        ${canApprove ? `<button type="button" class="primary" data-playbook-approve="${escapeHtml(playbook.id || "")}" data-playbook-version="${escapeHtml(version)}" ${approving ? "disabled" : ""}>${approving ? "Approving…" : `Approve v${escapeHtml(version)}`}</button>` : ""}
+        ${isOwner && !playbook.archived ? `<button type="button" data-playbook-revise>Revise with Calliope</button>` : ""}
+        ${playbook.approved && !playbook.archived ? `<button type="button" data-playbook-use>Use with Calliope</button>` : ""}
+      </div>
+    </div>`;
+  }
+
+  function renderWorkOrder(surface) {
+    const payload = surface.payload || {};
+    const workOrder = payload.work_order || {};
+    const result = payload.mode === "calliope_work_order_result" ? payload : payload.result;
+    const status = String(workOrder.status || payload.status || result?.status || "draft");
+    const schedule = workOrder.schedule || {};
+    if (result && payload.mode === "calliope_work_order_result") {
+      return `<div class="work-order-result-surface ${escapeHtml(result.status || "complete")}">
+        <span>Assigned to Callie · ${escapeHtml(result.status || "complete")}</span>
+        <h4>${escapeHtml(result.summary || "Assignment finished")}</h4>
+        <p>${escapeHtml(result.attention_required
+          ? "This run asked for your attention and was routed through the configured Inbox policy."
+          : result.changed
+            ? "A meaningful change was saved with this private run."
+            : "Healthy no-change result · saved here without creating Inbox noise.")}</p>
+        ${Array.isArray(result.steps) && result.steps.length ? `<div>${result.steps.slice(0, 6).map((step) => `<i class="${escapeHtml(step.status || "complete")}">${escapeHtml(step.label || "Run step")}</i>`).join("")}</div>` : ""}
+      </div>`;
+    }
+    const controls = [];
+    if (["draft", "error"].includes(status)) controls.push(["activate", status === "error" ? "Try again" : "Activate"]);
+    if (status === "active") controls.push(["run_now", "Run now"], ["pause", "Pause"]);
+    if (status === "paused") controls.push(["resume", "Resume"]);
+    if (!["completed", "cancelled"].includes(status)) controls.push(["cancel", "Cancel"]);
+    return `<div class="work-order-surface status-${escapeHtml(status)}" data-work-order-id="${escapeHtml(workOrder.id || "")}">
+      <div class="work-order-surface-mark" aria-hidden="true">⌁</div>
+      <div class="work-order-surface-copy">
+        <span>Assigned to Callie · ${escapeHtml(workOrderStatusLabel(status))}</span>
+        <h4>${escapeHtml(workOrder.title || surface.title || "Calliope assignment")}</h4>
+        <p>${escapeHtml(workOrder.instruction || "Private delegated work awaiting review.")}</p>
+        <div><i>${escapeHtml(schedule.display || schedule.value || "On demand")}</i><i>${escapeHtml(schedule.timezone || "UTC")}</i><i>${escapeHtml(String(workOrder.approval_policy || "read_only").replaceAll("_", " "))}</i></div>
+        ${schedule.error ? `<em>${escapeHtml(schedule.error)}</em>` : ""}
+      </div>
+      <footer>
+        <button type="button" data-open-assigned-work>All assigned work</button>
+        ${controls.map(([action, label]) => `<button type="button" data-work-order-action="${escapeHtml(action)}">${escapeHtml(label)}</button>`).join("")}
+      </footer>
+    </div>`;
+  }
+
   function renderAction(surface) {
     const payload = surface.payload || {};
     const run = payload.run && typeof payload.run === "object" ? payload.run : null;
@@ -8439,6 +10209,178 @@
       <div class="inventory-surface-items">${rows}</div>
       <footer>These typed references preserve identity when you ask Calliope to inspect, explain, test, or change them.</footer>
     </div>`;
+  }
+
+  function sketchIdForSurface(surface) {
+    return String(surface?.payload?.sketch_id || "");
+  }
+
+  function sketchActorLabel(actor) {
+    if (actor === "calliope") return "Calliope edited";
+    if (actor === "human") return "You edited";
+    if (actor === "undo") return "Calliope edit undone";
+    return "Saved";
+  }
+
+  function sketchActivityLabel(payload = {}) {
+    const revision = Number(payload.revision || 1);
+    const count = Number(payload.element_count || 0);
+    if (payload.auto_created === true && revision === 1 && count === 0) return "Ready";
+    return sketchActorLabel(payload.last_actor);
+  }
+
+  function sketchDockMeta(payload = {}) {
+    const revision = Number(payload.revision || 1);
+    const count = Number(payload.element_count || 0);
+    return `${sketchActivityLabel(payload)} · r${revision} · ${count.toLocaleString()} element${count === 1 ? "" : "s"}`;
+  }
+
+  function currentSketchThemeMode() {
+    return document.documentElement.dataset.warehouseColorMode === "light"
+      || document.documentElement.dataset.theme === "light" ? "light" : "dark";
+  }
+
+  function renderSketch(surface) {
+    const sketchId = sketchIdForSurface(surface);
+    if (!sketchId) return '<div class="chart-empty">Sketch identity unavailable</div>';
+    const payload = surface.payload || {};
+    const collapsed = state.sketchCollapsed.has(sketchId);
+    const revision = Number(payload.revision || 1);
+    const count = Number(payload.element_count || 0);
+    const activity = `${sketchActivityLabel(payload)} · r${revision}`;
+    if (collapsed) return "";
+    return `<div class="sketch-stage-frame" data-sketch-frame data-sketch-ready="false">
+      <div class="sketch-stage-loader" aria-hidden="true">
+        <canvas data-thinking-orb="working" data-thinking-orb-size="100" data-thinking-orb-tint="theme"></canvas>
+        <span>Restoring shared sketch</span>
+      </div>
+      <iframe
+        src="/calliope/sketches/${encodeURIComponent(sketchId)}?theme=${currentSketchThemeMode()}"
+        title="${escapeHtml(surface.title || "Collaborative Sketch")}"
+        data-sketch-id="${escapeHtml(sketchId)}"
+        loading="lazy"
+        referrerpolicy="same-origin"></iframe>
+      <footer>
+        <span data-sketch-status>${escapeHtml(activity)}</span>
+        <i>${count.toLocaleString()} element${count === 1 ? "" : "s"} · edits save automatically</i>
+      </footer>
+    </div>`;
+  }
+
+  function sketchFrames() {
+    return [
+      ...$$('iframe[data-sketch-id]', els.sketchShelf),
+      ...$$('iframe[data-sketch-id]', els.sketchWorkspace),
+      ...$$('iframe[data-playbook-sketch]', els.stage),
+    ];
+  }
+
+  function currentSketchCard() {
+    return $("[data-sketch-card]", els.sketchShelf)
+      || $("[data-sketch-card]", els.sketchWorkspace);
+  }
+
+  function syncSketchWorkspaceControl(card, expanded) {
+    const button = $("[data-expand-sketch]", card);
+    if (!button) return;
+    button.setAttribute("aria-pressed", String(expanded));
+    button.title = expanded
+      ? "Return the Sketch to the Stage"
+      : "Open the Sketch in a large workspace";
+    button.textContent = expanded ? "Restore" : "Large";
+  }
+
+  function notifySketchViewportChanged(card) {
+    const frame = $('iframe[data-sketch-id]', card);
+    frame?.contentWindow?.postMessage(
+      { type: "calliope.sketch.viewport.changed" },
+      window.location.origin,
+    );
+  }
+
+  function closeSketchWorkspace({ restore = true } = {}) {
+    const card = $("[data-sketch-card]", els.sketchWorkspace);
+    state.sketchExpandedId = null;
+    document.body.classList.remove("sketch-workspace-open");
+    if (restore && card) {
+      els.sketchShelf.append(card);
+      els.sketchShelf.hidden = !activeSketchSurface();
+      syncSketchWorkspaceControl(card, false);
+    } else {
+      card?.remove();
+    }
+    els.sketchWorkspace.replaceChildren();
+    if (els.sketchDialog.open) els.sketchDialog.close();
+    if (restore && card) {
+      window.requestAnimationFrame(() => notifySketchViewportChanged(card));
+    }
+  }
+
+  function openSketchWorkspace(sketchId) {
+    if (!sketchId || state.sketchExpandedId === sketchId) return;
+    if (state.sketchExpandedId) closeSketchWorkspace();
+    const card = currentSketchCard();
+    if (!card || card.dataset.sketchId !== sketchId) return;
+    state.sketchExpandedId = sketchId;
+    els.sketchWorkspace.replaceChildren();
+    els.sketchWorkspace.append(card);
+    els.sketchShelf.hidden = true;
+    syncSketchWorkspaceControl(card, true);
+    document.body.classList.add("sketch-workspace-open");
+    if (!els.sketchDialog.open) els.sketchDialog.showModal();
+    window.requestAnimationFrame(() => notifySketchViewportChanged(card));
+  }
+
+  function setSketchWorkspaceExpanded(sketchId, expanded) {
+    if (expanded) openSketchWorkspace(sketchId);
+    else closeSketchWorkspace();
+  }
+
+  function handleSketchCardClick(event) {
+    const close = event.target.closest("[data-close-sketch-workspace]");
+    if (close) {
+      closeSketchWorkspace();
+      return true;
+    }
+    const expand = event.target.closest("[data-expand-sketch]");
+    if (expand) {
+      const sketchId = expand.dataset.expandSketch;
+      setSketchWorkspaceExpanded(sketchId, state.sketchExpandedId !== sketchId);
+      return true;
+    }
+    const toggle = event.target.closest("[data-toggle-sketch]");
+    if (toggle) {
+      const sketchId = toggle.dataset.toggleSketch;
+      const card = toggle.closest("[data-sketch-card]");
+      if (!state.sketchCollapsed.has(sketchId) && card?.dataset.sketchDirty === "true") {
+        state.sketchPendingCollapse = sketchId;
+        const frame = $('iframe[data-sketch-id]', card);
+        frame?.contentWindow?.postMessage(
+          { type: "calliope.sketch.flush" },
+          window.location.origin,
+        );
+        toast("Saving the Sketch before collapsing it…");
+        return true;
+      }
+      toggleSketchCollapsed(sketchId);
+      return true;
+    }
+    const source = event.target.closest("[data-source-turn]");
+    if (source) {
+      if (state.sketchExpandedId) closeSketchWorkspace();
+      jumpToTurn(source.dataset.sourceTurn);
+      return true;
+    }
+    const card = event.target.closest("[data-surface-id]");
+    if (card?.matches("[data-sketch-card].sketch-minimized")) {
+      toggleSketchCollapsed(card.dataset.sketchId);
+      return true;
+    }
+    if (card && !event.target.closest("a,button,input,select,label")) {
+      focusSurface(card.dataset.surfaceId);
+      return true;
+    }
+    return false;
   }
 
   function renderArtifact(surface) {
@@ -8615,6 +10557,31 @@
     } catch {
       // The artifact's deterministic profile fallback remains complete.
     }
+  }
+
+  async function sendViewerThemeToSketch(targetWindow) {
+    if (!targetWindow) return;
+    const mode = currentSketchThemeMode();
+    try {
+      const snapshot = window.WarehouseTheme?.getSnapshot
+        ? await window.WarehouseTheme.getSnapshot()
+        : null;
+      targetWindow.postMessage(
+        { type: "calliope.sketch.theme.apply", mode, snapshot },
+        window.location.origin,
+      );
+    } catch {
+      targetWindow.postMessage(
+        { type: "calliope.sketch.theme.apply", mode },
+        window.location.origin,
+      );
+    }
+  }
+
+  function broadcastViewerThemeToSketches() {
+    sketchFrames().forEach((frame) => {
+      void sendViewerThemeToSketch(frame.contentWindow);
+    });
   }
 
   function broadcastViewerThemeToArtifacts() {
@@ -10203,9 +12170,7 @@
       query: {
         ...(source.payload || {}),
         sql: source.source?.sql || "",
-        default_view: importedSheet
-          ? "table"
-          : classifyChart(source) && !isMetadataQuery(source) ? "chart" : "table",
+        default_view: source.payload?.default_view === "chart" ? "chart" : "table",
       },
     });
   }
@@ -10246,10 +12211,14 @@
     const canMutateNotebook = !currentReadOnly();
     const designProfile = surface.presentation?.design_profile;
     const personalBrief = surface.kind === "evidence" && surface.payload?.mode === "personal_brief";
-    const meta = [
-      surface.artifact_version ? `v${surface.artifact_version}` : null,
-      relativeTime(surface.created_at),
-    ].filter(Boolean).join(" · ");
+    const sketchMinimized = surface.kind === "sketch"
+      && state.sketchCollapsed.has(sketchIdForSurface(surface));
+    const meta = surface.kind === "sketch"
+      ? sketchDockMeta(surface.payload)
+      : [
+        surface.artifact_version ? `v${surface.artifact_version}` : null,
+        relativeTime(surface.created_at),
+      ].filter(Boolean).join(" · ");
     const metadata = surface.kind === "query" && isMetadataQuery(surface);
     const privateGoogleDocument = surface.kind === "document"
       && surface.payload?.provider === "google_docs";
@@ -10276,6 +12245,9 @@
       dream: renderDreamSurface,
       instrument: renderInstrument,
       workflow: renderWorkflow,
+      playbook: renderPlaybook,
+      work_order: renderWorkOrder,
+      sketch: renderSketch,
     })[surface.kind]?.(surface) || `<div class="chart-empty">Surface unavailable</div>`;
     const openUrl = surface.kind === "artifact"
       ? artifactSessionUrl(surface.payload?.display_url || surface.payload?.url)
@@ -10320,14 +12292,14 @@
           ${lineage}
         </details>`
       : `<div class="surface-body">${body}</div>${lineage}`;
-    return `<article class="surface kind-${escapeHtml(surface.kind)} ${metadata ? "metadata-surface" : ""} ${
+    return `<article class="surface kind-${escapeHtml(surface.kind)} ${metadata ? "metadata-surface" : ""} ${sketchMinimized ? "sketch-minimized" : ""} ${
       state.selectedSurfaceId === surface.id ? "selected" : ""
-    }" data-surface-id="${escapeHtml(surface.id)}" aria-current="${
+    }" data-surface-id="${escapeHtml(surface.id)}"${surface.kind === "sketch" ? ` data-sketch-card data-sketch-id="${escapeHtml(sketchIdForSurface(surface))}"` : ""} aria-current="${
       state.selectedSurfaceId === surface.id ? "true" : "false"
     }">
       <header class="surface-head">
         <span class="surface-kind">${surfaceGlyph(surface.kind)} ${metadata ? "metadata" : personalBrief ? "brief" : escapeHtml(surface.kind)}</span>
-        <div class="surface-titles"><h3>${escapeHtml(surface.title)}</h3><p>${escapeHtml(meta)}${
+        <div class="surface-titles"><h3>${escapeHtml(surface.title)}</h3><p${surface.kind === "sketch" ? " data-sketch-meta" : ""}>${escapeHtml(meta)}${
           designProfile
             ? `<span class="style-profile-badge" title="Pinned Design Profile version">${escapeHtml(designProfile.name)} · v${escapeHtml(designProfile.version)}</span>`
             : ""
@@ -10360,11 +12332,26 @@
               state.inspectingSurfaceId === surface.id ? "Picking…" : "Select"
             }</button>`
             : ""}
+          ${surface.kind === "sketch"
+            ? `${sketchMinimized ? "" : `<button type="button" data-expand-sketch="${escapeHtml(sketchIdForSurface(surface))}" aria-pressed="${
+              state.sketchExpandedId === sketchIdForSurface(surface)
+            }" title="${
+              state.sketchExpandedId === sketchIdForSurface(surface)
+                ? "Return the Sketch to the Stage"
+                : "Open the Sketch in a large workspace"
+            }">${state.sketchExpandedId === sketchIdForSurface(surface) ? "Restore" : "Large"}</button>`}
+              <button type="button" data-toggle-sketch="${escapeHtml(sketchIdForSurface(surface))}" aria-expanded="${!sketchMinimized}" title="${
+              state.sketchCollapsed.has(sketchIdForSurface(surface)) ? "Expand shared Sketch" : "Collapse shared Sketch"
+            }">${state.sketchCollapsed.has(sketchIdForSurface(surface)) ? "Expand" : "Collapse"}</button>`
+            : ""}
           ${surface.kind === "evidence" && canMutateNotebook
             ? personalBrief
               ? `<button type="button" data-refresh-brief title="Resolve a new timestamped observation snapshot" ${state.brief.loading ? "disabled" : ""}>Refresh</button>`
               : `<button type="button" data-repeat-evidence="${escapeHtml(surface.id)}" title="Run this evidence search again">Again</button>`
             : `<button type="button" data-source-turn="${escapeHtml(surface.turn_id)}" title="Jump to source message">↗</button>`}
+          ${surface.kind === "sketch"
+            ? `<button class="sketch-workspace-close" type="button" data-close-sketch-workspace title="Close large workspace" aria-label="Close large Sketch workspace">×</button>`
+            : ""}
           ${openUrl ? `<a href="${escapeHtml(openUrl)}" target="_blank" rel="noopener" title="Open full size">↥</a>` : ""}
         </div>
       </header>
@@ -10398,7 +12385,8 @@
   }
 
   function stageEmptyHeadlineCanRotate() {
-    return !els.stageEmpty.hidden
+    return !SETUP_MODE
+      && !els.stageEmpty.hidden
       && !document.hidden
       && !stageEmptyMotionPreference.matches;
   }
@@ -10411,7 +12399,12 @@
     els.stageEmptyHeadline.classList.remove("is-changing");
     if (reset) {
       stageEmptyHeadlineQueue = [];
-      setStageEmptyHeadline(0);
+      if (SETUP_MODE) {
+        els.stageEmptyHeadline.textContent = "Setup work appears here.";
+        els.stageEmptyHeadline.dataset.length = "short";
+      } else {
+        setStageEmptyHeadline(0);
+      }
     }
   }
 
@@ -10458,6 +12451,87 @@
     syncStageEmptyHeadlineRotation();
   }
 
+  function initializeSketchFrame() {
+    const card = currentSketchCard();
+    const frame = card ? $('iframe[data-sketch-id]', card) : null;
+    const loader = card ? $("[data-thinking-orb]", card) : null;
+    if (loader) window.CalliopeThinkingOrbs?.mount(loader, "working", 100);
+    if (!frame) return;
+    frame.addEventListener("load", () => void sendViewerThemeToSketch(frame.contentWindow));
+  }
+
+  function updateRetainedSketchCard(card, surface) {
+    const previousSurfaceId = card.dataset.surfaceId;
+    if (state.selectedSurfaceId === previousSurfaceId && previousSurfaceId !== surface.id) {
+      state.selectedSurfaceId = surface.id;
+      renderSelected();
+    }
+    card.dataset.surfaceId = surface.id;
+    card.classList.toggle("selected", state.selectedSurfaceId === surface.id);
+    card.setAttribute("aria-current", String(state.selectedSurfaceId === surface.id));
+    const title = $(".surface-titles h3", card);
+    if (title) title.textContent = surface.title || "Collaborative Sketch";
+    const source = $("[data-source-turn]", card);
+    if (source) source.dataset.sourceTurn = surface.turn_id || "";
+    const payload = surface.payload || {};
+    const meta = $("[data-sketch-meta]", card);
+    if (meta) meta.textContent = sketchDockMeta(payload);
+    const status = $("[data-sketch-status]", card);
+    if (status) status.textContent = `${sketchActivityLabel(payload)} · r${Number(payload.revision || 1)}`;
+    const detail = $(".sketch-stage-frame > footer i", card);
+    const count = Number(payload.element_count || 0);
+    if (detail) detail.textContent = `${count.toLocaleString()} element${count === 1 ? "" : "s"} · edits save automatically`;
+  }
+
+  function renderSketchShelf() {
+    const surface = activeSketchSurface();
+    let existing = currentSketchCard();
+    const nextSketchId = sketchIdForSurface(surface);
+    if (state.sketchExpandedId && (!surface || state.sketchExpandedId !== nextSketchId)) {
+      closeSketchWorkspace({ restore: false });
+      existing = null;
+    }
+    if (!surface) {
+      if (existing) {
+        const loader = $("[data-thinking-orb]", existing);
+        if (loader) window.CalliopeThinkingOrbs?.unmount(loader);
+      }
+      els.sketchShelf.innerHTML = "";
+      els.sketchShelf.hidden = true;
+      return;
+    }
+    const sketchId = nextSketchId;
+    initializeDefaultSketchCollapse(surface);
+    const collapsed = state.sketchCollapsed.has(sketchId);
+    const existingCollapsed = Boolean(existing?.classList.contains("sketch-minimized"));
+    if (
+      existing
+      && existing.dataset.sketchId === sketchId
+      && existingCollapsed === collapsed
+    ) {
+      updateRetainedSketchCard(existing, surface);
+      els.sketchShelf.hidden = state.sketchExpandedId === sketchId;
+      return;
+    }
+    const oldLoader = $("[data-thinking-orb]", els.sketchShelf);
+    if (oldLoader) window.CalliopeThinkingOrbs?.unmount(oldLoader);
+    els.sketchShelf.innerHTML = surfaceCard(surface);
+    els.sketchShelf.hidden = false;
+    initializeSketchFrame();
+  }
+
+  function toggleSketchCollapsed(sketchId) {
+    if (!sketchId) return;
+    if (state.sketchExpandedId === sketchId) closeSketchWorkspace();
+    if (state.sketchCollapsed.has(sketchId)) state.sketchCollapsed.delete(sketchId);
+    else state.sketchCollapsed.add(sketchId);
+    state.sketchCollapseInitialized.add(sketchId);
+    state.sketchPendingCollapse = null;
+    persistCollapsedSketches();
+    persistInitializedSketchCollapses();
+    renderSketchShelf();
+  }
+
   function renderStage(initial = false) {
     if (workflowNodeTooltipTarget?.closest("#stage")) hideWorkflowNodeTooltip();
     if (state.speech.target?.kind === "daily_note" && state.speech.phase !== "idle") {
@@ -10470,18 +12544,23 @@
     state.artifactFrameHeights.forEach((_height, surfaceId) => {
       if (!currentSurfaceIds.has(surfaceId)) state.artifactFrameHeights.delete(surfaceId);
     });
-    const visibleSurfaces = visibleStageSurfaces();
+    const visibleSurfaces = visibleStageSurfaces().filter(
+      (surface) => surface.kind !== "sketch",
+    );
+    renderSketchShelf();
     syncGoogleSheetImportControls();
     els.surfaceCount.textContent = `${visibleSurfaces.length} surface${visibleSurfaces.length === 1 ? "" : "s"}`;
-    els.stageEmpty.hidden = Boolean(visibleSurfaces.length);
+    els.stageEmpty.hidden = Boolean(
+      visibleSurfaces.length || (SETUP_MODE && !els.setupStageControls?.hidden),
+    );
     syncStageEmptyHeadlineRotation();
     const turns = [...state.turns].reverse().filter((turn) => surfacesForTurn(turn.id).length);
     els.stage.innerHTML = turns.map((turn) => `
       <section class="stratum" data-stratum-turn="${escapeHtml(turn.id)}">
-        <header class="stratum-head ${turn.turn_kind === "evidence_search" ? "search-stratum" : turn.turn_kind === "brief" ? "brief-stratum" : ["sheet_import", "sheet_refresh", "document_import", "document_refresh", "document_remove"].includes(turn.turn_kind) ? "sheet-import-stratum" : ""}">
-          <span>${turn.turn_kind === "evidence_search" ? "Search" : turn.turn_kind === "brief" ? "Brief" : turn.turn_kind === "sheet_import" ? "Sheet import" : turn.turn_kind === "sheet_refresh" ? "Sheet refresh" : turn.turn_kind === "document_import" ? "Private document" : turn.turn_kind === "document_refresh" ? "Private document refresh" : turn.turn_kind === "document_remove" ? "Private document removed" : `Turn ${escapeHtml(turn.ordinal)}`}</span>
-          ${["evidence_search", "brief", "sheet_import", "sheet_refresh", "document_import", "document_refresh", "document_remove"].includes(turn.turn_kind)
-            ? `<em>${turn.turn_kind === "brief" ? "Observed snapshot" : ["sheet_import", "sheet_refresh", "document_import", "document_refresh", "document_remove"].includes(turn.turn_kind) ? escapeHtml(turn.user_message) : `“${escapeHtml(turn.user_message)}”`}</em>`
+        <header class="stratum-head ${turn.turn_kind === "evidence_search" ? "search-stratum" : turn.turn_kind === "brief" ? "brief-stratum" : ["sheet_import", "sheet_refresh", "document_import", "document_refresh", "document_remove", "setup_control"].includes(turn.turn_kind) ? "sheet-import-stratum" : ""}">
+          <span>${turn.turn_kind === "evidence_search" ? "Search" : turn.turn_kind === "brief" ? "Brief" : turn.turn_kind === "setup_control" ? "Secure setup" : turn.turn_kind === "sheet_import" ? "Sheet import" : turn.turn_kind === "sheet_refresh" ? "Sheet refresh" : turn.turn_kind === "document_import" ? "Private document" : turn.turn_kind === "document_refresh" ? "Private document refresh" : turn.turn_kind === "document_remove" ? "Private document removed" : `Turn ${escapeHtml(turn.ordinal)}`}</span>
+          ${["evidence_search", "brief", "sheet_import", "sheet_refresh", "document_import", "document_refresh", "document_remove", "setup_control"].includes(turn.turn_kind)
+            ? `<em>${turn.turn_kind === "brief" ? "Observed snapshot" : ["sheet_import", "sheet_refresh", "document_import", "document_refresh", "document_remove", "setup_control"].includes(turn.turn_kind) ? escapeHtml(turn.user_message) : `“${escapeHtml(turn.user_message)}”`}</em>`
             : `<button type="button" data-source-turn="${escapeHtml(turn.id)}">“${escapeHtml(turn.user_message)}”</button>`}
           <span>${escapeHtml(relativeTime(turn.created_at))}</span>
         </header>
@@ -12042,7 +14121,7 @@
         ? "Open the complete answer while the spoken version is being shaped"
         : active && thisTurn
           ? "Open the complete answer · audio is playing"
-          : "Open the complete answer or replay the spoken cut";
+          : "Open the complete answer or replay the spoken rendering";
     });
     const dialogActive = active
       && state.voice.dialogTurnId === String(state.voice.turnId || "");
@@ -12405,7 +14484,7 @@
     const label = preparing ? "Shaping" : active ? "Playing" : "Voice";
     return `<button type="button" class="message-voice ${active ? "active" : ""}"
       data-open-voice-turn="${escapeHtml(turn.id || "")}"
-      title="${preparing ? "Open the complete answer while the spoken version is being shaped" : active ? "Open the complete answer · audio is playing" : "Open the complete answer or replay the spoken cut"}">
+      title="${preparing ? "Open the complete answer while the spoken version is being shaped" : active ? "Open the complete answer · audio is playing" : "Open the complete answer or replay the spoken rendering"}">
       <i aria-hidden="true"></i><span data-voice-label>${escapeHtml(label)}</span>
     </button>`;
   }
@@ -12421,7 +14500,7 @@
     const spokenWords = render ? voiceWordRanges(render.script).length : 0;
     els.voiceDialogMeta.innerHTML = [
       `${originalWords} word original`,
-      render ? `${spokenWords} word spoken cut` : "spoken cut shaping",
+      render ? `${spokenWords} word spoken rendering` : "spoken rendering shaping",
       mode,
       render
         ? render.rewrite_provider === "local" ? "local fallback" : `${render.rewrite_provider || "semantic"} rewrite`
@@ -12767,6 +14846,121 @@
     return { completed, transportClosed: false, projectionErrors };
   }
 
+  async function saveTurnAsPlaybook(turnId) {
+    const source = state.turns.find((turn) => String(turn.id || "") === String(turnId || ""));
+    if (!source || state.busy || currentReadOnly()) return;
+    const existingDraft = composerValue();
+    const pendingContext = {
+      attachments: [...state.attachments],
+      spatialSelections: state.spatialSelections.map((item) => ({ ...item })),
+      evidenceSelections: state.evidenceSelections.map((item) => ({ ...item })),
+      selectedSurfaceId: state.selectedSurfaceId,
+      designProfileVersionId: state.nextTurnDesignProfileVersionId,
+    };
+    const actionMessage = "Save the useful method through that response as a private Playbook draft. Keep it outcome-focused and reusable, and show me the draft for review.";
+    state.playbookSavingTurns.add(String(turnId));
+    state.playbookSourceTurnId = String(turnId);
+    state.attachments = [];
+    state.spatialSelections = [];
+    state.evidenceSelections = [];
+    state.selectedSurfaceId = null;
+    state.nextTurnDesignProfileVersionId = null;
+    composerSetValue(actionMessage);
+    setMobilePanel("chat");
+    renderAttachmentTray();
+    renderSpatialSelectionTray();
+    renderEvidenceContextTray();
+    renderSelected();
+    renderDesignProfileChip();
+    renderChat();
+    try {
+      await sendTurn();
+    } finally {
+      state.playbookSavingTurns.delete(String(turnId));
+      if (state.playbookSourceTurnId === String(turnId)) state.playbookSourceTurnId = null;
+      if (existingDraft.trim() && (!composerValue().trim() || composerValue() === actionMessage)) {
+        composerSetValue(existingDraft);
+      }
+      state.attachments = pendingContext.attachments;
+      state.spatialSelections = pendingContext.spatialSelections;
+      state.evidenceSelections = pendingContext.evidenceSelections;
+      state.selectedSurfaceId = pendingContext.selectedSurfaceId;
+      state.nextTurnDesignProfileVersionId = pendingContext.designProfileVersionId;
+      renderAttachmentTray();
+      renderSpatialSelectionTray();
+      renderEvidenceContextTray();
+      renderSelected();
+      renderDesignProfileChip();
+      renderChat();
+    }
+  }
+
+  function openSavedPlaybook(playbookId) {
+    const surface = state.surfaces.find((item) => (
+      item.kind === "playbook"
+      && String(item.payload?.playbook?.id || "") === String(playbookId || "")
+    ));
+    if (!surface) {
+      toast("The Playbook is available under Library · Routines");
+      return;
+    }
+    setMobilePanel();
+    focusSurface(surface.id);
+  }
+
+  function preparePlaybookPrompt(playbook, mode) {
+    const title = playbook.title || "this Playbook";
+    const version = playbook.version || playbook.approved_version || 1;
+    const reference = playbook.capability_name || playbook.id || title;
+    const prompt = mode === "use"
+      ? `Use the approved “${title}” Playbook (${reference}, v${version}) for: `
+      : mode === "share"
+        ? `Update access for the “${title}” Playbook (${reference}, v${version}). Share it with these Teams or people: `
+        : `Revise the “${title}” Playbook (${reference}, current v${version}) based on this change: `;
+    const current = composerValue().trim();
+    composerSetValue(current ? `${current}\n${prompt}` : prompt);
+    setMobilePanel("chat");
+    composerFocus();
+  }
+
+  async function approvePlaybook(playbookId, version, button) {
+    const key = `${playbookId}:${version}`;
+    if (!playbookId || state.playbookApproving.has(key)) return;
+    state.playbookApproving.add(key);
+    if (button) button.disabled = true;
+    renderStage();
+    try {
+      const result = await api(
+        `/api/calliope/playbooks/${encodeURIComponent(playbookId)}/approve`,
+        { method: "POST", body: JSON.stringify({ version: Number(version) }) },
+      );
+      state.surfaces = state.surfaces.map((surface) => (
+        surface.kind === "playbook"
+        && String(surface.payload?.playbook?.id || "") === String(playbookId)
+        && Number(surface.payload?.playbook?.version || 0) === Number(version)
+          ? { ...surface, payload: { mode: "calliope_playbook", ...result } }
+          : surface
+      ));
+      renderStage();
+      renderChat();
+      toast(`Approved ${result.playbook?.title || "Playbook"} · v${version}`);
+      await loadInbox({ silent: true });
+      await loadSessions(state.current?.id, true, { allowDuringTurn: true });
+    } finally {
+      state.playbookApproving.delete(key);
+      renderStage();
+    }
+  }
+
+  async function openPlaybookSource(playbook) {
+    const sessionId = String(playbook?.source_session_id || "");
+    if (!sessionId) return;
+    if (String(state.current?.id || "") !== sessionId) {
+      await selectSession(sessionId, { focusComposer: false });
+    }
+    if (playbook.source_turn_id) jumpToTurn(playbook.source_turn_id);
+  }
+
   async function sendTurn() {
     if (!state.current || currentReadOnly() || state.busy || state.speech.phase !== "idle") return;
     const sessionId = String(state.current.id);
@@ -12801,6 +14995,7 @@
     }));
     const outgoingSelectedSurfaceId = state.selectedSurfaceId;
     const outgoingDesignProfileVersionId = state.nextTurnDesignProfileVersionId;
+    const outgoingPlaybookSourceTurnId = state.playbookSourceTurnId;
     const submissionPayload = {
       message: rawMessage,
       object_refs: outgoingObjectHandles,
@@ -12808,8 +15003,14 @@
       spatial_selections: outgoingSpatialSelections,
       evidence_refs: outgoingEvidenceHandles,
       selected_surface_id: outgoingSelectedSurfaceId,
+      ...(SETUP_MODE && state.setup.activeItem
+        ? { setup_item: state.setup.activeItem }
+        : {}),
       ...(outgoingDesignProfileVersionId
         ? { design_profile_version_id: outgoingDesignProfileVersionId }
+        : {}),
+      ...(outgoingPlaybookSourceTurnId
+        ? { playbook_source_turn_id: outgoingPlaybookSourceTurnId }
         : {}),
     };
     const submissionSignature = turnSubmissionSignature(submissionPayload);
@@ -12852,6 +15053,7 @@
     clearSpatialSelections();
     clearEvidenceSelections();
     state.nextTurnDesignProfileVersionId = null;
+    state.playbookSourceTurnId = null;
     renderAttachmentTray();
     renderDesignProfileChip();
     resizeComposer();
@@ -13072,6 +15274,10 @@
       setStatus(state.config?.healthy ? "ready" : "unavailable", state.config?.healthy ? "" : "offline");
       syncSpeechControls();
       composerFocus();
+      if (SETUP_MODE) Promise.allSettled([
+        loadSetupWorkspace({ silent: true }),
+        loadSetupProof({ silent: true }),
+      ]);
     }
   }
 
@@ -13279,6 +15485,10 @@
         els.send.disabled = false;
         setStatus(state.config?.healthy ? "ready" : "unavailable", state.config?.healthy ? "" : "offline");
         syncSpeechControls();
+        if (SETUP_MODE) Promise.allSettled([
+          loadSetupWorkspace({ silent: true }),
+          loadSetupProof({ silent: true }),
+        ]);
       }
     })();
     state.turnReconnectPromise = work;
@@ -13291,7 +15501,7 @@
 
   function friendlyTool(name) {
     const raw = String(name || "warehouse tool").split("_");
-    const known = ["search_calliope_actions", "plan_calliope_action", "execute_calliope_action", "draft_calliope_instrument", "draft_calliope_workflow", "begin_calliope_workflow_run", "finish_calliope_workflow_run", "run_sql_multi", "run_sql", "create_live_app", "update_live_app", "publish_dashboard", "update_dashboard", "capture_live_app", "render_pdf", "metric_history", "describe_cube", "pivot", "metric"];
+    const known = ["search_calliope_actions", "administer_calliope_action", "administer_local_sql", "draft_calliope_instrument", "draft_calliope_workflow", "draft_calliope_work_order", "draft_calliope_playbook", "read_calliope_playbook", "approve_calliope_playbook", "set_calliope_playbook_access", "archive_calliope_playbook", "begin_calliope_work_order_run", "finish_calliope_work_order_run", "begin_calliope_workflow_run", "finish_calliope_workflow_run", "run_sql_multi", "run_sql", "create_live_app", "update_live_app", "publish_dashboard", "update_dashboard", "capture_live_app", "render_pdf", "metric_history", "describe_cube", "pivot", "metric"];
     const value = String(name || "");
     const found = known.find((tool) => value === tool || value.endsWith(`__${tool}`));
     return (found || raw.slice(-2).join("_")).replaceAll("_", " ");
@@ -13392,6 +15602,10 @@
       markDreamViewed().catch(() => {});
     });
     els.dreamsDetail.addEventListener("click", (event) => {
+      if (event.target.closest("[data-dream-playbook-accept]")) {
+        acceptDreamPlaybook().catch((error) => toast(error.message, true));
+        return;
+      }
       const action = event.target.closest("[data-dream-action]");
       if (action) {
         mutateDream(action.dataset.dreamAction).catch((error) => toast(error.message, true));
@@ -13615,7 +15829,7 @@
       openActionWithCalliope().catch((error) => toast(error.message, true));
     });
     els.actionCreatePlan.addEventListener("click", () => {
-      createActionPlan().catch((error) => toast(error.message, true));
+      executeActionDirect().catch((error) => toast(error.message, true));
     });
     els.actionApply.addEventListener("click", () => {
       applyActionPlan().catch((error) => toast(error.message, true));
@@ -13867,6 +16081,228 @@
       setMobilePanel(document.body.classList.contains("mobile-chat-open") ? null : "chat");
     });
     els.mobileShade.addEventListener("click", () => setMobilePanel());
+    els.setupTodoList?.addEventListener("click", (event) => {
+      const item = event.target.closest("[data-setup-item]");
+      if (!item) return;
+      state.setup.activeItem = String(item.dataset.setupItem || "");
+      renderSetupWorkspace();
+      renderSetupDatabaseStage();
+      const prompt = String(item.dataset.setupPrompt || "").trim();
+      if (prompt) composerSetValue(prompt.slice(0, 6000));
+      const staged = ["preflight", "administrator", "company", "database", "knowledge", "proof", "launch"]
+        .includes(state.setup.activeItem);
+      if (staged) {
+        setMobilePanel();
+        els.setupStageControls?.scrollIntoView({ block: "start", behavior: "smooth" });
+        if (state.setup.activeItem === "preflight" && !state.setup.preflight.snapshot) {
+          loadSetupPreflight().catch(() => {});
+        } else if (state.setup.activeItem === "company" && !state.setup.company.profile) {
+          loadSetupCompany().catch(() => {});
+        } else if (state.setup.activeItem === "proof") {
+          loadSetupProof().catch(() => {});
+        }
+      } else {
+        setMobilePanel("chat");
+        composerFocus();
+      }
+    });
+    els.setupStageControls?.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const companyForm = event.target.closest("[data-setup-company-form]");
+      if (companyForm) {
+        reviewSetupCompany(companyForm).catch((error) => {
+          state.setup.company.error = error.message;
+          renderSetupDatabaseStage();
+        });
+        return;
+      }
+      const proofForm = event.target.closest("[data-setup-proof-form]");
+      if (proofForm) {
+        reviewSetupProof(proofForm).catch((error) => {
+          state.setup.proof.error = error.message;
+          renderSetupDatabaseStage();
+        });
+        return;
+      }
+      const connectionForm = event.target.closest("[data-setup-connection-form]");
+      if (connectionForm) {
+        saveSetupConnection(connectionForm).catch((error) => {
+          state.setup.database.error = error.message;
+          renderSetupDatabaseStage();
+        });
+        return;
+      }
+      const discoveryForm = event.target.closest("[data-setup-discovery-form]");
+      if (discoveryForm) {
+        discoverSetupTables(discoveryForm).catch((error) => {
+          state.setup.database.error = error.message;
+          renderSetupDatabaseStage();
+        });
+      }
+    });
+    els.setupStageControls?.addEventListener("click", (event) => {
+      const button = event.target.closest("button");
+      if (!button) return;
+      const database = state.setup.database;
+      if (button.matches("[data-setup-run-preflight]")) {
+        runSetupPreflight().catch((error) => {
+          state.setup.preflight.error = error.message;
+          renderSetupDatabaseStage();
+        });
+      } else if (button.matches("[data-setup-edit-company]")) {
+        state.setup.company.plan = null;
+        state.setup.company.planToken = "";
+        renderSetupDatabaseStage();
+      } else if (button.matches("[data-setup-apply-company]")) {
+        applySetupCompany().catch((error) => {
+          state.setup.company.error = error.message;
+          renderSetupDatabaseStage();
+        });
+      } else if (button.matches("[data-setup-refresh-proof]")) {
+        loadSetupProof().catch(() => {});
+      } else if (button.matches("[data-setup-edit-proof]")) {
+        state.setup.proof.plan = null;
+        state.setup.proof.planToken = "";
+        renderSetupDatabaseStage();
+      } else if (button.matches("[data-setup-apply-proof]")) {
+        applySetupProof().catch((error) => {
+          state.setup.proof.error = error.message;
+          renderSetupDatabaseStage();
+        });
+      } else if (button.matches("[data-setup-review-launch]")) {
+        reviewSetupLaunch().catch((error) => {
+          state.setup.launch.error = error.message;
+          renderSetupDatabaseStage();
+        });
+      } else if (button.matches("[data-setup-edit-launch]")) {
+        state.setup.launch.plan = null;
+        state.setup.launch.planToken = "";
+        renderSetupDatabaseStage();
+      } else if (button.matches("[data-setup-apply-launch]")) {
+        applySetupLaunch().catch((error) => {
+          state.setup.launch.error = error.message;
+          renderSetupDatabaseStage();
+        });
+      } else if (button.matches("[data-setup-open-calliope]")) {
+        window.location.assign("/calliope");
+      } else if (button.matches("[data-setup-ask]")) {
+        composerSetValue(String(button.dataset.setupAsk || "").slice(0, 6000));
+        setMobilePanel("chat");
+        composerFocus();
+      } else if (button.matches("[data-setup-add-connection]")) {
+        database.showConnectionForm = true;
+        database.connectionFormMode = "add";
+        database.error = "";
+        renderSetupDatabaseStage();
+      } else if (button.matches("[data-setup-cancel-connection]")) {
+        database.showConnectionForm = false;
+        database.connectionFormMode = "";
+        renderSetupDatabaseStage();
+      } else if (button.matches("[data-setup-replace-credential]")) {
+        database.showConnectionForm = true;
+        database.connectionFormMode = "replace";
+        database.error = "";
+        renderSetupDatabaseStage();
+      } else if (button.matches("[data-setup-use-connection]")) {
+        database.selectedConnection = button.dataset.setupUseConnection || "";
+        database.showConnectionForm = false;
+        database.connectionFormMode = "";
+        database.discovery = null;
+        database.plan = null;
+        database.planToken = "";
+        database.sourceSchema = "";
+        database.schemaDiscovery = null;
+        database.schemaConnection = "";
+        database.destinationSchema = setupDefaultDestinationSchema(setupDatabaseConnection());
+        renderSetupDatabaseStage();
+        loadSetupSchemas({ silent: true }).catch(() => {});
+      } else if (button.matches("[data-setup-add-schema]")) {
+        database.discovery = null;
+        database.plan = null;
+        database.planToken = "";
+        database.appliedRunId = "";
+        database.sourceSchema = database.schemaDiscovery?.default_schema || "";
+        database.selections = {};
+        renderSetupDatabaseStage();
+      } else if (button.matches("[data-setup-probe]")) {
+        probeSetupConnection().catch((error) => {
+          database.error = error.message;
+          renderSetupDatabaseStage();
+        });
+      } else if (button.matches("[data-setup-tables]")) {
+        const selected = button.dataset.setupTables === "all";
+        Object.values(database.selections).forEach((selection) => { selection.selected = selected; });
+        database.plan = null;
+        database.planToken = "";
+        renderSetupDatabaseStage();
+      } else if (button.matches("[data-setup-review-plan]")) {
+        reviewSetupPlan().catch((error) => {
+          database.error = error.message;
+          renderSetupDatabaseStage();
+        });
+      } else if (button.matches("[data-setup-edit-plan]")) {
+        database.plan = null;
+        database.planToken = "";
+        renderSetupDatabaseStage();
+      } else if (button.matches("[data-setup-apply-plan]")) {
+        applySetupPlan().catch((error) => {
+          database.error = error.message;
+          renderSetupDatabaseStage();
+        });
+      } else if (button.matches("[data-setup-dismiss-error]")) {
+        database.error = "";
+        renderSetupDatabaseStage();
+      }
+    });
+    els.setupStageControls?.addEventListener("change", (event) => {
+      const control = event.target;
+      const database = state.setup.database;
+      if (control.closest("[data-setup-company-form]") && rememberSetupCompanyControl(control)) {
+        return;
+      }
+      if (control.matches('[data-setup-proof-form] input[name="surface_id"]')) {
+        state.setup.proof.selectedSurface = control.value;
+        renderSetupDatabaseStage();
+        return;
+      }
+      if (control.matches("[data-setup-table-toggle]")) {
+        const selection = database.selections[control.dataset.setupTableToggle];
+        if (selection) selection.selected = Boolean(control.checked);
+      } else if (control.matches("[data-setup-table-mode]")) {
+        const selection = database.selections[control.dataset.setupTableMode];
+        if (selection) {
+          selection.load_mode = control.value;
+          if (control.value !== "incremental_upsert") selection.cursor_column = "";
+        }
+      } else if (control.matches("[data-setup-table-cursor]")) {
+        const selection = database.selections[control.dataset.setupTableCursor];
+        if (selection) selection.cursor_column = control.value;
+      } else if (control.matches("[data-setup-schedule]")) {
+        database.scheduleSeconds = control.value;
+      } else {
+        return;
+      }
+      database.plan = null;
+      database.planToken = "";
+      renderSetupDatabaseStage();
+    });
+    els.setupStageControls?.addEventListener("input", (event) => {
+      const control = event.target;
+      const database = state.setup.database;
+      if (control.closest("[data-setup-company-form]") && rememberSetupCompanyControl(control)) {
+        return;
+      }
+      if (control.matches("[data-setup-table-destination]")) {
+        const selection = database.selections[control.dataset.setupTableDestination];
+        if (selection) selection.destination_table = control.value;
+      } else if (control.matches("[data-setup-destination-schema]")) {
+        database.destinationSchema = control.value;
+      } else {
+        return;
+      }
+      database.plan = null;
+      database.planToken = "";
+    });
     window.addEventListener("resize", () => {
       if (!window.matchMedia("(max-width: 880px)").matches) setMobilePanel();
       if (state.sessionWidth != null) setSessionWidth(state.sessionWidth, false);
@@ -13942,6 +16378,12 @@
     els.inboxRefresh.addEventListener("click", () => loadInbox().catch(() => {}));
     els.inboxAck.addEventListener("click", () => acknowledgeInbox());
     els.inboxSchedule.addEventListener("click", () => scheduleInboxWork());
+    els.inboxModes.addEventListener("click", (event) => {
+      const button = event.target.closest("[data-inbox-mode]");
+      if (!button) return;
+      state.inbox.mode = button.dataset.inboxMode;
+      renderInbox();
+    });
     els.inboxFilters.addEventListener("click", (event) => {
       const button = event.target.closest("[data-inbox-filter]");
       if (!button) return;
@@ -13949,6 +16391,26 @@
       renderInbox();
     });
     els.inboxList.addEventListener("click", (event) => {
+      const playbookAction = event.target.closest("[data-personal-playbook-action]");
+      if (playbookAction) {
+        handlePersonalPlaybookAction(playbookAction)
+          .catch((error) => toast(error.message, true));
+        return;
+      }
+      const workOrderNew = event.target.closest("[data-work-order-new]");
+      const workOrderAction = event.target.closest("[data-work-order-action]");
+      if (workOrderNew) {
+        scheduleInboxWork();
+        return;
+      }
+      if (workOrderAction) {
+        mutateWorkOrder(
+          workOrderAction.closest("[data-work-order-id]"),
+          workOrderAction.dataset.workOrderAction,
+          workOrderAction,
+        );
+        return;
+      }
       const card = event.target.closest("[data-inbox-source][data-inbox-id]");
       const investigate = event.target.closest("[data-inbox-investigate]");
       const action = event.target.closest("[data-inbox-action]");
@@ -13974,6 +16436,14 @@
       const card = event.target.closest("[data-session-id]");
       if (card) selectSession(card.dataset.sessionId).catch((error) => toast(error.message, true));
     });
+    els.sessionList.addEventListener("toggle", (event) => {
+      const group = event.target.closest?.("[data-work-order-run-group]");
+      if (!group) return;
+      const id = group.dataset.workOrderRunGroup;
+      if (group.open) state.workOrderGroupsCollapsed.delete(id);
+      else state.workOrderGroupsCollapsed.add(id);
+      persistCollapsedWorkOrderGroups();
+    }, true);
     els.sessionList.addEventListener("keydown", (event) => {
       const tab = event.target.closest("[data-session-tab]");
       if (!tab || !["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
@@ -14191,6 +16661,17 @@
       }
       updateViewerGrid();
     });
+    els.sketchDialog.addEventListener("cancel", (event) => {
+      event.preventDefault();
+      closeSketchWorkspace();
+    });
+    els.sketchDialog.addEventListener("click", (event) => {
+      if (event.target === els.sketchDialog) {
+        closeSketchWorkspace();
+        return;
+      }
+      handleSketchCardClick(event);
+    });
     els.viewerContent.addEventListener("input", (event) => {
       if (!event.target.matches("[data-query-filter]") || !state.viewerSurface) return;
       state.viewerGrid.filter = event.target.value;
@@ -14208,6 +16689,17 @@
       clearSurfaceSelection();
     });
     els.messages.addEventListener("click", (event) => {
+      const savePlaybook = event.target.closest("[data-save-playbook-turn]");
+      if (savePlaybook) {
+        saveTurnAsPlaybook(savePlaybook.dataset.savePlaybookTurn)
+          .catch((error) => toast(error.message, true));
+        return;
+      }
+      const savedPlaybook = event.target.closest("[data-open-saved-playbook]");
+      if (savedPlaybook) {
+        openSavedPlaybook(savedPlaybook.dataset.openSavedPlaybook);
+        return;
+      }
       const voiceButton = event.target.closest("[data-open-voice-turn]");
       if (voiceButton) {
         openVoiceDialog(voiceButton.dataset.openVoiceTurn);
@@ -14242,7 +16734,36 @@
     els.messages.addEventListener("scroll", () => {
       state.chatAtLiveEdge = isChatAtLiveEdge();
     }, { passive: true });
+    els.sketchShelf.addEventListener("click", (event) => {
+      handleSketchCardClick(event);
+    });
     els.stage.addEventListener("click", (event) => {
+      const playbookCard = event.target.closest("[data-playbook-id]");
+      const playbookSurface = playbookCard?.closest("[data-surface-id]");
+      const playbook = state.surfaces.find(
+        (item) => item.id === playbookSurface?.dataset.surfaceId,
+      )?.payload?.playbook;
+      const approvePlaybookButton = event.target.closest("[data-playbook-approve]");
+      if (approvePlaybookButton) {
+        approvePlaybook(
+          approvePlaybookButton.dataset.playbookApprove,
+          approvePlaybookButton.dataset.playbookVersion,
+          approvePlaybookButton,
+        ).catch((error) => toast(error.message, true));
+        return;
+      }
+      if (event.target.closest("[data-playbook-revise]") && playbook) {
+        preparePlaybookPrompt(playbook, "revise");
+        return;
+      }
+      if (event.target.closest("[data-playbook-use]") && playbook) {
+        preparePlaybookPrompt(playbook, "use");
+        return;
+      }
+      if (event.target.closest("[data-playbook-source]") && playbook) {
+        openPlaybookSource(playbook).catch((error) => toast(error.message, true));
+        return;
+      }
       if (event.target.closest("[data-calendar-connect]")) {
         connectGoogleCalendar();
         return;
@@ -14376,6 +16897,21 @@
       const openQuery = event.target.closest("[data-open-query-surface]");
       if (openQuery) {
         openQuerySurface(openQuery.dataset.openQuerySurface);
+        return;
+      }
+      const openAssigned = event.target.closest("[data-open-assigned-work]");
+      if (openAssigned) {
+        state.inbox.mode = "assigned";
+        openInbox();
+        return;
+      }
+      const workOrderAction = event.target.closest("[data-work-order-action]");
+      if (workOrderAction) {
+        mutateWorkOrder(
+          workOrderAction.closest("[data-work-order-id]"),
+          workOrderAction.dataset.workOrderAction,
+          workOrderAction,
+        );
         return;
       }
       const openInstrument = event.target.closest("[data-open-instrument]");
@@ -14532,6 +17068,80 @@
     window.addEventListener("message", async (event) => {
       const data = event.data;
       if (!data) return;
+      const sketchIframe = sketchFrames()
+        .find((frame) => frame.contentWindow === event.source);
+      if (sketchIframe) {
+        if (event.origin !== window.location.origin) return;
+        const sketchId = sketchIframe.dataset.sketchId;
+        const card = sketchIframe.closest("[data-sketch-card]");
+        const frame = sketchIframe.closest("[data-sketch-frame]");
+        const status = $("[data-sketch-status]", card);
+        if (data.type === "calliope.sketch.theme.request") {
+          await sendViewerThemeToSketch(event.source);
+          return;
+        }
+        if (data.type === "calliope.sketch.expand.request") {
+          setSketchWorkspaceExpanded(sketchId, state.sketchExpandedId !== sketchId);
+          return;
+        }
+        if (data.type === "calliope.sketch.ready") {
+          if (frame) frame.dataset.sketchReady = "true";
+          const loader = $("[data-thinking-orb]", frame);
+          if (loader) window.CalliopeThinkingOrbs?.unmount(loader);
+          card?.removeAttribute("data-sketch-dirty");
+          await sendViewerThemeToSketch(event.source);
+          return;
+        }
+        if (data.type === "calliope.sketch.dirty") {
+          if (card) card.dataset.sketchDirty = "true";
+          if (status) status.textContent = "Unsaved visual edit";
+          return;
+        }
+        if (data.type === "calliope.sketch.saved") {
+          const patch = {
+            revision: Number(data.revision || 1),
+            last_actor: data.last_actor || "human",
+            last_operation_count: Number(data.last_operation_count || 0),
+            element_count: Number(data.element_count || 0),
+            last_change_summary: data.last_change_summary || {},
+            can_undo_calliope: Boolean(data.can_undo_calliope),
+          };
+          state.surfaces.forEach((surface) => {
+            if (surface.kind === "sketch" && sketchIdForSurface(surface) === sketchId) {
+              surface.payload = { ...(surface.payload || {}), ...patch };
+              if (data.title) surface.title = data.title;
+            }
+          });
+          card?.removeAttribute("data-sketch-dirty");
+          if (status) status.textContent = `${sketchActorLabel(patch.last_actor)} · r${patch.revision}`;
+          if (data.changed) {
+            const active = activeSketchSurface();
+            if (active) {
+              state.selectedSurfaceId = active.id;
+              if (card) updateRetainedSketchCard(card, active);
+              renderSelected();
+              renderDesignProfileChip();
+            }
+            toast("Sketch saved · attached to your next turn");
+          }
+          if (state.sketchPendingCollapse === sketchId) toggleSketchCollapsed(sketchId);
+          return;
+        }
+        if (data.type === "calliope.sketch.conflict") {
+          card?.removeAttribute("data-sketch-dirty");
+          state.sketchPendingCollapse = null;
+          if (status) status.textContent = `Reloaded newer edit · r${Number(data.revision || 1)}`;
+          toast("The Sketch moved while you were editing; the newer checkpoint is loaded");
+          return;
+        }
+        if (data.type === "calliope.sketch.error") {
+          state.sketchPendingCollapse = null;
+          if (status) status.textContent = "Sketch needs attention";
+          toast(data.message || "The Sketch could not be saved", true);
+          return;
+        }
+        return;
+      }
       const iframe = $$("iframe[data-artifact-slug]").find((frame) => frame.contentWindow === event.source);
       if (!iframe) return;
       const surfaceId = iframe.closest("[data-surface-id]")?.dataset.surfaceId;
@@ -14598,6 +17208,7 @@
     });
     window.addEventListener("warehouse-theme-change", () => {
       broadcastViewerThemeToArtifacts();
+      broadcastViewerThemeToSketches();
       $$('.artifact-frame[data-frame-state="loading"] iframe', els.stage)
         .forEach(startArtifactFrameLoader);
       const selected = selectedDesignVersion();
@@ -14614,9 +17225,20 @@
         updateCalliopeAvatar();
         connectSessionEvents();
         if (!state.busy) loadSessions().catch(() => {});
-        loadInbox({ silent: true }).catch(() => {});
-        loadBriefStatus({ silent: true }).catch(() => {});
-        loadDreams({ silent: true }).catch(() => {});
+        if (SETUP_MODE) {
+          loadSetupWorkspace({ silent: true })
+            .then(() => Promise.allSettled([
+              loadSetupDatabases({ silent: true }),
+              loadSetupPreflight({ silent: true }),
+              loadSetupCompany({ silent: true }),
+              loadSetupProof({ silent: true }),
+            ]))
+            .catch(() => {});
+        } else {
+          loadInbox({ silent: true }).catch(() => {});
+          loadBriefStatus({ silent: true }).catch(() => {});
+          loadDreams({ silent: true }).catch(() => {});
+        }
       }
     });
     document.addEventListener("drop", (event) => {
@@ -14635,6 +17257,7 @@
     initializeComposerEditor();
     setupEvents();
     initializeStageEmptyHeadlines();
+    applySetupModeChrome();
     try {
       const launch = new URLSearchParams(window.location.search);
       let launchSession = launch.get("session");
@@ -14650,85 +17273,96 @@
       const launchCalendar = launch.get("calendar");
       const launchWorkspace = launch.get("workspace");
       await loadConfig();
-      await loadBriefStatus({ silent: true });
-      await loadGoogleWorkspaceStatus({ silent: true });
-      await loadDreams({ silent: true });
-      await loadPages({ selectId: launchPage, silent: true });
-      if (launchCalendar && state.config?.google_calendar) {
-        const message = ({
-          connected: "Google Calendar connected to your private Personal Brief layer",
-          cancelled: "Google Calendar connection cancelled",
-          account_mismatch: "Use the same Google account that is signed in to Calliope",
-          error: "Google Calendar could not be connected; you can try again",
-        })[launchCalendar] || "Google Calendar connection updated";
-        toast(message, ["account_mismatch", "error"].includes(launchCalendar));
-        launch.delete("calendar");
-        const cleanQuery = launch.toString();
-        window.history.replaceState(
-          {},
-          "",
-          `${window.location.pathname}${cleanQuery ? `?${cleanQuery}` : ""}`,
-        );
-      }
-      if (launchWorkspace && state.config?.google_workspace?.enabled) {
-        const message = ({
-          connected: "Google Workspace connected · Sheets and private Docs are ready",
-          cancelled: "Google Workspace connection cancelled",
-          account_mismatch: "Use the same Google account that is signed in to Calliope",
-          error: "Google Workspace could not be connected; you can try again",
-        })[launchWorkspace] || "Google Workspace connection updated";
-        toast(message, ["account_mismatch", "error"].includes(launchWorkspace));
-        if (launchWorkspace !== "connected") {
-          sessionStorage.removeItem("calliope.pendingWorkspaceExport.v1");
-          sessionStorage.removeItem(PENDING_WORKSPACE_PICKER_KEY);
-          sessionStorage.removeItem(PENDING_WORKSPACE_DOCUMENT_PICKER_KEY);
+      if (SETUP_MODE) {
+        const setup = await loadSetupWorkspace();
+        launchSession = setup?.session?.id || launchSession;
+        await Promise.allSettled([
+          loadSetupDatabases(),
+          loadSetupPreflight(),
+          loadSetupCompany(),
+          loadSetupProof(),
+        ]);
+      } else {
+        await loadBriefStatus({ silent: true });
+        await loadGoogleWorkspaceStatus({ silent: true });
+        await loadDreams({ silent: true });
+        await loadPages({ selectId: launchPage, silent: true });
+        if (launchCalendar && state.config?.google_calendar) {
+          const message = ({
+            connected: "Google Calendar connected to your private Personal Brief layer",
+            cancelled: "Google Calendar connection cancelled",
+            account_mismatch: "Use the same Google account that is signed in to Calliope",
+            error: "Google Calendar could not be connected; you can try again",
+          })[launchCalendar] || "Google Calendar connection updated";
+          toast(message, ["account_mismatch", "error"].includes(launchCalendar));
+          launch.delete("calendar");
+          const cleanQuery = launch.toString();
+          window.history.replaceState(
+            {},
+            "",
+            `${window.location.pathname}${cleanQuery ? `?${cleanQuery}` : ""}`,
+          );
         }
-        launch.delete("workspace");
-        const cleanQuery = launch.toString();
-        window.history.replaceState(
-          {},
-          "",
-          `${window.location.pathname}${cleanQuery ? `?${cleanQuery}` : ""}`,
-        );
-      }
-      if (launchBrief && launchBrief !== "0" && state.config?.personal_briefs) {
-        state.brief.loading = true;
-        renderBriefStatus();
-        try {
-          const data = await requestPersonalBrief(false);
-          launchSession = data.session?.id || launchSession;
-          launchSurface = data.surface?.id || launchSurface;
-          state.brief.status = {
-            ...(state.brief.status || {}),
-            exists: true,
-            session_id: launchSession,
-            surface_id: launchSurface,
-            item_count: Number(data.surface?.payload?.count || 0),
-          };
-          launch.delete("brief");
-          if (launchSession) launch.set("session", launchSession);
-          if (launchSurface) launch.set("surface", launchSurface);
-          const query = launch.toString();
-          window.history.replaceState({}, "", `${window.location.pathname}${query ? `?${query}` : ""}`);
-        } finally {
-          state.brief.loading = false;
+        if (launchWorkspace && state.config?.google_workspace?.enabled) {
+          const message = ({
+            connected: "Google Workspace connected · Sheets and private Docs are ready",
+            cancelled: "Google Workspace connection cancelled",
+            account_mismatch: "Use the same Google account that is signed in to Calliope",
+            error: "Google Workspace could not be connected; you can try again",
+          })[launchWorkspace] || "Google Workspace connection updated";
+          toast(message, ["account_mismatch", "error"].includes(launchWorkspace));
+          if (launchWorkspace !== "connected") {
+            sessionStorage.removeItem("calliope.pendingWorkspaceExport.v1");
+            sessionStorage.removeItem(PENDING_WORKSPACE_PICKER_KEY);
+            sessionStorage.removeItem(PENDING_WORKSPACE_DOCUMENT_PICKER_KEY);
+          }
+          launch.delete("workspace");
+          const cleanQuery = launch.toString();
+          window.history.replaceState(
+            {},
+            "",
+            `${window.location.pathname}${cleanQuery ? `?${cleanQuery}` : ""}`,
+          );
+        }
+        if (launchBrief && launchBrief !== "0" && state.config?.personal_briefs) {
+          state.brief.loading = true;
           renderBriefStatus();
+          try {
+            const data = await requestPersonalBrief(false);
+            launchSession = data.session?.id || launchSession;
+            launchSurface = data.surface?.id || launchSurface;
+            state.brief.status = {
+              ...(state.brief.status || {}),
+              exists: true,
+              session_id: launchSession,
+              surface_id: launchSurface,
+              item_count: Number(data.surface?.payload?.count || 0),
+            };
+            launch.delete("brief");
+            if (launchSession) launch.set("session", launchSession);
+            if (launchSurface) launch.set("surface", launchSurface);
+            const query = launch.toString();
+            window.history.replaceState({}, "", `${window.location.pathname}${query ? `?${query}` : ""}`);
+          } finally {
+            state.brief.loading = false;
+            renderBriefStatus();
+          }
         }
+        await loadInbox({ silent: true });
+        clearInterval(state.inbox.timer);
+        state.inbox.timer = setInterval(
+          () => loadInbox({ silent: true }).catch(() => {}),
+          45_000,
+        );
+        clearInterval(state.brief.timer);
+        state.brief.timer = setInterval(
+          () => loadBriefStatus({ silent: true }).catch(() => {}),
+          60_000,
+        );
+        await loadDesignProfiles();
+        await loadInstruments();
+        await loadWorkflows();
       }
-      await loadInbox({ silent: true });
-      clearInterval(state.inbox.timer);
-      state.inbox.timer = setInterval(
-        () => loadInbox({ silent: true }).catch(() => {}),
-        45_000,
-      );
-      clearInterval(state.brief.timer);
-      state.brief.timer = setInterval(
-        () => loadBriefStatus({ silent: true }).catch(() => {}),
-        60_000,
-      );
-      await loadDesignProfiles();
-      await loadInstruments();
-      await loadWorkflows();
       await loadSessions(launchSession);
       connectSessionEvents();
       const pendingWorkspaceExport = sessionStorage.getItem("calliope.pendingWorkspaceExport.v1");
@@ -14772,7 +17406,13 @@
       }
       clearInterval(state.sessionRefreshTimer);
       state.sessionRefreshTimer = setInterval(() => {
-        if (!document.hidden && !state.busy) loadSessions().catch(() => {});
+        if (!document.hidden && !state.busy) {
+          loadSessions().catch(() => {});
+          if (SETUP_MODE) Promise.allSettled([
+            loadSetupWorkspace({ silent: true }),
+            loadSetupProof({ silent: true }),
+          ]);
+        }
       }, 60_000);
       if (launchSurface && state.surfaces.some((surface) => surface.id === launchSurface)) {
         const launched = state.surfaces.find((surface) => surface.id === launchSurface);
@@ -14793,25 +17433,25 @@
         const query = launch.toString();
         window.history.replaceState({}, "", `${window.location.pathname}${query ? `?${query}` : ""}`);
       }
-      if (launchInstrument) {
+      if (!SETUP_MODE && launchInstrument) {
         await openInstruments(launchInstrument);
       }
-      if (launchWorkflow) {
+      if (!SETUP_MODE && launchWorkflow) {
         await openWorkflows(launchWorkflow);
       }
-      if (launchAction) {
+      if (!SETUP_MODE && launchAction) {
         await openActionLibrary(launchAction);
       }
-      if (launchPage) {
+      if (!SETUP_MODE && launchPage) {
         await openPages(launchPage);
       }
-      if (launchInbox && launchInbox !== "0") {
+      if (!SETUP_MODE && launchInbox && launchInbox !== "0") {
         openInbox();
         launch.delete("inbox");
         const query = launch.toString();
         window.history.replaceState({}, "", `${window.location.pathname}${query ? `?${query}` : ""}`);
       }
-      if (!state.sessions.length && !els.actionDialog.open && !els.instrumentDialog.open && !els.workflowDialog.open && !els.inboxDialog.open && !els.pagesDialog.open) {
+      if (!SETUP_MODE && !state.sessions.length && !els.actionDialog.open && !els.instrumentDialog.open && !els.workflowDialog.open && !els.inboxDialog.open && !els.pagesDialog.open) {
         els.dialog.showModal();
         requestAnimationFrame(() => els.newSessionTitle.focus());
       }

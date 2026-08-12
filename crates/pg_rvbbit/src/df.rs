@@ -495,7 +495,9 @@ fn discover_catalog_scan(asof: Option<AsOf>) -> Result<BTreeMap<String, RvbbitTa
         None => crate::time_travel::latest_predicate("c.oid", "rg.generation"),
     };
     let tombstone_predicate = match asof.as_ref() {
-        Some(asof) => crate::time_travel::tombstone_predicate(asof, "c.oid", "dl.deleted_generation"),
+        Some(asof) => {
+            crate::time_travel::tombstone_predicate(asof, "c.oid", "dl.deleted_generation")
+        }
         None => String::new(),
     };
     let tombstone_row_group_predicate = match asof.as_ref() {

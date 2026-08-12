@@ -2269,7 +2269,7 @@ fn render_compose(manifest: &Value, safe_name: &str) -> Result<String> {
     let healthcheck_code = serde_json::to_string(&healthcheck_code).unwrap();
 
     Ok(format!(
-        "services:\n  {service}:\n{runtime_source}{runtime_command}{runtime_ipc}    container_name: rvbbit-{service}\n    expose:\n      - \"{container_port}\"\n    environment:\n{env_yaml}\n    volumes:\n{volume_mounts}\n    networks:\n      - rvbbit\n    healthcheck:\n      test: [\"CMD\", \"python\", \"-c\", {healthcheck_code}]\n      interval: 10s\n      timeout: 5s\n      retries: 60\n\nnetworks:\n  rvbbit:\n    name: ${{RVBBIT_DOCKER_NETWORK:-docker_default}}\n    external: true\n\nvolumes:\n{volume_defs}\n"
+        "services:\n  {service}:\n{runtime_source}{runtime_command}{runtime_ipc}    container_name: rvbbit-{service}\n    expose:\n      - \"{container_port}\"\n    environment:\n{env_yaml}\n    volumes:\n{volume_mounts}\n    networks:\n      - rvbbit\n    healthcheck:\n      test: [\"CMD\", \"python\", \"-c\", {healthcheck_code}]\n      interval: 10s\n      timeout: 5s\n      retries: 60\n    restart: unless-stopped\n\nnetworks:\n  rvbbit:\n    name: ${{RVBBIT_DOCKER_NETWORK:-docker_default}}\n    external: true\n\nvolumes:\n{volume_defs}\n"
     ))
 }
 
@@ -2915,6 +2915,23 @@ fn register_runtime(db: &mut Client, manifest: &Value, result: &DeploymentResult
             )
             .context("registering Python runtime")?;
         }
+        "data_mover" => {
+            db.execute(
+                "SELECT rvbbit.register_data_mover_runtime(\
+                 runtime_name => $1, endpoint_url => $2, runtime_status => 'ready', \
+                 runtime_labels => $3::text::jsonb, runtime_source => 'warren', \
+                 warren_deployment_id => NULL, install_manifest => $4::text::jsonb, \
+                 health => $5::text::jsonb)",
+                &[
+                    &runtime_name,
+                    &result.endpoint_url,
+                    &labels,
+                    &install_manifest,
+                    &health,
+                ],
+            )
+            .context("registering data-mover runtime")?;
+        }
         "mcp" | "mcp_gateway" => {
             db.execute(
                 "SELECT rvbbit.register_mcp_gateway(\
@@ -3117,6 +3134,7 @@ fn probe_runtime(manifest: &Value, result: &DeploymentResult) -> Result<Value> {
             | "http_service"
             | "brain_connector"
             | "document_connector"
+            | "data_mover"
     ) {
         let parsed = if result.published_host_port {
             http_get_json(&result.probe_url)
@@ -3797,5 +3815,6 @@ mod gpu_tests {
         assert!(rendered.contains(
             "urllib.request.urlopen(\\\"http://localhost:8080/health?probe='quoted'\\\")"
         ));
+        assert!(rendered.contains("    restart: unless-stopped\n"));
     }
 }

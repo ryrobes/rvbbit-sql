@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="color-scheme" content="dark light">
   <style>html{background:#100d0b}body{background:transparent}</style>
-  <title>Calliope · RVBBIT.AI</title>
+  <title>__CALLIOPE_PAGE_TITLE__</title>
   <link rel="icon" href="/theme/datarabbit.svg" type="image/svg+xml">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -14,12 +14,12 @@
   <link rel="stylesheet" href="/theme/warehouse-theme.css">
   <script src="/theme/warehouse-theme.js"></script>
 </head>
-<body data-warehouse-page="calliope">
+<body data-warehouse-page="calliope" data-calliope-mode="__CALLIOPE_MODE__">
 __CALLIOPE_BACKGROUND__
 <div class="grid-wash" aria-hidden="true"></div>
 
 <nav class="topbar" data-warehouse-header>
-  <a class="brand" href="/gallery" aria-label="Calliope artifacts">
+  <a class="brand" __CALLIOPE_BRAND_LINK__ aria-label="Calliope artifacts">
     __CALLIOPE_RABBIT__
     <span class="calliope-brand"><span class="calliope-brand-name">Calliope</span><span class="calliope-brand-byline">by RVBBIT.AI</span></span>
   </a>
@@ -32,6 +32,7 @@ __CALLIOPE_BACKGROUND__
     </button>
   </div>
   <div class="top-context">
+    <span class="setup-context"><i></i> initial setup</span>
     <span class="company-memory"><i></i> shared company memory</span>
     <a class="artifacts-link" href="/gallery">Artifacts</a>
     <button id="personal-brief-open" class="personal-brief-open" type="button" title="Open today's private Personal Brief">
@@ -61,6 +62,22 @@ __CALLIOPE_BACKGROUND__
          aria-label="Resize sessions panel" aria-orientation="vertical"
          aria-valuemin="205" aria-valuemax="420" aria-valuenow="238"
          tabindex="0"></div>
+    <section id="setup-rail" class="setup-rail" aria-label="Getting started">
+      <header class="setup-rail-head">
+        <p class="eyebrow">First boot</p>
+        <h1>Getting started</h1>
+        <p>Calliope will walk you through each part and put the working controls on the stage.</p>
+      </header>
+      <div class="setup-progress" aria-label="Setup progress">
+        <div><span>Required setup</span><b id="setup-progress-label">Checking…</b></div>
+        <i><span id="setup-progress-bar"></span></i>
+      </div>
+      <div id="setup-todo-list" class="setup-todo-list" aria-live="polite"></div>
+      <footer class="setup-rail-note">
+        <strong>This is a working conversation.</strong>
+        <p>Secrets stay behind references. Query results, table choices, tests, and other setup artifacts appear on the stage.</p>
+      </footer>
+    </section>
     <header class="column-head sessions-head">
       <div>
         <p class="eyebrow">Your notebooks</p>
@@ -76,7 +93,7 @@ __CALLIOPE_BACKGROUND__
       <span class="work-inbox-mark" aria-hidden="true">↳</span>
       <span class="work-inbox-open-copy">
         <strong>Work Inbox</strong>
-        <small>Changes · results · things to resolve</small>
+        <small>Inbox · assignments · playbooks</small>
       </span>
       <b id="work-inbox-count" class="work-inbox-count" hidden>0</b>
       <i aria-hidden="true">›</i>
@@ -91,7 +108,7 @@ __CALLIOPE_BACKGROUND__
   <section class="stage-column" aria-label="Artifact history">
     <header class="column-head stage-head">
       <div class="stage-title-wrap">
-        <p class="eyebrow">Living artifact record</p>
+        <p id="stage-eyebrow" class="eyebrow">Living artifact record</p>
         <button id="session-title" class="session-title" type="button" title="Rename session">Choose or start a session</button>
         <div id="session-access-meta" class="session-access-meta" hidden></div>
       </div>
@@ -123,13 +140,15 @@ __CALLIOPE_BACKGROUND__
       <span id="evidence-search-scope" class="evidence-search-scope">docs · artifacts · data</span>
       <button id="evidence-search-submit" type="submit" disabled>Find</button>
     </form>
+    <div id="sketch-shelf" class="sketch-shelf" aria-label="Active shared Sketch" hidden></div>
     <div id="stage-scroll" class="stage-scroll">
       <button id="new-surfaces" class="new-surfaces" type="button" hidden>New surfaces ↑</button>
+      <section id="setup-stage-controls" class="setup-stage-controls" aria-label="Secure setup controls" hidden></section>
       <div id="stage-empty" class="stage-empty">
         <div class="orbit" aria-hidden="true"><i></i><i></i><i></i></div>
         <p class="eyebrow">Nothing placed yet</p>
         <h2 id="stage-empty-headline" class="stage-empty-headline" data-length="short">Ideas become things here.</h2>
-        <p>Find existing evidence or ask Calliope a business question. Search sets, queries, charts, dashboards, decks, images, and documents collect above their history—not inside the conversation.</p>
+        <p id="stage-empty-copy">Find existing evidence or ask Calliope a business question. Search sets, queries, charts, dashboards, decks, images, and documents collect above their history—not inside the conversation.</p>
       </div>
       <div id="stage" class="stage"></div>
     </div>
@@ -147,14 +166,14 @@ __CALLIOPE_BACKGROUND__
         <img id="calliope-avatar" alt="" width="42" height="42" decoding="async">
       </div>
       <div>
-        <p class="eyebrow">Warehouse muse</p>
+        <p id="chat-eyebrow" class="eyebrow">Warehouse muse</p>
         <h2>Calliope</h2>
       </div>
       <span id="calliope-status" class="agent-status"><i></i><span>checking</span></span>
     </header>
 
     <div id="chat-empty" class="chat-empty">
-      <p>Calliope works through the same governed RVBBIT tools used from GChat and MCP clients. Her prose stays here; what she makes appears on the stage.</p>
+      <p id="chat-empty-copy">Calliope works through the same governed RVBBIT tools used from GChat and MCP clients. Her prose stays here; what she makes appears on the stage.</p>
     </div>
     <div id="messages" class="messages" aria-live="polite"></div>
     <section id="tool-activity" class="tool-activity" aria-label="Temporary turn activity" hidden>
@@ -344,7 +363,7 @@ __CALLIOPE_BACKGROUND__
     <header>
       <div>
         <p class="eyebrow">Complete response</p>
-        <h2 id="voice-dialog-title">Behind the spoken cut</h2>
+        <h2 id="voice-dialog-title">Behind the spoken rendering</h2>
       </div>
       <button id="voice-dialog-close" class="markup-close" type="button" aria-label="Close spoken response">×</button>
     </header>
@@ -352,7 +371,7 @@ __CALLIOPE_BACKGROUND__
       <div class="voice-dialog-signal" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
       <div id="voice-dialog-script" class="voice-dialog-script"></div>
       <div id="voice-dialog-meta" class="voice-dialog-meta"></div>
-      <small>When voice is on, the conversation follows the concise words Calliope speaks. This modal keeps her complete, canonical answer available without adding another chat message.</small>
+      <small>When voice is on, the conversation follows the words Calliope speaks. This modal keeps her complete, canonical answer available without adding another chat message.</small>
     </div>
     <footer>
       <button id="voice-dialog-copy" class="quiet-action" type="button">Copy full answer</button>
@@ -411,6 +430,10 @@ __CALLIOPE_BACKGROUND__
       </div>
     </footer>
   </div>
+</dialog>
+
+<dialog id="sketch-workspace-dialog" class="sketch-workspace-dialog" aria-label="Expanded collaborative Sketch">
+  <div id="sketch-workspace-content" class="sketch-workspace-content"></div>
 </dialog>
 
 <dialog id="surface-viewer-dialog" class="surface-viewer-dialog" aria-labelledby="surface-viewer-title">
@@ -533,7 +556,7 @@ __CALLIOPE_BACKGROUND__
       <div class="work-inbox-heading">
         <p class="eyebrow">Private action surface</p>
         <h2 id="work-inbox-title">Work Inbox</h2>
-        <p>What changed, why it matters, and the next useful move—without another feed to babysit.</p>
+        <p id="work-inbox-copy">What changed, why it matters, and the next useful move—without another feed to babysit.</p>
       </div>
       <div class="work-inbox-head-actions">
         <button id="work-inbox-schedule" class="work-inbox-primary" type="button">＋ Schedule something</button>
@@ -542,6 +565,11 @@ __CALLIOPE_BACKGROUND__
         <button id="work-inbox-close" class="markup-close" type="button" aria-label="Close Work Inbox">×</button>
       </div>
     </header>
+    <nav id="work-inbox-modes" class="work-inbox-modes" aria-label="Calliope work views">
+      <button type="button" data-inbox-mode="inbox" aria-pressed="true">Work Inbox <span id="work-inbox-mode-count">0</span></button>
+      <button type="button" data-inbox-mode="assigned" aria-pressed="false">Assigned to Callie <span id="work-assigned-mode-count">0</span></button>
+      <button type="button" data-inbox-mode="playbooks" aria-pressed="false">My Playbooks <span id="work-playbook-mode-count">0</span></button>
+    </nav>
     <nav id="work-inbox-filters" class="work-inbox-filters" aria-label="Filter Work Inbox">
       <button type="button" data-inbox-filter="open" aria-pressed="true">Open</button>
       <button type="button" data-inbox-filter="attention" aria-pressed="false">Needs attention</button>
@@ -701,22 +729,22 @@ __CALLIOPE_BACKGROUND__
           <section id="action-detail-requirements" class="action-detail-requirements" hidden></section>
           <form id="action-detail-form" class="action-detail-form"></form>
           <section id="action-plan" class="action-plan" hidden>
-            <header><div><span>Change plan</span><strong id="action-plan-summary"></strong></div><b id="action-plan-status">Awaiting approval</b></header>
+            <header><div><span>Change receipt</span><strong id="action-plan-summary"></strong></div><b id="action-plan-status">Applying</b></header>
             <div id="action-plan-steps" class="action-plan-steps"></div>
             <p id="action-plan-rollback" class="action-plan-rollback"></p>
           </section>
           <footer class="action-detail-actions">
-            <p id="action-detail-note">Nothing changes until you approve the plan.</p>
+            <p id="action-detail-note">Submitting applies and verifies this change directly, with a durable redacted receipt.</p>
             <button id="action-open-with-calliope" type="button">Open with Calliope</button>
-            <button id="action-create-plan" class="primary-action" type="button">Review change →</button>
-            <button id="action-apply" class="primary-action" type="button" hidden>Approve &amp; apply →</button>
+            <button id="action-create-plan" class="primary-action" type="button">Apply &amp; verify →</button>
+            <button id="action-apply" class="primary-action" type="button" hidden>Apply legacy receipt →</button>
           </footer>
         </article>
         <div id="library-changes-empty" class="inventory-empty" hidden>
           <i aria-hidden="true">✓</i>
           <p class="eyebrow">Durable change receipts</p>
-          <h3>No governed changes yet.</h3>
-          <p>Approved Library changes will remain here with their frozen plan, verification, and rollback guidance.</p>
+          <h3>No appliance changes yet.</h3>
+          <p>Library changes remain here with their redacted inputs, verification, and rollback guidance.</p>
         </div>
       </section>
     </div>

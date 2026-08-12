@@ -173,6 +173,27 @@ def test_managed_clover_uses_a_stable_service_model_alias():
     assert "'provider','clover_llm','model','gemma4'" not in install_sql
     assert '"provider":"clover_llm","model":"gemma4"' not in install_sql
     assert "nvidia/Gemma-4-31B-IT-NVFP4" not in install_sql
+    assert "register_backend('embed',     'https://clover.rvbb.it/v1/embeddings'" in install_sql
+    assert "'openai', 32, 25, 30000, 'RVBBIT_CLOVER_KEY'" in install_sql
+    assert "http://clover.rvbb.it:8090" not in install_sql
+
+
+def test_clover_edge_is_pinned_and_terminates_tls_in_front_of_hutch():
+    compose = yaml.safe_load(
+        (ROOT / "docker" / "docker-compose.clover-edge.yml").read_text(
+            encoding="utf-8"
+        )
+    )
+    caddy = compose["services"]["caddy"]
+    assert caddy["image"].startswith("caddy@sha256:")
+    assert caddy["network_mode"] == "host"
+    assert "./clover/Caddyfile:/etc/caddy/Caddyfile:ro" in caddy["volumes"]
+
+    caddyfile = (ROOT / "docker" / "clover" / "Caddyfile").read_text(
+        encoding="utf-8"
+    )
+    assert "clover.rvbb.it" in caddyfile
+    assert "reverse_proxy 127.0.0.1:8090" in caddyfile
 
 
 def test_google_meet_pack_renders_as_a_governed_brain_connector():
@@ -555,9 +576,15 @@ def test_uber_compose_bootstraps_baseline_capabilities():
     bootstrap_env = services["bootstrap"]["environment"]
     assert bootstrap_env["RVBBIT_UBER_BOOTSTRAP_CAPABILITIES"] == (
         "${RVBBIT_UBER_BOOTSTRAP_CAPABILITIES:-"
-        "smoke/warren-echo,runtimes/python-runtime,runtimes/mcp-gateway}"
+        "smoke/warren-echo,runtimes/python-runtime,runtimes/mcp-gateway,"
+        "data/dlt-mirror}"
     )
     assert services["bootstrap"]["command"] == ["rvbbit-uber-bootstrap"]
+
+    postgres_health = services["postgres"]["healthcheck"]["test"]
+    assert postgres_health[0] == "CMD-SHELL"
+    assert "grep -qx postgres /proc/1/comm" in postgres_health[1]
+    assert "pg_isready" in postgres_health[1]
 
     socket_mount = "${RVBBIT_DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock"
     for service_name in ("lens", "warren"):
@@ -579,6 +606,139 @@ def test_uber_compose_bootstraps_baseline_capabilities():
 
     dockerfile = (ROOT / "docker" / "Dockerfile.rvbbit").read_text(encoding="utf-8")
     assert "docker/uber/bootstrap.sh /usr/local/bin/rvbbit-uber-bootstrap" in dockerfile
+
+
+def test_calliope_compose_is_a_pinned_hosted_full_stack():
+    class ComposeLoader(yaml.SafeLoader):
+        pass
+
+    ComposeLoader.add_constructor(
+        "!reset", lambda loader, node: loader.construct_sequence(node)
+    )
+    ComposeLoader.add_constructor(
+        "!override", lambda loader, node: loader.construct_sequence(node)
+    )
+    compose_path = ROOT / "docker" / "docker-compose.calliope.yml"
+    compose = yaml.load(compose_path.read_text(encoding="utf-8"), Loader=ComposeLoader)
+    services = compose["services"]
+
+    assert {
+        "postgres",
+        "duck",
+        "lens",
+        "warren",
+        "bootstrap",
+        "doc-extract",
+        "hindsight",
+        "hermes",
+        "warehouse-mcp",
+        "origin",
+    } <= set(services)
+    assert services["warehouse-mcp"]["profiles"] == []
+    assert services["origin"]["profiles"] == []
+
+    lens_env = services["lens"]["environment"]
+    assert lens_env["RVBBIT_MODE"] == "burrow"
+    assert lens_env["RVBBIT_AUTH_INTERNAL"] == "http://warehouse-mcp:8765"
+    assert services["lens"]["ports"] == [
+        "${RVBBIT_LENS_PORT:-127.0.0.1:3000}:3000"
+    ]
+    assert (
+        services["warehouse-mcp"]["environment"]["WAREHOUSE_LOGIN_UI"] == "lens"
+    )
+    assert "${RVBBIT_BURROW_PORT:-127.0.0.1:3001}:80" in services["origin"][
+        "ports"
+    ]
+
+    postgres_env = services["postgres"]["environment"]
+    assert postgres_env["RVBBIT_CLOVER_KEY"].startswith("${RVBBIT_CLOVER_KEY:?")
+    assert postgres_env["RVBBIT_CLOVER_INSTALL_SOURCE"] == "shipped"
+
+    bootstrap_env = services["bootstrap"]["environment"]
+    assert bootstrap_env["RVBBIT_CLOVER_REQUIRED"] == "true"
+    assert bootstrap_env["RVBBIT_CLOVER_VERIFY_REMOTE"] == "true"
+    assert bootstrap_env["RVBBIT_CLOVER_INSTALL_SOURCE"] == "shipped"
+    assert bootstrap_env["RVBBIT_CLOVER_REQUIRED_MODEL"].endswith(":-calliope}")
+    assert bootstrap_env["RVBBIT_HOSTED_SERVICES"] == "true"
+    assert bootstrap_env["RVBBIT_UBER_BOOTSTRAP_CAPABILITIES"].endswith(
+        ":-runtimes/python-runtime,runtimes/mcp-gateway,data/dlt-mirror}"
+    )
+
+    hindsight = services["hindsight"]
+    assert "hindsight-api:0.9.0-slim@sha256:" in hindsight["image"]
+    assert hindsight["environment"]["HINDSIGHT_API_DATABASE_SCHEMA"] == "hindsight"
+    assert hindsight["environment"]["HINDSIGHT_API_LLM_MODEL"].endswith(
+        ":-calliope}"
+    )
+    assert hindsight["environment"]["HINDSIGHT_API_EMBEDDINGS_OPENAI_MODEL"] == "embed"
+
+    hermes = services["hermes"]
+    assert hermes["build"]["dockerfile"] == "docker/Dockerfile.calliope-hermes"
+    assert "nousresearch/hermes-agent@sha256:" in hermes["build"]["args"][
+        "HERMES_BASE_IMAGE"
+    ]
+    assert hermes["environment"]["API_SERVER_MODEL_NAME"].endswith(":-calliope}")
+    assert hermes["environment"]["HINDSIGHT_API_URL"] == "http://hindsight:8888"
+    assert hermes["depends_on"]["hindsight"]["condition"] == "service_started"
+    assert hermes["depends_on"]["warehouse-mcp"]["condition"] == "service_healthy"
+    assert "hermes" not in services["warehouse-mcp"]["depends_on"]
+    assert services["warehouse-mcp"]["environment"]["WAREHOUSE_HERMES_URL"] == (
+        "http://hermes:8642"
+    )
+
+    hermes_dockerfile = (
+        ROOT / "docker" / "Dockerfile.calliope-hermes"
+    ).read_text(encoding="utf-8")
+    assert "git apply --check --include=tools/mcp_tool.py" in hermes_dockerfile
+    assert "69ae247cf3dba34a37ab4af8484b96d3559a4fcf" in hermes_dockerfile
+
+
+def test_hosted_bootstrap_reapplies_shipped_clover_on_existing_volumes():
+    bootstrap = (ROOT / "docker" / "uber" / "bootstrap.sh").read_text(
+        encoding="utf-8"
+    )
+    init = (ROOT / "docker" / "init" / "02-install-clover.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert "install_managed_clover" in bootstrap
+    assert "refreshing managed/clover from the pinned image snapshot" in bootstrap
+    assert "pg_read_file('/usr/share/rvbbit/capabilities/catalog.json')" in bootstrap
+    assert "capabilities/packs/managed/clover/capability.json" in bootstrap
+    assert "rvbbit.upsert_capability_catalog_entry" in bootstrap
+    postgres_dockerfile = (ROOT / "docker" / "Dockerfile.rvbbit").read_text(
+        encoding="utf-8"
+    )
+    assert "chmod -R a+rX /usr/share/rvbbit/capabilities" in postgres_dockerfile
+    assert "jsonb_array_elements_text(c.manifest #> '{managed,install,sql}')" in bootstrap
+    assert "rvbbit.backend_probe('embed')" in bootstrap
+    assert 'RVBBIT_CLOVER_REQUIRED_MODEL:-' in bootstrap
+    assert "configure_hosted_clover_defaults" in bootstrap
+    assert "rvbbit.bind_extract_entities_to_clover()" in bootstrap
+    assert "rvbbit.extract_entities(text,text,jsonb)" in bootstrap
+    assert "prepare_hosted_services" in bootstrap
+    assert "CREATE EXTENSION IF NOT EXISTS vector" in bootstrap
+    assert "CREATE EXTENSION IF NOT EXISTS pg_trgm WITH SCHEMA public" in bootstrap
+    assert "ALTER EXTENSION pg_trgm SET SCHEMA public" in bootstrap
+    assert "rvbbit.register_memory_service" in bootstrap
+    assert 'RVBBIT_CLOVER_INSTALL_SOURCE:-live' in init
+    assert 'CLOVER_INSTALL_SOURCE" = "shipped"' in init
+
+
+def test_product_images_and_repository_pin_the_same_rust_toolchain():
+    toolchain = (ROOT / "rust-toolchain.toml").read_text(encoding="utf-8")
+    postgres = (ROOT / "docker" / "Dockerfile.rvbbit").read_text(encoding="utf-8")
+    warren = (ROOT / "docker" / "Dockerfile.warren-agent").read_text(encoding="utf-8")
+
+    toolchain_version = re.search(r'^channel = "([0-9]+\.[0-9]+\.[0-9]+)"$', toolchain, re.M)
+    postgres_version = re.search(r"--default-toolchain ([0-9]+\.[0-9]+\.[0-9]+)", postgres)
+    warren_version = re.search(r"^FROM rust:([0-9]+\.[0-9]+)-", warren, re.M)
+
+    assert toolchain_version
+    assert postgres_version
+    assert warren_version
+    assert toolchain_version.group(1) == postgres_version.group(1)
+    assert toolchain_version.group(1).startswith(f"{warren_version.group(1)}.")
 
 
 def test_release_compose_exposes_configurable_docker_socket_to_capability_runners():

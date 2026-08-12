@@ -271,10 +271,11 @@ if [[ "$SKIP_LENS" -eq 0 ]]; then
         --label "org.opencontainers.image.title=rvbbit-lens"
 fi
 
-# Warehouse MCP — a self-contained sidecar (server.py + requirements), so it builds
-# straight from services/warehouse-mcp; no staged release context needed.
+# Warehouse MCP also carries the shared Business Topology excavation worker, so
+# its context is the repository root while the Dockerfile still copies only the
+# service and bounded topology package.
 if [[ "$SKIP_WAREHOUSE_MCP" -eq 0 ]]; then
-    build_image rvbbit-warehouse-mcp "$ROOT/services/warehouse-mcp/Dockerfile" "$ROOT/services/warehouse-mcp" "$PLATFORM" \
+    build_image rvbbit-warehouse-mcp "$ROOT/services/warehouse-mcp/Dockerfile" "$ROOT" "$PLATFORM" \
         --label "org.opencontainers.image.title=rvbbit-warehouse-mcp"
 fi
 

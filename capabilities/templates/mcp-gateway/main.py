@@ -28,12 +28,12 @@ import logging
 import os
 import re
 from contextlib import AsyncExitStack
-from typing import Any
+from typing import Any, Literal
 
 import asyncpg
 import httpx
 from fastapi import FastAPI, Header, HTTPException
-from pydantic import AnyUrl, BaseModel, Field
+from pydantic import AnyUrl, BaseModel, Field, SecretStr
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
@@ -68,18 +68,23 @@ _ENV_REF = re.compile(r"\$\{(\w+)\}")
 
 # ---- secret store ---------------------------------------------------------
 #
-# Install-time secrets (API keys entered in the UI) are POSTed to /secrets and
-# held HERE, by the gateway — never persisted in Postgres, which only stores
-# ${VAR} references in mcp_servers.env. resolve_env() checks this store
-# (scoped per server) BEFORE the gateway's own process env, so a server
-# registered with env {"GITHUB_TOKEN": "${GITHUB_TOKEN}"} picks up whatever the
-# installer entered. Encrypted at rest with Fernet when `cryptography` + a key
-# are available; degrades to plaintext-in-file (gateway is already an isolation
-# boundary) with a warning otherwise.
+# New installations persist install-time secrets in rvbbit.credentials through
+# the purpose-specific SQL API. This object is the in-memory runtime cache and a
+# compatibility reader for gateways that start before migration 0286. Existing
+# encrypted files are copied into the canonical store once, but never overwrite
+# a newer canonical value. Only ${VAR} references remain in mcp_servers.
 
 SECRETS_PATH = os.environ.get("RVBBIT_GATEWAY_SECRETS_PATH", "/app/data/mcp-secrets.bin")
 GATEWAY_TOKEN = os.environ.get("RVBBIT_GATEWAY_TOKEN") or None
 MAX_TIMEOUT_MS = 600_000
+REQUIRE_CANONICAL_CREDENTIALS = os.environ.get(
+    "RVBBIT_REQUIRE_CANONICAL_CREDENTIALS", ""
+).strip().lower() in {"1", "true", "yes", "on"}
+REQUIRE_LEGACY_ENCRYPTION = os.environ.get(
+    "RVBBIT_GATEWAY_REQUIRE_ENCRYPTION", ""
+).strip().lower() in {"1", "true", "yes", "on"}
+canonical_credentials = False
+revoked_credentials: set[tuple[str, str]] = set()
 
 try:
     from cryptography.fernet import Fernet
@@ -90,6 +95,10 @@ except ImportError:
 
 def _load_fernet():
     if not _HAS_CRYPTO:
+        if REQUIRE_LEGACY_ENCRYPTION:
+            raise RuntimeError(
+                "mcp-gateway: cryptography is required for the legacy secret store"
+            )
         log.warning("mcp-gateway: `cryptography` not installed; secret store is UNENCRYPTED")
         return None
     key = os.environ.get("RVBBIT_GATEWAY_SECRET_KEY")
@@ -102,7 +111,9 @@ def _load_fernet():
     try:
         if os.path.exists(key_path):
             with open(key_path, "rb") as f:
-                return Fernet(f.read().strip())
+                cipher = Fernet(f.read().strip())
+            os.chmod(key_path, 0o600)
+            return cipher
         os.makedirs(os.path.dirname(key_path) or ".", exist_ok=True)
         k = Fernet.generate_key()
         with open(key_path, "wb") as f:
@@ -112,6 +123,10 @@ def _load_fernet():
                     "RVBBIT_GATEWAY_SECRET_KEY (mounted) for durable production use", key_path)
         return Fernet(k)
     except Exception as e:
+        if REQUIRE_LEGACY_ENCRYPTION:
+            raise RuntimeError(
+                "mcp-gateway: encrypted legacy secret-store setup failed"
+            ) from e
         log.warning("mcp-gateway: encryption setup failed (%s); secrets UNENCRYPTED", e)
         return None
 
@@ -155,16 +170,28 @@ class SecretStore:
     def for_server(self, server: str) -> dict[str, str]:
         return dict(self._data.get(server, {}))
 
-    def set(self, server: str, name: str, value: str):
-        self._data.setdefault(server, {})[name] = value
-        self._persist()
+    def snapshot(self) -> dict[str, dict[str, str]]:
+        return {server: dict(values) for server, values in self._data.items()}
 
-    def delete(self, server: str, name: str):
+    def replace(self, data: dict[str, dict[str, str]]):
+        self._data = {
+            str(server): {str(name): str(value) for name, value in values.items()}
+            for server, values in data.items()
+            if isinstance(values, dict)
+        }
+
+    def set(self, server: str, name: str, value: str, *, persist: bool = True):
+        self._data.setdefault(server, {})[name] = value
+        if persist:
+            self._persist()
+
+    def delete(self, server: str, name: str, *, persist: bool = True):
         if name in self._data.get(server, {}):
             del self._data[server][name]
             if not self._data[server]:
                 del self._data[server]
-            self._persist()
+            if persist:
+                self._persist()
 
     def names(self, server: str) -> list[str]:
         return sorted(self._data.get(server, {}).keys())
@@ -173,13 +200,99 @@ class SecretStore:
 secrets = SecretStore()
 
 
+async def _initialize_canonical_credentials() -> None:
+    """Hydrate the runtime cache and migrate missing legacy file entries."""
+    global canonical_credentials, revoked_credentials
+    if db_pool is None:
+        raise RuntimeError("mcp-gateway database pool is not initialized")
+    canonical_credentials = False
+    revoked_credentials = set()
+    try:
+        async with db_pool.acquire() as conn:
+            supported = await conn.fetchval(
+                "SELECT to_regprocedure('rvbbit.set_mcp_credential(text,text,text)') "
+                "IS NOT NULL"
+            )
+            key_ready = bool(supported) and bool(
+                await conn.fetchval("SELECT rvbbit.credential_key_available()")
+            )
+            if not supported or not key_ready:
+                reason = (
+                    "migration 0286 is not installed"
+                    if not supported
+                    else "RVBBIT_CREDENTIAL_KEY is not configured"
+                )
+                if REQUIRE_CANONICAL_CREDENTIALS:
+                    raise RuntimeError(
+                        f"canonical MCP credentials are required but {reason}"
+                    )
+                log.warning(
+                    "mcp-gateway: canonical credential store unavailable (%s); "
+                    "using the legacy encrypted file",
+                    reason,
+                )
+                return
+
+            rows = await conn.fetch(
+                "SELECT namespace AS server_name,name AS secret_name,status "
+                "FROM rvbbit.list_credentials('mcp',NULL)"
+            )
+            known = {
+                (str(row["server_name"]), str(row["secret_name"])) for row in rows
+            }
+            active = {
+                (str(row["server_name"]), str(row["secret_name"]))
+                for row in rows if str(row["status"]) == "active"
+            }
+            revoked = known.difference(active)
+            legacy = secrets.snapshot()
+            for server, values in legacy.items():
+                for name, value in values.items():
+                    if (server, name) in known:
+                        continue
+                    await conn.fetchval(
+                        "SELECT rvbbit.set_mcp_credential($1, $2, $3)",
+                        server,
+                        name,
+                        value,
+                    )
+                    known.add((server, name))
+                    active.add((server, name))
+
+            hydrated: dict[str, dict[str, str]] = {}
+            for server, name in sorted(active):
+                value = await conn.fetchval(
+                    "SELECT rvbbit.resolve_mcp_credential($1, $2)", server, name
+                )
+                if value:
+                    hydrated.setdefault(server, {})[name] = str(value)
+            secrets.replace(hydrated)
+            revoked_credentials = revoked
+            canonical_credentials = True
+            log.info(
+                "mcp-gateway: canonical credential store ready for %d server(s)",
+                len(hydrated),
+            )
+    except Exception:
+        canonical_credentials = False
+        revoked_credentials = set()
+        if REQUIRE_CANONICAL_CREDENTIALS:
+            raise
+        log.exception(
+            "mcp-gateway: canonical credential initialization failed; "
+            "using the legacy encrypted file"
+        )
+
+
 def _expand_refs(value: str, server_name: str | None) -> str:
     """Expand ${VAR} refs in a string. Resolution order, highest first: the per-server secret store
-    (UI-entered keys), then the gateway's own process env. Keys never round-trip through Postgres."""
+    (canonical credentials cached in memory), then the gateway's process env."""
     store = secrets.for_server(server_name) if server_name else {}
 
     def _sub(m):
         var = m.group(1)
+        if server_name and (server_name, var) in revoked_credentials:
+            return ""
         return store[var] if var in store else os.environ.get(var, "")
 
     return _ENV_REF.sub(_sub, value)
@@ -206,7 +319,10 @@ def resolve_auth_headers(config: "MCPServerConfig") -> dict[str, str]:
     if not config.auth_header_env:
         return {}
     store = secrets.for_server(config.name)
-    token = store.get(config.auth_header_env) or os.environ.get(config.auth_header_env)
+    if (config.name, config.auth_header_env) in revoked_credentials:
+        token = None
+    else:
+        token = store.get(config.auth_header_env) or os.environ.get(config.auth_header_env)
     if not token:
         log.warning(
             "mcp-gateway: HTTP MCP server %r configured auth_header_env=%r, "
@@ -673,7 +789,9 @@ async def probe(server: str, authorization: str | None = Header(default=None)):
 
 # ---- secrets API ----------------------------------------------------------
 #
-# The install UI pushes API keys here (not to Postgres). Guarded by a shared
+# The native install/admin UI pushes API keys here. In canonical mode this is
+# the sole write boundary into encrypted Postgres ciphertext; plaintext is
+# retained only in the gateway's in-memory runtime cache. Guarded by a shared
 # bearer token when RVBBIT_GATEWAY_TOKEN is set; open (with a log note) in dev.
 
 
@@ -687,18 +805,76 @@ def _check_token(authorization: str | None) -> None:
 class SecretRequest(BaseModel):
     server: str
     name: str
-    value: str
+    value: SecretStr
+    expected_version: int | None = Field(default=None, ge=1)
+    expected_status: Literal["active", "revoked"] | None = None
+    expect_absent: bool = False
 
 
 class SecretRef(BaseModel):
     server: str
     name: str
+    expected_version: int | None = Field(default=None, ge=1)
+    expected_status: Literal["active", "revoked"] | None = None
+
+
+async def _check_credential_revision(conn, req: SecretRequest | SecretRef) -> None:
+    current = await conn.fetchrow(
+        "SELECT version,status FROM rvbbit.credentials "
+        "WHERE credential_ref=rvbbit.credential_ref('mcp',$1,$2) FOR UPDATE",
+        req.server,
+        req.name,
+    )
+    if getattr(req, "expect_absent", False):
+        if current:
+            raise HTTPException(409, "credential changed since the approved plan")
+        return
+    if req.expected_version is None:
+        return
+    if (
+        not current
+        or int(current["version"]) != int(req.expected_version)
+        or (
+            req.expected_status is not None
+            and str(current["status"]) != str(req.expected_status)
+        )
+    ):
+        raise HTTPException(409, "credential changed since the approved plan")
 
 
 @app.post("/secrets")
 async def set_secret(req: SecretRequest, authorization: str | None = Header(default=None)):
     _check_token(authorization)
-    secrets.set(req.server, req.name, req.value)
+    secret_value = req.value.get_secret_value()
+    if canonical_credentials:
+        if db_pool is None:
+            raise HTTPException(503, "canonical credential database is unavailable")
+        try:
+            async with db_pool.acquire() as conn:
+                async with conn.transaction():
+                    await _check_credential_revision(conn, req)
+                    await conn.fetchval(
+                        "SELECT rvbbit.set_mcp_credential($1, $2, $3)",
+                        req.server,
+                        req.name,
+                        secret_value,
+                    )
+        except HTTPException:
+            raise
+        except Exception as exc:
+            log.warning(
+                "mcp-gateway: canonical credential write failed for %s/%s: %s",
+                req.server,
+                req.name,
+                type(exc).__name__,
+            )
+            raise HTTPException(503, "canonical credential write failed") from exc
+        secrets.set(req.server, req.name, secret_value, persist=False)
+        revoked_credentials.discard((req.server, req.name))
+    else:
+        if REQUIRE_CANONICAL_CREDENTIALS:
+            raise HTTPException(503, "canonical credential store is unavailable")
+        secrets.set(req.server, req.name, secret_value)
     # Respawn on next call so the new secret is picked up.
     await evict_server(req.server)
     return {"ok": True, "server": req.server, "name": req.name}
@@ -707,7 +883,34 @@ async def set_secret(req: SecretRequest, authorization: str | None = Header(defa
 @app.delete("/secrets")
 async def delete_secret(req: SecretRef, authorization: str | None = Header(default=None)):
     _check_token(authorization)
-    secrets.delete(req.server, req.name)
+    if canonical_credentials:
+        if db_pool is None:
+            raise HTTPException(503, "canonical credential database is unavailable")
+        try:
+            async with db_pool.acquire() as conn:
+                async with conn.transaction():
+                    await _check_credential_revision(conn, req)
+                    await conn.fetchval(
+                        "SELECT rvbbit.delete_mcp_credential($1, $2)",
+                        req.server,
+                        req.name,
+                    )
+        except HTTPException:
+            raise
+        except Exception as exc:
+            log.warning(
+                "mcp-gateway: canonical credential delete failed for %s/%s: %s",
+                req.server,
+                req.name,
+                type(exc).__name__,
+            )
+            raise HTTPException(503, "canonical credential delete failed") from exc
+        secrets.delete(req.server, req.name, persist=False)
+        revoked_credentials.add((req.server, req.name))
+    else:
+        if REQUIRE_CANONICAL_CREDENTIALS:
+            raise HTTPException(503, "canonical credential store is unavailable")
+        secrets.delete(req.server, req.name)
     await evict_server(req.server)
     return {"ok": True, "server": req.server, "name": req.name}
 
@@ -721,7 +924,11 @@ async def secret_status(server: str, authorization: str | None = Header(default=
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "servers_loaded": sorted(pool.keys())}
+    return {
+        "status": "ok",
+        "servers_loaded": sorted(pool.keys()),
+        "credential_store": "canonical" if canonical_credentials else "legacy",
+    }
 
 
 # ---- lifecycle ------------------------------------------------------------
@@ -766,6 +973,7 @@ async def startup():
             await asyncio.sleep(1)
     if db_pool is None:
         raise RuntimeError(f"could not connect to {DSN} after 60 attempts")
+    await _initialize_canonical_credentials()
     log.info("mcp-gateway ready on :9180")
 
 

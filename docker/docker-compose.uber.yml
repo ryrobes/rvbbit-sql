@@ -18,6 +18,18 @@ services:
       <<: *rvbbit-secret-env
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-rvbbit}
       POSTGRES_DB: ${POSTGRES_DB:-rvbbit}
+      # Managed semantic SQL is installed by initdb on a fresh volume and by
+      # the bootstrap service on upgrades. The hosted Calliope manifest makes
+      # this mandatory; the generic uber stack keeps it optional.
+      RVBBIT_CLOVER_KEY: ${RVBBIT_CLOVER_KEY:-}
+      RVBBIT_CLOVER_INSTALL_SOURCE: ${RVBBIT_CLOVER_INSTALL_SOURCE:-live}
+      # Root wrapping key for rvbbit.credentials. Hosted provisioning generates
+      # this once and keeps it outside Postgres; RVBBIT_CREDENTIAL_KEYS supports
+      # primary,old-key rotation. Never reuse an LLM, OAuth, or JWT secret.
+      RVBBIT_CREDENTIAL_KEY: ${RVBBIT_CREDENTIAL_KEY:-}
+      RVBBIT_CREDENTIAL_KEYS: ${RVBBIT_CREDENTIAL_KEYS:-}
+      RVBBIT_CREDENTIAL_KEY_FILE: ${RVBBIT_CREDENTIAL_KEY_FILE:-}
+      RVBBIT_CREDENTIAL_KEYS_FILE: ${RVBBIT_CREDENTIAL_KEYS_FILE:-}
       RVBBIT_DUCK_BACKEND: ${RVBBIT_DUCK_BACKEND:-true}
       RVBBIT_DUCK_BIN: ${RVBBIT_DUCK_BIN:-/usr/local/bin/rvbbit-duck}
       RVBBIT_DUCK_DSN: postgresql://postgres:${POSTGRES_PASSWORD:-rvbbit}@postgres:5432/${POSTGRES_DB:-rvbbit}
@@ -46,7 +58,11 @@ services:
       - -c
       - config_file=/etc/rvbbit/tuning.conf
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d ${POSTGRES_DB:-rvbbit}"]
+      # docker-entrypoint starts a temporary Postgres during first-time init.
+      # Do not release dependents until that server has stopped and PID 1 is
+      # the final postgres process, or one-shot Warehouse bootstrap work can
+      # race the handoff and remain uninitialized until a manual restart.
+      test: ["CMD-SHELL", "grep -qx postgres /proc/1/comm && pg_isready -U postgres -d ${POSTGRES_DB:-rvbbit}"]
       interval: 5s
       timeout: 3s
       retries: 30
@@ -140,8 +156,9 @@ services:
       RVBBIT_APP_BASE: ${WAREHOUSE_PUBLIC_URL:-}
       RVBBIT_APP_BASE_INTERNAL: http://warehouse-mcp:8765
       WAREHOUSE_MCP_KEY: ${WAREHOUSE_MCP_KEY:-}
-      # Burrow mode (docs/BURROW_PLAN.md): one database, one door — lens
-      # gates on the warehouse session and executes SQL as the viewer's role.
+      # Burrow mode (docs/BURROW_PLAN.md): one database, one door — Lens gates
+      # on the Warehouse session. pg auth executes as the mapped viewer role;
+      # shared hosted auth uses the pinned service connection after that gate.
       RVBBIT_MODE: ${RVBBIT_MODE:-}
       RVBBIT_AUTH_INTERNAL: http://warehouse-mcp:8765
     ports:
@@ -162,6 +179,8 @@ services:
       <<: *rvbbit-secret-env
       RVBBIT_DSN: postgresql://postgres:${POSTGRES_PASSWORD:-rvbbit}@postgres:5432/${POSTGRES_DB:-rvbbit}
       RVBBIT_GATEWAY_TOKEN: ${RVBBIT_GATEWAY_TOKEN:-}
+      RVBBIT_MIRROR_TOKEN: ${RVBBIT_MIRROR_TOKEN:-}
+      RVBBIT_REQUIRE_CANONICAL_CREDENTIALS: ${RVBBIT_REQUIRE_CANONICAL_CREDENTIALS:-false}
       WARREN_NODE: ${WARREN_NODE:-compose-warren}
       WARREN_WORK_DIR: /var/lib/rvbbit/warren
       RVBBIT_DOCKER_NETWORK: ${RVBBIT_DOCKER_NETWORK:-rvbbit_uber}
@@ -187,10 +206,18 @@ services:
       RVBBIT_DSN: postgresql://postgres:${POSTGRES_PASSWORD:-rvbbit}@postgres:5432/${POSTGRES_DB:-rvbbit}
       WARREN_NODE: ${WARREN_NODE:-compose-warren}
       RVBBIT_UBER_TARGET_SELECTOR: ${RVBBIT_UBER_TARGET_SELECTOR:-}
-      RVBBIT_UBER_BOOTSTRAP_CAPABILITIES: ${RVBBIT_UBER_BOOTSTRAP_CAPABILITIES:-smoke/warren-echo,runtimes/python-runtime,runtimes/mcp-gateway}
+      RVBBIT_UBER_BOOTSTRAP_CAPABILITIES: ${RVBBIT_UBER_BOOTSTRAP_CAPABILITIES:-smoke/warren-echo,runtimes/python-runtime,runtimes/mcp-gateway,data/dlt-mirror}
       RVBBIT_UBER_BOOTSTRAP_TIMEOUT_SECONDS: ${RVBBIT_UBER_BOOTSTRAP_TIMEOUT_SECONDS:-600}
       RVBBIT_UBER_BOOTSTRAP_POLL_SECONDS: ${RVBBIT_UBER_BOOTSTRAP_POLL_SECONDS:-2}
       RVBBIT_UBER_SKIP_BOOTSTRAP: ${RVBBIT_UBER_SKIP_BOOTSTRAP:-false}
+      RVBBIT_CLOVER_KEY: ${RVBBIT_CLOVER_KEY:-}
+      RVBBIT_CLOVER_REQUIRED: ${RVBBIT_CLOVER_REQUIRED:-false}
+      RVBBIT_CLOVER_VERIFY_REMOTE: ${RVBBIT_CLOVER_VERIFY_REMOTE:-false}
+      RVBBIT_CLOVER_INSTALL_SOURCE: ${RVBBIT_CLOVER_INSTALL_SOURCE:-live}
+      RVBBIT_CLOVER_OPENAI_BASE_URL: ${RVBBIT_CLOVER_OPENAI_BASE_URL:-https://clover.rvbb.it/v1}
+      RVBBIT_CLOVER_REQUIRED_MODEL: ${RVBBIT_CLOVER_REQUIRED_MODEL:-}
+      RVBBIT_HOSTED_SERVICES: ${RVBBIT_HOSTED_SERVICES:-false}
+      RVBBIT_HINDSIGHT_ENDPOINT: ${RVBBIT_HINDSIGHT_ENDPOINT:-http://hindsight:8888}
       RVBBIT_LENS_CONNECTIONS_PATH: /var/lib/rvbbit/lens/connections.json
       RVBBIT_LENS_BOOTSTRAP_CONNECTION: ${RVBBIT_LENS_BOOTSTRAP_CONNECTION:-true}
       RVBBIT_LENS_CONNECTION_ID: ${RVBBIT_LENS_CONNECTION_ID:-rvbbit-uber}
@@ -221,7 +248,8 @@ services:
     profiles: ["warehouse"]
     image: ${RVBBIT_WAREHOUSE_MCP_IMAGE:-ghcr.io/ryrobes/rvbbit-warehouse-mcp:${RVBBIT_VERSION:-latest}}
     build:
-      context: ../services/warehouse-mcp
+      context: ..
+      dockerfile: services/warehouse-mcp/Dockerfile
     container_name: rvbbit-warehouse-mcp
     depends_on:
       postgres:
@@ -285,6 +313,14 @@ services:
       # and serve at /thumbs (lens proxies them at /api/rvbbit/thumb).
       LENS_PUBLIC_URL: ${LENS_PUBLIC_URL:-}
       WAREHOUSE_LIVE_APP_CAPTURE_DIR: /app/data/captures
+      # Durable, SQL-leased Business Topology excavation. Intermediate private
+      # receipts live in the existing Warehouse volume; PostgreSQL owns run and
+      # progress state, so DataRabbit/browser lifecycle never owns execution.
+      WAREHOUSE_BUSINESS_TOPOLOGY_WORKER: ${WAREHOUSE_BUSINESS_TOPOLOGY_WORKER:-1}
+      WAREHOUSE_BUSINESS_TOPOLOGY_DSN: ${WAREHOUSE_BUSINESS_TOPOLOGY_DSN:-}
+      WAREHOUSE_BUSINESS_TOPOLOGY_DIR: /app/data/business-topology
+      WAREHOUSE_BUSINESS_TOPOLOGY_POLL_SECONDS: ${WAREHOUSE_BUSINESS_TOPOLOGY_POLL_SECONDS:-2}
+      WAREHOUSE_BUSINESS_TOPOLOGY_LEASE_SECONDS: ${WAREHOUSE_BUSINESS_TOPOLOGY_LEASE_SECONDS:-300}
       # Post-publication semantic compiler. Publication remains non-blocking;
       # the worker renders each immutable HTML version and the database-side
       # RVBBIT agent operator proposes replayable value definitions.
@@ -313,7 +349,7 @@ services:
       WAREHOUSE_CALLIOPE_MAX_AUDIO_BYTES: ${WAREHOUSE_CALLIOPE_MAX_AUDIO_BYTES:-12582912}
       WAREHOUSE_CALLIOPE_MAX_AUDIO_SECONDS: ${WAREHOUSE_CALLIOPE_MAX_AUDIO_SECONDS:-120}
       # Optional spoken-response projection. Credentials stay server-side;
-      # browsers receive a governed short script and streamed PCM audio only.
+      # browsers receive the complete spoken rendering and streamed PCM audio only.
       ELEVENLABS_API_KEY: ${ELEVENLABS_API_KEY:-}
       ELEVENLABS_VOICE_ID: ${ELEVENLABS_VOICE_ID:-}
       WAREHOUSE_CALLIOPE_TTS_FAST_MODEL: ${WAREHOUSE_CALLIOPE_TTS_FAST_MODEL:-eleven_flash_v2_5}
@@ -321,13 +357,27 @@ services:
       WAREHOUSE_CALLIOPE_TTS_EXPRESSIVE_STABILITY: ${WAREHOUSE_CALLIOPE_TTS_EXPRESSIVE_STABILITY:-0.3}
       WAREHOUSE_CALLIOPE_TTS_SAMPLE_RATE: ${WAREHOUSE_CALLIOPE_TTS_SAMPLE_RATE:-24000}
       WAREHOUSE_CALLIOPE_TTS_PREPARE_TIMEOUT_SECONDS: ${WAREHOUSE_CALLIOPE_TTS_PREPARE_TIMEOUT_SECONDS:-30}
+      # The spoken rewrite uses Clover's full Calliope chat model directly.
+      # No max_tokens value is sent; a provider length-stop fails closed to
+      # the complete canonical answer rather than accepting partial prose.
+      RVBBIT_CLOVER_KEY: ${RVBBIT_CLOVER_KEY:-}
+      RVBBIT_CLOVER_OPENAI_BASE_URL: ${RVBBIT_CLOVER_OPENAI_BASE_URL:-https://clover.rvbb.it/v1}
+      RVBBIT_CLOVER_REQUIRED_MODEL: ${RVBBIT_CLOVER_REQUIRED_MODEL:-calliope}
       RVBBIT_GATEWAY_TOKEN: ${RVBBIT_GATEWAY_TOKEN:-}
+      RVBBIT_MIRROR_TOKEN: ${RVBBIT_MIRROR_TOKEN:-}
+      # Normally resolved from the Warren runtime registry. Set only when the
+      # dlt mirror controller is managed outside this appliance network.
+      WAREHOUSE_DLT_MIRROR_URL: ${WAREHOUSE_DLT_MIRROR_URL:-}
       WAREHOUSE_CALLIOPE_DIR: /app/data/calliope
       # URL-backed Design Profile references reject private/local targets by
       # default. Enable only when Warehouse runs on a trusted client network.
       WAREHOUSE_CALLIOPE_STYLE_ALLOW_PRIVATE_URLS: ${WAREHOUSE_CALLIOPE_STYLE_ALLOW_PRIVATE_URLS:-false}
       WAREHOUSE_CALLIOPE_EXPORT_ROOTS: ${WAREHOUSE_CALLIOPE_EXPORT_DIR:-/tmp/rvbbit-hermes-exports}
       WAREHOUSE_CALLIOPE_MAX_EXPORT_BYTES: ${WAREHOUSE_CALLIOPE_MAX_EXPORT_BYTES:-134217728}
+      # Server-local Brain folder ingestion is deliberately confined to this
+      # path (or another explicit OS-path-separated allowlist). The durable
+      # /app/data volume already contains the default import directory.
+      WAREHOUSE_BRAIN_IMPORT_ROOTS: ${WAREHOUSE_BRAIN_IMPORT_ROOTS:-/app/data/brain-imports}
       # Burrow mode (docs/BURROW_PLAN.md): WAREHOUSE_AUTH=pg makes Postgres
       # the IdP — logins are PG accounts (members of WAREHOUSE_PG_LOGIN_ROLE),
       # sessions run SET ROLE. WAREHOUSE_LOGIN_UI=lens hands the login PAGE
@@ -345,7 +395,7 @@ services:
   # WAREHOUSE_PUBLIC_URL and LENS_PUBLIC_URL BOTH to the public origin URL.
   origin:
     profiles: ["origin"]
-    image: caddy:2-alpine
+    image: ${RVBBIT_ORIGIN_IMAGE:-caddy:2-alpine}
     container_name: rvbbit-origin
     depends_on:
       - lens

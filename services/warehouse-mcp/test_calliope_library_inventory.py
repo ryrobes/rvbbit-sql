@@ -351,6 +351,7 @@ def test_inventory_snapshot_isolates_collectors_and_filters_exact_refs(monkeypat
         ],
         "_library_cube_inventory": lambda _conn, _owner: (_ for _ in ()).throw(RuntimeError("old install")),
         "_library_metric_inventory": lambda _conn, _owner: [],
+        "_library_mirror_inventory": lambda _conn, _owner: [],
         "_library_routine_inventory": lambda _conn, _owner: [],
         "_library_team_inventory": lambda _conn, _owner: [],
         "_library_personal_inventory": lambda _conn, _owner: [],
@@ -399,3 +400,37 @@ def test_personal_collectors_are_scoped_to_the_signed_in_owner():
     assert "WHERE lower(owner_email)=lower(%s)" in source
     assert "WHERE lower(rm.principal)=lower(%s)" in source
     assert "FROM rvbbit.brain_role_members" in source
+
+
+def test_mirror_inventory_exposes_dlt_receipts_without_source_credentials():
+    class Connection:
+        def execute(self, query, _params=None):
+            if query.startswith("SELECT to_regclass"):
+                return _TeamResult(row={"jobs": True, "runs": True})
+            if "FROM rvbbit.mirror_jobs" in query:
+                return _TeamResult(rows=[{
+                    "job_name": "erp_sales", "connection_name": "erp",
+                    "source_schema": "sales", "destination_schema": "erp_sales",
+                    "enabled": True, "schedule_seconds": 3600,
+                    "next_run_at": "2026-08-11T16:00:00+00:00",
+                    "last_run_at": "2026-08-11T15:00:00+00:00",
+                    "updated_at": "2026-08-11T14:00:00+00:00", "table_count": 8,
+                    "run_id": uuid.uuid4(), "latest_run_trigger": "schedule",
+                    "latest_run_status": "failed",
+                    "latest_run_requested_at": "2026-08-11T15:00:00+00:00",
+                    "latest_run_started_at": "2026-08-11T15:00:01+00:00",
+                    "latest_run_finished_at": "2026-08-11T15:02:00+00:00",
+                    "tables_succeeded": 7, "tables_failed": 1, "rows_loaded": 900,
+                    "latest_run_error_code": "SOURCE_TIMEOUT",
+                    "latest_run_error_message": "source timed out",
+                }])
+            raise AssertionError(query)
+
+    item = calliope._library_mirror_inventory(Connection(), "admin@example.com")[0]
+
+    assert item["ref"] == "mirror:erp_sales"
+    assert item["section"] == "routines"
+    assert item["state"] == "attention"
+    assert item["detail"]["action_id"] == "mirror.manage:erp_sales"
+    assert "retry" in item["intents"]
+    assert "credential" not in json.dumps(item).lower()

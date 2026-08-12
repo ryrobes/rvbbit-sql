@@ -1,0 +1,237 @@
+name: rvbbit-calliope
+
+# Hosted Calliope appliance. This intentionally extends the generic uber
+# service definitions while making hosted-only dependencies and secret/image
+# contracts explicit. Run from the repository root with:
+#
+#   docker compose --env-file /opt/rvbbit/.env \
+#     -f docker/docker-compose.calliope.yml up -d
+
+services:
+  postgres:
+    extends:
+      file: docker-compose.uber.yml
+      service: postgres
+    image: ${RVBBIT_POSTGRES_IMAGE:?Provision RVBBIT_POSTGRES_IMAGE with a pinned image tag or digest}
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Provision POSTGRES_PASSWORD in /opt/rvbbit/.env}
+      RVBBIT_CLOVER_KEY: ${RVBBIT_CLOVER_KEY:?Provision RVBBIT_CLOVER_KEY in /opt/rvbbit/.env}
+      RVBBIT_CLOVER_INSTALL_SOURCE: shipped
+      RVBBIT_CREDENTIAL_KEY: ${RVBBIT_CREDENTIAL_KEY:?Provision RVBBIT_CREDENTIAL_KEY in /opt/rvbbit/.env}
+      RVBBIT_GATEWAY_TOKEN: ${RVBBIT_GATEWAY_TOKEN:?Provision RVBBIT_GATEWAY_TOKEN in /opt/rvbbit/.env}
+
+  duck:
+    extends:
+      file: docker-compose.uber.yml
+      service: duck
+    image: ${RVBBIT_POSTGRES_IMAGE:?Provision RVBBIT_POSTGRES_IMAGE with a pinned image tag or digest}
+    environment:
+      RVBBIT_DSN: postgresql://postgres:${POSTGRES_PASSWORD:?Provision POSTGRES_PASSWORD in /opt/rvbbit/.env}@postgres:5432/${POSTGRES_DB:-rvbbit}
+
+  lens:
+    extends:
+      file: docker-compose.uber.yml
+      service: lens
+    image: ${RVBBIT_LENS_IMAGE:?Provision RVBBIT_LENS_IMAGE with a pinned image tag or digest}
+    environment:
+      # Hosted DataRabbit is the appliance's authenticated diagnostic console.
+      # It introspects the Warehouse wh_session; it never owns an OAuth secret.
+      RVBBIT_MODE: burrow
+      RVBBIT_AUTH_INTERNAL: http://warehouse-mcp:8765
+      RVBBIT_DOCKER_NETWORK: ${RVBBIT_DOCKER_NETWORK:-rvbbit_calliope}
+      RVBBIT_LENS_SEED_DSN: postgresql://postgres:${POSTGRES_PASSWORD:?Provision POSTGRES_PASSWORD in /opt/rvbbit/.env}@postgres:5432/${POSTGRES_DB:-rvbbit}
+    # The direct Next listener cannot complete login/OAuth routing. Keep it as
+    # a loopback-only break-glass probe; use the Burrow origin port below.
+    ports: !override
+      - "${RVBBIT_LENS_PORT:-127.0.0.1:3000}:3000"
+
+  warren:
+    extends:
+      file: docker-compose.uber.yml
+      service: warren
+    image: ${RVBBIT_WARREN_AGENT_IMAGE:?Provision RVBBIT_WARREN_AGENT_IMAGE with a pinned image tag or digest}
+    environment:
+      RVBBIT_DSN: postgresql://postgres:${POSTGRES_PASSWORD:?Provision POSTGRES_PASSWORD in /opt/rvbbit/.env}@postgres:5432/${POSTGRES_DB:-rvbbit}
+      RVBBIT_DOCKER_NETWORK: ${RVBBIT_DOCKER_NETWORK:-rvbbit_calliope}
+      RVBBIT_GATEWAY_TOKEN: ${RVBBIT_GATEWAY_TOKEN:?Provision RVBBIT_GATEWAY_TOKEN in /opt/rvbbit/.env}
+      RVBBIT_MIRROR_TOKEN: ${RVBBIT_MIRROR_TOKEN:?Provision RVBBIT_MIRROR_TOKEN in /opt/rvbbit/.env}
+      RVBBIT_REQUIRE_CANONICAL_CREDENTIALS: "true"
+
+  bootstrap:
+    extends:
+      file: docker-compose.uber.yml
+      service: bootstrap
+    image: ${RVBBIT_POSTGRES_IMAGE:?Provision RVBBIT_POSTGRES_IMAGE with a pinned image tag or digest}
+    environment:
+      RVBBIT_DSN: postgresql://postgres:${POSTGRES_PASSWORD:?Provision POSTGRES_PASSWORD in /opt/rvbbit/.env}@postgres:5432/${POSTGRES_DB:-rvbbit}
+      RVBBIT_LENS_CONNECTION_LABEL: ${RVBBIT_LENS_CONNECTION_LABEL:-RVBBIT Calliope}
+      RVBBIT_LENS_CONNECTION_PASSWORD: ${POSTGRES_PASSWORD:?Provision POSTGRES_PASSWORD in /opt/rvbbit/.env}
+      RVBBIT_UBER_BOOTSTRAP_CAPABILITIES: ${RVBBIT_UBER_BOOTSTRAP_CAPABILITIES:-runtimes/python-runtime,runtimes/mcp-gateway,data/dlt-mirror}
+      RVBBIT_CLOVER_KEY: ${RVBBIT_CLOVER_KEY:?Provision RVBBIT_CLOVER_KEY in /opt/rvbbit/.env}
+      RVBBIT_CLOVER_REQUIRED: "true"
+      RVBBIT_CLOVER_VERIFY_REMOTE: "true"
+      RVBBIT_CLOVER_INSTALL_SOURCE: shipped
+      RVBBIT_CLOVER_OPENAI_BASE_URL: ${RVBBIT_CLOVER_OPENAI_BASE_URL:-https://clover.rvbb.it/v1}
+      RVBBIT_CLOVER_REQUIRED_MODEL: ${RVBBIT_CLOVER_REQUIRED_MODEL:-calliope}
+      RVBBIT_HOSTED_SERVICES: "true"
+      RVBBIT_HINDSIGHT_ENDPOINT: http://hindsight:8888
+
+  doc-extract:
+    extends:
+      file: docker-compose.uber.yml
+      service: doc-extract
+    image: ${RVBBIT_DOC_EXTRACT_IMAGE:?Provision RVBBIT_DOC_EXTRACT_IMAGE with a pinned image tag or digest}
+
+  hindsight:
+    image: ${RVBBIT_HINDSIGHT_IMAGE:-ghcr.io/vectorize-io/hindsight-api:0.9.0-slim@sha256:18f40fbdf34ebb6caadbe97e05e61959d82114c857b35b05aa86e09e99c92dd9}
+    container_name: rvbbit-hindsight
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+    environment:
+      HINDSIGHT_API_HOST: 0.0.0.0
+      HINDSIGHT_API_PORT: "8888"
+      HINDSIGHT_API_DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:?Provision POSTGRES_PASSWORD in /opt/rvbbit/.env}@postgres:5432/${POSTGRES_DB:-rvbbit}
+      HINDSIGHT_API_DATABASE_SCHEMA: hindsight
+      HINDSIGHT_API_LLM_PROVIDER: openai
+      HINDSIGHT_API_LLM_API_KEY: ${RVBBIT_CLOVER_KEY:?Provision RVBBIT_CLOVER_KEY in /opt/rvbbit/.env}
+      HINDSIGHT_API_LLM_MODEL: ${RVBBIT_CLOVER_REQUIRED_MODEL:-calliope}
+      HINDSIGHT_API_LLM_BASE_URL: ${RVBBIT_CLOVER_OPENAI_BASE_URL:-https://clover.rvbb.it/v1}
+      HINDSIGHT_API_LLM_TRACE_ENABLED: "false"
+      HINDSIGHT_API_EMBEDDINGS_PROVIDER: openai
+      HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY: ${RVBBIT_CLOVER_KEY:?Provision RVBBIT_CLOVER_KEY in /opt/rvbbit/.env}
+      HINDSIGHT_API_EMBEDDINGS_OPENAI_MODEL: embed
+      HINDSIGHT_API_EMBEDDINGS_OPENAI_BASE_URL: ${RVBBIT_CLOVER_OPENAI_BASE_URL:-https://clover.rvbb.it/v1}
+      HINDSIGHT_API_RERANKER_PROVIDER: rrf
+      HINDSIGHT_API_AUDIT_LOG_ENABLED: "true"
+      HINDSIGHT_API_WORKER_ID: rvbbit-calliope-hindsight
+    expose:
+      - "8888"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8888/health', timeout=3).read()"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 20s
+    restart: unless-stopped
+
+  hermes:
+    image: ${RVBBIT_HERMES_IMAGE:-rvbbit-calliope-hermes:69ae247c}
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.calliope-hermes
+      args:
+        HERMES_BASE_IMAGE: ${RVBBIT_HERMES_BASE_IMAGE:-nousresearch/hermes-agent@sha256:e3a16e60340da20b40578a417be1eb08f9fe46fef961cce16498711606adc10f}
+    container_name: rvbbit-hermes
+    depends_on:
+      hindsight:
+        # Memory is valuable but must not make the setup/admin surface
+        # unavailable during a provider outage. Hindsight keeps its own
+        # healthcheck and restart policy so the degraded state stays visible.
+        condition: service_started
+      warehouse-mcp:
+        # Warehouse must accept the first internal MCP handshake before
+        # Hermes performs its bounded initial discovery. Otherwise upstream
+        # parks the server after its startup retries and the first chat turn
+        # has no governed query tools.
+        condition: service_healthy
+    environment:
+      HERMES_UID: ${HERMES_UID:-10000}
+      HERMES_GID: ${HERMES_GID:-10000}
+      RVBBIT_CLOVER_KEY: ${RVBBIT_CLOVER_KEY:?Provision RVBBIT_CLOVER_KEY in /opt/rvbbit/.env}
+      RVBBIT_CLOVER_OPENAI_BASE_URL: ${RVBBIT_CLOVER_OPENAI_BASE_URL:-https://clover.rvbb.it/v1}
+      API_SERVER_ENABLED: "true"
+      API_SERVER_KEY: ${WAREHOUSE_HERMES_API_KEY:?Provision WAREHOUSE_HERMES_API_KEY in /opt/rvbbit/.env}
+      API_SERVER_HOST: 0.0.0.0
+      API_SERVER_PORT: "8642"
+      API_SERVER_MODEL_NAME: ${RVBBIT_CLOVER_REQUIRED_MODEL:-calliope}
+      HINDSIGHT_MODE: local_external
+      HINDSIGHT_API_URL: http://hindsight:8888
+      HINDSIGHT_TIMEOUT: ${HINDSIGHT_TIMEOUT:-120}
+      WAREHOUSE_HERMES_MCP_KEY: ${WAREHOUSE_HERMES_MCP_KEY:?Provision WAREHOUSE_HERMES_MCP_KEY in /opt/rvbbit/.env}
+      HERMES_ENVIRONMENT_HINT: "Calliope is the appliance UI. Company data is local in RVBBIT Postgres; remote source credentials are used only by the dlt mirror controller."
+    command: ["gateway", "run"]
+    expose:
+      - "8642"
+    volumes:
+      - rvbbit_hermes:/opt/data
+      - ${WAREHOUSE_CALLIOPE_EXPORT_DIR:-/opt/rvbbit/calliope-exports}:${WAREHOUSE_CALLIOPE_EXPORT_DIR:-/opt/rvbbit/calliope-exports}
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS -H \"Authorization: Bearer $${API_SERVER_KEY}\" http://127.0.0.1:8642/health >/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 20s
+    restart: unless-stopped
+
+  warehouse-mcp:
+    extends:
+      file: docker-compose.uber.yml
+      service: warehouse-mcp
+    profiles: !reset []
+    image: ${RVBBIT_WAREHOUSE_MCP_IMAGE:?Provision RVBBIT_WAREHOUSE_MCP_IMAGE with a pinned image tag or digest}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      bootstrap:
+        condition: service_completed_successfully
+    environment:
+      WAREHOUSE_DSN: postgresql://postgres:${POSTGRES_PASSWORD:?Provision POSTGRES_PASSWORD in /opt/rvbbit/.env}@postgres:5432/${POSTGRES_DB:-rvbbit}
+      WAREHOUSE_LOGIN_PASSWORD: ${WAREHOUSE_LOGIN_PASSWORD:?Provision WAREHOUSE_LOGIN_PASSWORD in /opt/rvbbit/.env}
+      WAREHOUSE_ALLOWED_EMAILS: ${WAREHOUSE_ALLOWED_EMAILS:?Provision one bootstrap administrator email in /opt/rvbbit/.env}
+      WAREHOUSE_TEAM_BOOTSTRAP_ADMINS: ${WAREHOUSE_TEAM_BOOTSTRAP_ADMINS:?Provision the bootstrap Admins Team email in /opt/rvbbit/.env}
+      WAREHOUSE_JWT_SECRET: ${WAREHOUSE_JWT_SECRET:?Provision WAREHOUSE_JWT_SECRET in /opt/rvbbit/.env}
+      WAREHOUSE_MCP_KEY: ${WAREHOUSE_MCP_KEY:?Provision WAREHOUSE_MCP_KEY in /opt/rvbbit/.env}
+      WAREHOUSE_HERMES_MCP_KEY: ${WAREHOUSE_HERMES_MCP_KEY:?Provision WAREHOUSE_HERMES_MCP_KEY in /opt/rvbbit/.env}
+      WAREHOUSE_HERMES_URL: http://hermes:8642
+      WAREHOUSE_HERMES_API_KEY: ${WAREHOUSE_HERMES_API_KEY:?Provision WAREHOUSE_HERMES_API_KEY in /opt/rvbbit/.env}
+      WAREHOUSE_HERMES_MEMORY_KEY: ${WAREHOUSE_HERMES_MEMORY_KEY:-company}
+      RVBBIT_CLOVER_KEY: ${RVBBIT_CLOVER_KEY:?Provision RVBBIT_CLOVER_KEY in /opt/rvbbit/.env}
+      RVBBIT_CLOVER_OPENAI_BASE_URL: ${RVBBIT_CLOVER_OPENAI_BASE_URL:-https://clover.rvbb.it/v1}
+      RVBBIT_CLOVER_REQUIRED_MODEL: ${RVBBIT_CLOVER_REQUIRED_MODEL:-calliope}
+      WAREHOUSE_SEMANTIC_ENRICH_MODEL: ${RVBBIT_CLOVER_REQUIRED_MODEL:-calliope}
+      # Warehouse owns both Calliope and Burrow browser sessions. Caddy sends
+      # GET /login to Lens for presentation and every auth action back here.
+      WAREHOUSE_LOGIN_UI: lens
+      WAREHOUSE_CALLIOPE_STT_PROVIDER: ${WAREHOUSE_CALLIOPE_STT_PROVIDER:-off}
+      RVBBIT_GATEWAY_TOKEN: ${RVBBIT_GATEWAY_TOKEN:?Provision RVBBIT_GATEWAY_TOKEN in /opt/rvbbit/.env}
+      RVBBIT_MIRROR_TOKEN: ${RVBBIT_MIRROR_TOKEN:?Provision RVBBIT_MIRROR_TOKEN in /opt/rvbbit/.env}
+
+  origin:
+    extends:
+      file: docker-compose.uber.yml
+      service: origin
+    profiles: !reset []
+    image: ${RVBBIT_ORIGIN_IMAGE:?Provision RVBBIT_ORIGIN_IMAGE with a pinned image tag or digest}
+    depends_on:
+      lens:
+        condition: service_started
+      warehouse-mcp:
+        condition: service_healthy
+    # A second, loopback-only publication of the SAME unified origin is the
+    # advanced Burrow entrypoint. Publishing target :80 twice is deliberate:
+    # both ports share Warehouse OAuth routes, state, and wh_session cookies.
+    ports:
+      - "${RVBBIT_BURROW_PORT:-127.0.0.1:3001}:80"
+
+networks:
+  default:
+    name: ${RVBBIT_DOCKER_NETWORK:-rvbbit_calliope}
+
+volumes:
+  rvbbit_staging:
+    name: ${RVBBIT_STAGING_VOLUME:-rvbbit_calliope_staging}
+  rvbbit_pgdata:
+    name: ${RVBBIT_PGDATA_VOLUME:-rvbbit_calliope_pgdata}
+  rvbbit_duck_run:
+    name: ${RVBBIT_DUCK_RUN_VOLUME:-rvbbit_calliope_duck_run}
+  rvbbit_duck_arrow_ipc:
+    name: ${RVBBIT_DUCK_ARROW_IPC_VOLUME:-rvbbit_calliope_duck_arrow_ipc}
+  rvbbit_lens:
+    name: ${RVBBIT_LENS_VOLUME:-rvbbit_calliope_lens}
+  rvbbit_warren:
+    name: ${RVBBIT_WARREN_VOLUME:-rvbbit_calliope_warren}
+  rvbbit_warehouse_mcp:
+    name: ${RVBBIT_WAREHOUSE_MCP_VOLUME:-rvbbit_calliope_warehouse_mcp}
+  rvbbit_hermes:
+    name: ${RVBBIT_HERMES_VOLUME:-rvbbit_calliope_hermes}

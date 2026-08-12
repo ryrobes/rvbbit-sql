@@ -5606,6 +5606,7 @@ dependencies = [
  "pgrx-tests",
  "postgres",
  "reqwest",
+ "ring",
  "roaring 0.10.12",
  "rvbbit_storage",
  "serde",

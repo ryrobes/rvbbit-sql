@@ -23,11 +23,7 @@ use serde_json::json;
 /// IS temporary data access, so minting one is a privilege until role-scoped
 /// policies exist.
 #[pg_extern]
-fn capsule(
-    sql: &str,
-    ttl_secs: default!(i32, 900),
-    presign: default!(bool, true),
-) -> JsonB {
+fn capsule(sql: &str, ttl_secs: default!(i32, 900), presign: default!(bool, true)) -> JsonB {
     if !unsafe { pgrx::pg_sys::superuser() } {
         pgrx::error!("rvbbit.capsule: permission denied — requires superuser (v1)");
     }
@@ -110,7 +106,11 @@ fn capsule(
         let mut generation: i64 = 0;
         Spi::connect(|client| {
             let tup = client.select(&rg_sql, None, &[]).unwrap_or_else(|e| {
-                pgrx::error!("rvbbit.capsule: row_groups for {}.{}: {e}", t.schema, t.relname)
+                pgrx::error!(
+                    "rvbbit.capsule: row_groups for {}.{}: {e}",
+                    t.schema,
+                    t.relname
+                )
             });
             for row in tup {
                 let url: String = row.get(1).ok().flatten().unwrap_or_default();
@@ -125,9 +125,8 @@ fn capsule(
                     published_only = false;
                 }
                 let final_url = if presign {
-                    crate::storage::presign_get(&url, ttl).unwrap_or_else(|e| {
-                        pgrx::error!("rvbbit.capsule: {e}")
-                    })
+                    crate::storage::presign_get(&url, ttl)
+                        .unwrap_or_else(|e| pgrx::error!("rvbbit.capsule: {e}"))
                 } else {
                     url
                 };
@@ -160,7 +159,11 @@ fn capsule(
         let mut columns: Vec<serde_json::Value> = Vec::new();
         Spi::connect(|client| {
             let tup = client.select(&col_sql, None, &[]).unwrap_or_else(|e| {
-                pgrx::error!("rvbbit.capsule: columns for {}.{}: {e}", t.schema, t.relname)
+                pgrx::error!(
+                    "rvbbit.capsule: columns for {}.{}: {e}",
+                    t.schema,
+                    t.relname
+                )
             });
             for row in tup {
                 let name: String = row.get(1).ok().flatten().unwrap_or_default();
@@ -237,7 +240,10 @@ fn hare_run(
     }
 
     let capsule_doc = capsule(sql, ttl_secs, true).0;
-    let n_tables = capsule_doc["tables"].as_array().map(|a| a.len()).unwrap_or(0) as i32;
+    let n_tables = capsule_doc["tables"]
+        .as_array()
+        .map(|a| a.len())
+        .unwrap_or(0) as i32;
     let capsule_body = capsule_doc.to_string();
     let capsule_bytes = capsule_body.len() as i64;
     let url = format!("{}/capsule", endpoint.trim_end_matches('/'));
@@ -255,8 +261,7 @@ fn hare_run(
         });
     let total_ms = started.elapsed().as_secs_f64() * 1000.0;
 
-    let (http_status, body_json, error): (i32, serde_json::Value, Option<String>) = match response
-    {
+    let (http_status, body_json, error): (i32, serde_json::Value, Option<String>) = match response {
         Ok(resp) => {
             let status = resp.status().as_u16() as i32;
             match resp.text() {
@@ -277,8 +282,14 @@ fn hare_run(
         .get("server_elapsed_ms")
         .and_then(|v| v.as_f64())
         .unwrap_or(0.0);
-    let engine_ms = body_json.get("elapsed_ms").and_then(|v| v.as_f64()).unwrap_or(0.0);
-    let row_count = body_json.get("row_count").and_then(|v| v.as_i64()).unwrap_or(0);
+    let engine_ms = body_json
+        .get("elapsed_ms")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let row_count = body_json
+        .get("row_count")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
     // wire_ms = everything that ISN'T the hare's own handling: network both
     // ways + TLS + platform routing (+ cold start, when there is one).
     let wire_ms = (total_ms - server_ms).max(0.0);
@@ -300,7 +311,10 @@ fn hare_run(
         server_ms,
         wire_ms,
         total_ms,
-        error.as_deref().map(lit).unwrap_or_else(|| "NULL".to_string()),
+        error
+            .as_deref()
+            .map(lit)
+            .unwrap_or_else(|| "NULL".to_string()),
     );
     if let Err(e) = Spi::run(&insert) {
         pgrx::warning!("rvbbit.hare_run: telemetry insert failed (result still returned): {e}");

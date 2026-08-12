@@ -27,7 +27,9 @@ services:
       - -c
       - config_file=/etc/rvbbit/tuning.conf
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d ${POSTGRES_DB:-rvbbit}"]
+      # Reject the temporary server used by docker-entrypoint during init;
+      # dependents must wait for the final PID 1 postgres process.
+      test: ["CMD-SHELL", "grep -qx postgres /proc/1/comm && pg_isready -U postgres -d ${POSTGRES_DB:-rvbbit}"]
       interval: 5s
       timeout: 3s
       retries: 30

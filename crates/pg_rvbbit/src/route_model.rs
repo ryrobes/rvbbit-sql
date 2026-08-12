@@ -240,7 +240,15 @@ fn build_node(
             let my = nodes.len();
             nodes.push(TreeNode::Leaf { leaf: 0.0 }); // placeholder, overwritten below
             let left = build_node(nodes, samples, resid, &left_idx, depth + 1, n_features, cfg);
-            let right = build_node(nodes, samples, resid, &right_idx, depth + 1, n_features, cfg);
+            let right = build_node(
+                nodes,
+                samples,
+                resid,
+                &right_idx,
+                depth + 1,
+                n_features,
+                cfg,
+            );
             nodes[my] = TreeNode::Internal {
                 feature,
                 threshold,
@@ -375,7 +383,10 @@ mod tests {
             let b = (((k / 20) % 20) as f64) / 20.0;
             let noise = ((k * 7) % 5) as f64;
             let y = (if a < 0.5 { 1.0 } else { 3.0 }) + (if b < 0.5 { 0.0 } else { 2.0 });
-            samples.push(Sample { x: vec![a, b, noise], y });
+            samples.push(Sample {
+                x: vec![a, b, noise],
+                y,
+            });
         }
         let cfg = GbmConfig::default();
         let model = train_gbm(&samples, vec!["a".into(), "b".into(), "noise".into()], &cfg);

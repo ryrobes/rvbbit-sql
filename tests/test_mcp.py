@@ -518,6 +518,45 @@ def test_generate_wrappers(rvbbit, test_server):
     )
 
 
+def test_generate_wrappers_orders_required_args_before_optional_defaults(
+    rvbbit, test_server
+):
+    """JSON Schema property order must not produce invalid PostgreSQL DDL."""
+    rvbbit.execute(
+        "UPDATE rvbbit.mcp_tools SET input_schema=%s::jsonb "
+        "WHERE server=%s AND name='echo'",
+        (
+            json.dumps(
+                {
+                    "type": "object",
+                    "properties": {
+                        "optional_first": {"type": "string"},
+                        "required_later": {"type": "string"},
+                    },
+                    "required": ["required_later"],
+                }
+            ),
+            test_server,
+        ),
+    )
+
+    tool_count = rvbbit.execute(
+        "SELECT count(*) FROM rvbbit.mcp_tools WHERE server=%s", (test_server,)
+    ).fetchone()[0]
+    generated = rvbbit.execute(
+        "SELECT rvbbit.generate_mcp_wrappers(%s)", (test_server,)
+    ).fetchone()[0]
+    assert generated == tool_count
+
+    arguments = rvbbit.execute(
+        "SELECT pg_get_function_arguments(p.oid) "
+        "FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace "
+        "WHERE n.nspname=%s AND p.proname='echo'",
+        (test_server,),
+    ).fetchone()[0]
+    assert arguments.startswith("required_later text, optional_first text DEFAULT NULL")
+
+
 def test_wrapper_call_string_arg(rvbbit, test_server):
     rvbbit.execute("SELECT rvbbit.generate_mcp_wrappers(%s)", (test_server,))
     row = rvbbit.execute(

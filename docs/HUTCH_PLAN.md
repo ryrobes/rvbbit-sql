@@ -77,9 +77,34 @@ on EVERY boot (minutes of cold start).
 served name → vllm) + `GET /v1/models` (per-key entitled list). One surface
 serves pg_rvbbit's openai_chat transport, agent()/flow llm steps, AND raw
 OpenAI SDKs (direct sub-key use is fine — we host open-weights, not
-frontier). Token metering from usage block (prompt/completion columns added
-to ledger, idempotent ALTER); stream passthrough works, tokens unmetered on
-streams (v2: inject stream_options.include_usage, parse tail frame).
+frontier). Token metering comes from the upstream usage block; stream
+passthrough observes the final SSE usage event without changing the bytes sent
+to the client.
+Prometheus exposes dedicated `hutch_llm_*` request, latency, upstream-time,
+token, and reference-cost series labeled by authenticated `client_id`,
+canonical model, result code, and stream/response mode. The client label is
+the stable Hutch tenant id and never contains the bearer key or its hash.
+
+**DUAL COST ACCOUNTING LIVE (2026-08-11):** every paid upstream attempt gets a
+payload-free SQLite ledger row joined to its client invocation by a private
+correlation id. Hutch records two deliberately separate values: the stable,
+provider-neutral reference tariff from Hutch config and the actual provider
+charge reported by the response. OpenRouter costs are captured inline from
+ordinary JSON responses and final SSE events. If the client disconnects before
+the stream tail, a bounded background reconciler resolves the provider request
+id later; retries remain separate attempts so a first charged response cannot
+disappear behind a successful retry. Prometheus exports actual cost, reference
+cost, durable reconciliation coverage, pending work, and advisory catalog
+prices. The catalog refresh is asynchronous and never changes the configured
+reference tariff or blocks startup.
+
+**EMBEDDING SURFACE LIVE (2026-08-11):** OpenAI-compatible
+`POST /v1/embeddings` routes the stable public `embed` model alias through the
+same Clover bearer-key authentication, `clover` entitlement, tenant metering,
+and model-version receipts as `/b/embed/predict`. It accepts one string or a
+batch of strings and supports both OpenAI `float` and SDK-friendly `base64`
+encoding. Entitled clients also discover `embed` through `GET /v1/models`, so
+Hindsight and ordinary OpenAI SDKs need no bespoke embedding transport.
 
 E2E proven: `rvbbit.register_backend('hutch_llm',
 'http://<hutch>/v1/chat/completions', 'openai_chat', ...)` +
@@ -123,10 +148,12 @@ polar.env (env_file) for POLAR_SANDBOX_TOKEN.
 **CLOVER v1 CONTENTS PROVEN (2026-07-12):** the install script IS the
 package payload (scratchpad `clover_v1_install.sql`, becomes the catalog
 entry verbatim). Core move: **canonical-name rebinds** —
-`register_backend('embed', <hutch>/b/embed/predict, ...)` makes every
-built-in composite (outliers/dedupe_groups/knn_text/cluster) hutch-backed
-with ZERO operator changes, because `resolve_specialist("")` defaults to
-the name 'embed'. RULE: rebinding a canonical specialist name is a CACHE
+`register_backend('embed', 'https://clover.rvbb.it/v1/embeddings',
+'openai', ...)` makes every built-in text composite
+(outliers/dedupe_groups/knn_text/cluster) Clover-backed with ZERO operator
+changes, because `resolve_specialist("")` defaults to the name `embed`. RVBBIT
+omits the request model so the endpoint owns the stable alias; SDKs that require
+one send `embed`. RULE: rebinding a canonical specialist name is a CACHE
 INVALIDATION EVENT (`DELETE FROM rvbbit.embedding_cache WHERE
 specialist='embed'` — old local-model vectors share the key, not the
 vector space). Wrapper ops: clover_sentiment (specialist step, inputs

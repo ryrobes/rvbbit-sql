@@ -12,14 +12,10 @@ if [ -z "${RVBBIT_CLOVER_KEY:-}" ]; then
 fi
 
 CLOVER_INSTALL_URL="${RVBBIT_CLOVER_INSTALL_URL:-https://rvbbit.ai/clover-install.sql}"
-echo "rvbbit: RVBBIT_CLOVER_KEY present — installing Clover operators from ${CLOVER_INSTALL_URL}"
+CLOVER_INSTALL_SOURCE="${RVBBIT_CLOVER_INSTALL_SOURCE:-live}"
 
-if curl -fsSL --max-time 30 "$CLOVER_INSTALL_URL" \
-  | psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"; then
-  echo "rvbbit: Clover operators installed from live catalog"
-else
-  echo "rvbbit: live Clover install unavailable — applying shipped catalog snapshot"
-  if psql -X -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'SQL'
+install_shipped_clover() {
+  psql -X -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'SQL'
 DO $cached_clover$
 BEGIN
   IF NOT EXISTS (
@@ -44,10 +40,32 @@ WHERE c.id = 'managed/clover'
 ORDER BY ordinal
 \gexec
 SQL
-  then
+}
+
+if [ "$CLOVER_INSTALL_SOURCE" = "shipped" ]; then
+  echo "rvbbit: RVBBIT_CLOVER_KEY present — installing pinned shipped Clover snapshot"
+  if install_shipped_clover; then
     echo "rvbbit: Clover operators installed from shipped snapshot"
   else
-    echo "rvbbit: Clover install failed from both live and shipped catalogs — run manually:"
-    echo "  curl -fsSL ${CLOVER_INSTALL_URL} | psql \$DSN"
+    echo "rvbbit: shipped Clover install failed"
+    exit 1
   fi
+elif [ "$CLOVER_INSTALL_SOURCE" = "live" ]; then
+  echo "rvbbit: RVBBIT_CLOVER_KEY present — installing Clover operators from ${CLOVER_INSTALL_URL}"
+  if curl -fsSL --max-time 30 "$CLOVER_INSTALL_URL" \
+    | psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"; then
+    echo "rvbbit: Clover operators installed from live catalog"
+  else
+    echo "rvbbit: live Clover install unavailable — applying shipped catalog snapshot"
+    if install_shipped_clover; then
+      echo "rvbbit: Clover operators installed from shipped snapshot"
+    else
+      echo "rvbbit: Clover install failed from both live and shipped catalogs — run manually:"
+      echo "  curl -fsSL ${CLOVER_INSTALL_URL} | psql \$DSN"
+      exit 1
+    fi
+  fi
+else
+  echo "rvbbit: unsupported RVBBIT_CLOVER_INSTALL_SOURCE=${CLOVER_INSTALL_SOURCE} (expected live or shipped)"
+  exit 1
 fi

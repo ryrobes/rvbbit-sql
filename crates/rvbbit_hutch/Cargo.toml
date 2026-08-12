@@ -15,6 +15,9 @@ path = "src/main.rs"
 
 [dependencies]
 axum = { version = "0.8", features = ["http1", "json", "tokio"] }
+async-stream = "0.3"
+base64 = "0.22"
+futures-util = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "sync"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 serde = { version = "1", features = ["derive"] }

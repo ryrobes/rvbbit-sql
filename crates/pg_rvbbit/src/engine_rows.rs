@@ -75,7 +75,12 @@ unsafe fn datum_via_input(spec: &ColSpec, s: &str) -> pg_sys::Datum {
         s
     };
     let c = CString::new(src).unwrap_or_default();
-    pg_sys::OidInputFunctionCall(spec.infunc, c.as_ptr() as *mut _, spec.ioparam, spec.atttypmod)
+    pg_sys::OidInputFunctionCall(
+        spec.infunc,
+        c.as_ptr() as *mut _,
+        spec.ioparam,
+        spec.atttypmod,
+    )
 }
 
 /// Arrow cell → Datum for one output column. Returns (datum, isnull).
@@ -206,7 +211,8 @@ struct Sink {
 
 impl Sink {
     unsafe fn push(&mut self) {
-        let tuple = pg_sys::heap_form_tuple(self.desc, self.values.as_mut_ptr(), self.nulls.as_mut_ptr());
+        let tuple =
+            pg_sys::heap_form_tuple(self.desc, self.values.as_mut_ptr(), self.nulls.as_mut_ptr());
         pg_sys::tuplestore_puttuple(self.store, tuple);
         pg_sys::heap_freetuple(tuple);
         self.rows += 1;
@@ -288,10 +294,14 @@ pub unsafe extern "C-unwind" fn rvbbit_engine_rows_c(
 
     let rsi = (*fcinfo).resultinfo as *mut pg_sys::ReturnSetInfo;
     if rsi.is_null() || !pgrx::is_a((*fcinfo).resultinfo, pg_sys::NodeTag::T_ReturnSetInfo) {
-        pgrx::error!("rvbbit._engine_rows: set-valued function called in context that cannot accept a set");
+        pgrx::error!(
+            "rvbbit._engine_rows: set-valued function called in context that cannot accept a set"
+        );
     }
     if ((*rsi).allowedModes & pg_sys::SetFunctionReturnMode::SFRM_Materialize as i32) == 0 {
-        pgrx::error!("rvbbit._engine_rows: materialize mode required, but it is not allowed in this context");
+        pgrx::error!(
+            "rvbbit._engine_rows: materialize mode required, but it is not allowed in this context"
+        );
     }
     if (*rsi).expectedDesc.is_null() {
         pgrx::error!("rvbbit._engine_rows: a column definition list is required (call as ... AS t(col type, ...))");
@@ -348,7 +358,9 @@ pub unsafe extern "C-unwind" fn rvbbit_engine_rows_c(
     if let Some(reason) = direct_err {
         // Fallback: the existing engine_query_json owns retries + heap
         // fail-open; convert its objects through the same typinput path.
-        pgrx::debug1!("rvbbit._engine_rows: direct path unavailable ({reason}); using json pipeline");
+        pgrx::debug1!(
+            "rvbbit._engine_rows: direct path unavailable ({reason}); using json pipeline"
+        );
         let names: Vec<String> = (0..natts)
             .map(|i| {
                 let attr = pgrx::pg_sys::TupleDescAttr(desc, i as i32);

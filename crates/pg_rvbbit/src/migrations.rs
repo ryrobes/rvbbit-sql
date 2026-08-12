@@ -1133,6 +1133,66 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0278_calliope_living_pages",
         include_str!("../sql/migrations/0278_calliope_living_pages.sql"),
     ),
+    (
+        "0279_business_topology_foundation",
+        include_str!("../sql/migrations/0279_business_topology_foundation.sql"),
+    ),
+    (
+        "0280_calliope_delegated_work",
+        include_str!("../sql/migrations/0280_calliope_delegated_work.sql"),
+    ),
+    (
+        "0281_identity_scoped_capabilities",
+        include_str!("../sql/migrations/0281_identity_scoped_capabilities.sql"),
+    ),
+    (
+        "0282_business_topology_proposal_bundles",
+        include_str!("../sql/migrations/0282_business_topology_proposal_bundles.sql"),
+    ),
+    (
+        "0283_calliope_playbooks",
+        include_str!("../sql/migrations/0283_calliope_playbooks.sql"),
+    ),
+    (
+        "0284_business_topology_bundle_corrections",
+        include_str!("../sql/migrations/0284_business_topology_bundle_corrections.sql"),
+    ),
+    (
+        "0285_business_topology_workflows",
+        include_str!("../sql/migrations/0285_business_topology_workflows.sql"),
+    ),
+    (
+        "0286_canonical_credentials",
+        include_str!("../sql/migrations/0286_canonical_credentials.sql"),
+    ),
+    (
+        "0287_dlt_mirror_control_plane",
+        include_str!("../sql/migrations/0287_dlt_mirror_control_plane.sql"),
+    ),
+    (
+        "0288_calliope_setup_sessions",
+        include_str!("../sql/migrations/0288_calliope_setup_sessions.sql"),
+    ),
+    (
+        "0289_data_mover_runtime_registry",
+        include_str!("../sql/migrations/0289_data_mover_runtime_registry.sql"),
+    ),
+    (
+        "0290_dlt_destination_identifier_contract",
+        include_str!("../sql/migrations/0290_dlt_destination_identifier_contract.sql"),
+    ),
+    (
+        "0291_calliope_first_boot",
+        include_str!("../sql/migrations/0291_calliope_first_boot.sql"),
+    ),
+    (
+        "0292_dlt_mirror_rvbbit_registration",
+        include_str!("../sql/migrations/0292_dlt_mirror_rvbbit_registration.sql"),
+    ),
+    (
+        "0293_hosted_onboarding_followthrough",
+        include_str!("../sql/migrations/0293_hosted_onboarding_followthrough.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

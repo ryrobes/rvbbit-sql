@@ -33,6 +33,13 @@ runtime:
     # the SAME value on the pg-rvbbit service). Empty = open on the trusted
     # internal network (the gateway logs a warning); never expose port 9180 then.
     RVBBIT_GATEWAY_TOKEN: ${RVBBIT_GATEWAY_TOKEN:-}
+    # New installs use the encrypted Postgres credential store. Keep the
+    # compatibility switch off until RVBBIT_CREDENTIAL_KEY has been provisioned
+    # on Postgres; the hosted appliance profile turns it on.
+    RVBBIT_REQUIRE_CANONICAL_CREDENTIALS: ${RVBBIT_REQUIRE_CANONICAL_CREDENTIALS:-false}
+    # The legacy migration reader must never write plaintext if canonical
+    # storage is temporarily unavailable.
+    RVBBIT_GATEWAY_REQUIRE_ENCRYPTION: ${RVBBIT_GATEWAY_REQUIRE_ENCRYPTION:-true}
     GITHUB_TOKEN: ${GITHUB_TOKEN:-}
     GITHUB_USERNAME: ${GITHUB_USERNAME:-}
     OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
@@ -45,10 +52,8 @@ runtime:
   volumes:
     - name: mcp_npm_cache
       mount: /root/.npm
-    # MCP install-time secrets (encrypted) live at /app/data/mcp-secrets.bin (+ .key).
-    # Without a volume they're wiped on every gateway rebuild/recreate — which silently
-    # breaks every MCP server that needs a key (e.g. linear's LINEAR_API_TOKEN) until the
-    # secret is re-pushed. Persist them so secrets survive redeploys.
+    # Compatibility reader for pre-0286 MCP secrets. Once copied into canonical
+    # storage, this volume is no longer the authoritative store.
     - name: mcp_secrets
       mount: /app/data
 runtime_registration:

@@ -154,12 +154,11 @@ pub(crate) fn register_for_datafusion(
 /// error can't abort the caller.
 pub(crate) fn maybe_reoffload_cold(rel_oid: u32) {
     // Tolerate the policy table not existing yet (pre-migration backends).
-    let has_policy = pgrx::Spi::get_one::<bool>(
-        "SELECT to_regclass('rvbbit.cold_tier_policy') IS NOT NULL",
-    )
-    .ok()
-    .flatten()
-    .unwrap_or(false);
+    let has_policy =
+        pgrx::Spi::get_one::<bool>("SELECT to_regclass('rvbbit.cold_tier_policy') IS NOT NULL")
+            .ok()
+            .flatten()
+            .unwrap_or(false);
     if !has_policy {
         return;
     }
@@ -195,8 +194,8 @@ fn cold_stat(uri: &str) -> i64 {
             .map(|m| m.len() as i64)
             .unwrap_or_else(|e| pgrx::error!("rvbbit.cold_stat: stat {path}: {e}"));
     }
-    let url = Url::parse(uri)
-        .unwrap_or_else(|e| pgrx::error!("rvbbit.cold_stat: bad URI '{uri}': {e}"));
+    let url =
+        Url::parse(uri).unwrap_or_else(|e| pgrx::error!("rvbbit.cold_stat: bad URI '{uri}': {e}"));
     let (store, key) =
         object_store_for(&url).unwrap_or_else(|e| pgrx::error!("rvbbit.cold_stat: {e}"));
     let size = crate::df::with_lance_runtime(|rt| {
@@ -324,8 +323,9 @@ fn cold_put(local_path: &str, dest_uri: &str) -> i64 {
     // through the same primitive the object-store path uses.
     if let Some(dest) = dest_uri.strip_prefix("file://") {
         if let Some(parent) = std::path::Path::new(dest).parent() {
-            std::fs::create_dir_all(parent)
-                .unwrap_or_else(|e| pgrx::error!("rvbbit.cold_put: mkdir {}: {e}", parent.display()));
+            std::fs::create_dir_all(parent).unwrap_or_else(|e| {
+                pgrx::error!("rvbbit.cold_put: mkdir {}: {e}", parent.display())
+            });
         }
         std::fs::write(dest, &data)
             .unwrap_or_else(|e| pgrx::error!("rvbbit.cold_put: write {dest}: {e}"));

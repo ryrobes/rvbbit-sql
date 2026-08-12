@@ -308,6 +308,7 @@ BEGIN
         SELECT r.endpoint_url INTO resolved_runtime_endpoint
         FROM rvbbit.python_runtimes r
         WHERE r.name = normalized_runtime
+          AND r.language = 'python'
           AND r.status = 'ready';
         IF resolved_runtime_endpoint IS NULL THEN
             RAISE EXCEPTION 'rvbbit.create_python_env: python runtime "%" is not registered or ready',
@@ -672,7 +673,7 @@ fn load_spec_from_spi(
                 e.timeout_ms \
          FROM rvbbit.python_handlers h \
          JOIN rvbbit.python_envs e ON e.name = h.env_name \
-         LEFT JOIN rvbbit.python_runtimes r ON r.name = e.runtime_name \
+         LEFT JOIN rvbbit.python_runtimes r ON r.name = e.runtime_name AND r.language = 'python' \
          WHERE h.name = '{escaped}' \
            AND e.status <> 'disabled' \
            AND (e.runtime_name IS NULL OR r.status = 'ready')"

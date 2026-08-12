@@ -1,0 +1,7 @@
+# Customer-derived packets, label overlays, reports, and trained checkpoints
+# belong in a protected workspace, never in the public source tree.
+private/
+outputs/
+*.local.json
+*.private.json
+*.checkpoint.json

@@ -877,7 +877,11 @@ pub(crate) fn engine_query_payload_direct(
     query: &str,
     max_rows: i32,
 ) -> Result<Value, String> {
-    let max_rows = if max_rows > 0 { max_rows } else { self::max_rows() };
+    let max_rows = if max_rows > 0 {
+        max_rows
+    } else {
+        self::max_rows()
+    };
     if sidecar_result_format() != SidecarResultFormat::ArrowIpcFile {
         return Err("arrow transport disabled".to_string());
     }
@@ -1927,8 +1931,10 @@ fn send_fleet_request(
 /// the brain's environment. Command bodies (prewarm probes) and query bodies
 /// share this transport.
 fn send_fleet_json(endpoint: &str, mut body: Value, timeout: i32) -> Result<Value, String> {
-    let token = std::env::var("RVBBIT_ENGINE_TOKEN")
-        .map_err(|_| "fleet endpoint configured but RVBBIT_ENGINE_TOKEN is not in the server environment".to_string())?;
+    let token = std::env::var("RVBBIT_ENGINE_TOKEN").map_err(|_| {
+        "fleet endpoint configured but RVBBIT_ENGINE_TOKEN is not in the server environment"
+            .to_string()
+    })?;
     if let Some(map) = body.as_object_mut() {
         map.insert("token".to_string(), Value::String(token));
     }
@@ -1955,8 +1961,7 @@ fn send_fleet_json(endpoint: &str, mut body: Value, timeout: i32) -> Result<Valu
     if bytes == 0 {
         return Err("fleet engine returned no response".to_string());
     }
-    serde_json::from_str(response.trim_end())
-        .map_err(|e| format!("invalid fleet engine JSON: {e}"))
+    serde_json::from_str(response.trim_end()).map_err(|e| format!("invalid fleet engine JSON: {e}"))
 }
 
 fn send_shared_request(socket_path: &str, request: &str, timeout: i32) -> Result<Value, String> {

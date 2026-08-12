@@ -124,6 +124,57 @@ def test_candidates_require_real_observations_and_keep_a_deep_editorial_reservoi
     assert [item["portfolio_rank"] for item in ranked[:3]] == [1, 2, 3]
 
 
+def test_dreams_can_propose_a_complete_typed_playbook_but_never_a_partial_one():
+    observations = [{
+        "id": "observation:1",
+        "kind": "success",
+        "title": "A useful investigation keeps recurring",
+        "summary": "The same grounded method has produced useful reviewed results.",
+    }]
+    contract = {
+        "outcome": "Explain the material operating exceptions with current evidence.",
+        "when_to_use": ["A leader asks what changed and why"],
+        "triggers": ["operating review"],
+        "when_not_to_use": ["The source refresh is incomplete"],
+        "context_to_gather": ["Current governed metrics"],
+        "method": ["Resolve the current period", "Investigate material exceptions"],
+        "guardrails": ["Do not infer missing values"],
+        "deliverable": "A concise evidence-backed exception brief.",
+        "completion_criteria": ["Every material claim links to evidence"],
+        "fallbacks": ["State which source is unavailable"],
+        "required_capabilities": ["metric"],
+        "preferred_capabilities": ["compare"],
+        "optional_capabilities": [],
+    }
+    candidate = {
+        "dream_type": "connection",
+        "output_kind": "prototype",
+        "title": "Keep the operating exception method",
+        "thesis": "A successful recurring investigation should become a reusable private method.",
+        "observation_ids": ["observation:1"],
+        "output": {
+            "artifact_type": "playbook",
+            "playbook": {
+                "title": "Operating exception review",
+                "synopsis": "Turn current governed signals into a reviewed exception brief.",
+                "readiness": "ready",
+                "contract": contract,
+            },
+        },
+    }
+
+    valid = dreams.normalize_candidates({"dreams": [candidate]}, observations)
+    assert valid[0]["output"]["artifact_type"] == "playbook"
+    assert valid[0]["output"]["playbook"]["contract"]["method"] == contract["method"]
+
+    partial = json.loads(json.dumps(candidate))
+    partial["output"]["playbook"]["contract"]["completion_criteria"] = []
+    normalized = dreams.normalize_candidates({"dreams": [partial]}, observations)
+    assert normalized[0]["output"]["artifact_type"] == "analysis"
+    assert "playbook" not in normalized[0]["output"]
+    assert "artifact_type=playbook" in dreams.PERSONAL_IDEATOR_INSTRUCTIONS
+
+
 def test_evidence_lab_admits_only_bounded_observed_queries_and_installed_clover():
     observations = [{"id": "observation:1"}]
     targets = [{

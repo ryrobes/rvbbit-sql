@@ -1,0 +1,11 @@
+{
+  "mode": "local_external",
+  "bank_id": "hermes",
+  "recall_budget": "mid",
+  "recall_types": "observation",
+  "recall_prefetch_method": "recall",
+  "auto_recall": true,
+  "auto_retain": true,
+  "retain_async": true,
+  "memory_mode": "hybrid"
+}

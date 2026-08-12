@@ -1,0 +1,13 @@
+#!/command/with-contenv sh
+set -eu
+
+hermes_home="${HERMES_HOME:-/opt/data}"
+hindsight_dir="${hermes_home}/hindsight"
+hindsight_config="${hindsight_dir}/config.json"
+
+mkdir -p "$hindsight_dir"
+if [ ! -s "$hindsight_config" ]; then
+    install -o hermes -g hermes -m 0600 \
+        /opt/hermes/calliope/hindsight-config.json "$hindsight_config"
+    echo "[calliope] seeded pinned local-external Hindsight memory config"
+fi

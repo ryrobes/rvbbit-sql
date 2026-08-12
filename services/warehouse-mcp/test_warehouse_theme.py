@@ -418,6 +418,13 @@ def test_container_and_unified_origin_ship_theme_assets():
     ).read_text(encoding="utf-8")
 
 
+def test_unified_origin_routes_gallery_api_to_warehouse():
+    caddy = (_HERE.parent.parent / "docker" / "origin" / "Caddyfile").read_text(
+        encoding="utf-8"
+    )
+    assert "/gallery /api/gallery/* /calliope" in caddy
+
+
 def test_optional_tanstack_runtime_is_versioned_public_and_inlineable_for_captures():
     runtime = warehouse_theme._TANSTACK_CHARTS_JS
     assert warehouse_theme.TANSTACK_CHARTS_VERSION == "0.3.1"

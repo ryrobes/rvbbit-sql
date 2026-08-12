@@ -1,7 +1,9 @@
 .git
 .rvbbit
 .pytest_cache
-/bench
+/bench/*
+!/bench/business_topology/
+!/bench/business_topology/**
 /dist
 /results
 /target

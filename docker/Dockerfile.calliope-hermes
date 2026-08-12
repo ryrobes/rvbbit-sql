@@ -1,0 +1,25 @@
+ARG HERMES_BASE_IMAGE=nousresearch/hermes-agent@sha256:e3a16e60340da20b40578a417be1eb08f9fe46fef961cce16498711606adc10f
+FROM ${HERMES_BASE_IMAGE}
+
+USER root
+
+# Small, reviewable overlay on the pinned upstream image. The patch forwards
+# verified Hermes session provenance only to explicitly opted-in first-party
+# MCP servers; secret values remain environment references in the config.
+COPY services/warehouse-mcp/hermes-forward-session-identity.patch /tmp/hermes-forward-session-identity.patch
+RUN cd /opt/hermes \
+    && git apply --check --include=tools/mcp_tool.py /tmp/hermes-forward-session-identity.patch \
+    && git apply --include=tools/mcp_tool.py /tmp/hermes-forward-session-identity.patch \
+    && rm /tmp/hermes-forward-session-identity.patch
+
+# Upstream's stage-two hook copies cli-config.yaml.example into a new data
+# volume. Existing volumes are intentionally preserved. The additional hook
+# seeds only Hindsight's provider config, also on first boot.
+COPY docker/calliope/hermes-config.yaml /opt/hermes/cli-config.yaml.example
+COPY docker/calliope/hindsight-config.json /opt/hermes/calliope/hindsight-config.json
+COPY --chmod=0755 docker/calliope/013-calliope-config /etc/cont-init.d/013-calliope-config
+
+LABEL org.opencontainers.image.title="RVBBIT Calliope Hermes" \
+      org.opencontainers.image.description="Pinned Hermes Agent with Calliope defaults and first-party MCP provenance forwarding" \
+      org.opencontainers.image.base.name="nousresearch/hermes-agent@sha256:e3a16e60340da20b40578a417be1eb08f9fe46fef961cce16498711606adc10f" \
+      org.opencontainers.image.base.revision="69ae247cf3dba34a37ab4af8484b96d3559a4fcf"

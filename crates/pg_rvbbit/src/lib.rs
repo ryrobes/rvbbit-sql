@@ -30,6 +30,7 @@ mod columnar_cache;
 mod compact;
 mod composites;
 mod costs;
+mod credentials;
 mod custom_scan;
 mod delete_log;
 mod df;
@@ -98,14 +99,14 @@ mod takes;
 mod tam;
 mod telemetry;
 mod time_travel;
-mod workload_layout_tick;
-mod unified_layout_tick;
 mod tokens;
 mod triples;
+mod unified_layout_tick;
 mod unit_of_work;
 mod validator;
 mod vector;
 mod vortex_adapter;
+mod workload_layout_tick;
 
 /// Force the backend registry to reload from rvbbit.backends. Call after
 /// registering new backends in a long-lived session so the thread-safe

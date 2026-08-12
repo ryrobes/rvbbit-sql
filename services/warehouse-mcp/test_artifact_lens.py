@@ -176,6 +176,81 @@ def test_validate_sql_keeps_as_of_directive_out_of_read_only_gate(monkeypatch):
     ]
 
 
+def test_run_sql_returns_planner_resolved_warehouse_lineage(monkeypatch):
+    class _Description:
+        name = "customer_id"
+        type_code = 23
+
+    class _Cursor:
+        description = [_Description()]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, _statement):
+            return None
+
+        def fetchmany(self, _limit):
+            return [{"customer_id": 7}]
+
+        def fetchone(self):
+            return None
+
+    class _Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        @staticmethod
+        def cursor():
+            return _Cursor()
+
+    monkeypatch.setattr(
+        server,
+        "tool_validate_sql",
+        lambda _sql, _as_of=None: {
+            "valid": True,
+            "safe_select": True,
+            "engine": "rvbbit_native",
+            "rvbbit_tables": ["commerce.customers"],
+        },
+    )
+    monkeypatch.setattr(server, "_session_pg_role", lambda: None)
+    monkeypatch.setattr(server, "_conn", lambda **_kwargs: _Connection())
+    monkeypatch.setattr(
+        server,
+        "_referenced_tables",
+        lambda _sql: ["commerce.customers", "commerce.orders"],
+    )
+
+    result = server.tool_run_sql(
+        "SELECT c.customer_id FROM commerce.customers c "
+        "LEFT JOIN commerce.orders o USING (customer_id)"
+    )
+
+    assert result["warehouse_objects"] == [
+        "commerce.customers",
+        "commerce.orders",
+    ]
+    assert result["rvbbit_tables"] == ["commerce.customers"]
+    assert result["lineage"] == {
+        "warehouse_objects": ["commerce.customers", "commerce.orders"]
+    }
+    assert server._objects("run_sql", {}, result) == [
+        "commerce.customers",
+        "commerce.orders",
+    ]
+    assert server._summary("run_sql", result)["warehouse_objects"] == [
+        "commerce.customers",
+        "commerce.orders",
+    ]
+
+
 def test_publish_quarantines_bad_optional_semantics_instead_of_rejecting_artifact():
     invalid = {
         "app_kind": "dashboard",
@@ -660,7 +735,7 @@ def test_artifact_lens_is_shadow_isolated_trace_capable_and_heavily_debounced():
     assert ".evidence-card" in css
     assert "/theme/artifact-lens.js" in theme_server
     assert "/theme/artifact-lens.css" in theme_server
-    assert "COPY theme ./theme" in dockerfile
+    assert "COPY services/warehouse-mcp/theme ./theme" in dockerfile
 
 
 def test_closing_artifact_lens_disables_all_dashboard_selection_behavior():

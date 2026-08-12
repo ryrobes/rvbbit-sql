@@ -26,6 +26,9 @@ def test_voice_config_uses_server_only_elevenlabs_credentials(monkeypatch):
     monkeypatch.setenv("WAREHOUSE_HERMES_API_KEY", "hermes-key")
     monkeypatch.setenv("ELEVENLABS_API_KEY", "eleven-secret")
     monkeypatch.setenv("ELEVENLABS_VOICE_ID", "voice-id")
+    monkeypatch.setenv("RVBBIT_CLOVER_KEY", "clover-secret")
+    monkeypatch.setenv("RVBBIT_CLOVER_OPENAI_BASE_URL", "https://clover.example/v1")
+    monkeypatch.setenv("RVBBIT_CLOVER_REQUIRED_MODEL", "calliope")
     monkeypatch.delenv("WAREHOUSE_CALLIOPE_TTS_KEY", raising=False)
     monkeypatch.delenv("WAREHOUSE_CALLIOPE_TTS_VOICE_ID", raising=False)
     monkeypatch.delenv("WAREHOUSE_CALLIOPE_TTS_PREPARE_TIMEOUT_SECONDS", raising=False)
@@ -41,6 +44,9 @@ def test_voice_config_uses_server_only_elevenlabs_credentials(monkeypatch):
     assert config.voice_expressive_stability == 0.3
     assert config.voice_sample_rate == 24_000
     assert config.voice_prepare_timeout_seconds == 30
+    assert config.voice_rewrite_api_key == "clover-secret"
+    assert config.voice_rewrite_base_url == "https://clover.example/v1"
+    assert config.voice_rewrite_model == "calliope"
 
     monkeypatch.setenv("WAREHOUSE_CALLIOPE_TTS_KEY", "dedicated-secret")
     assert calliope.CalliopeConfig.from_env().voice_api_key == "dedicated-secret"
@@ -58,7 +64,7 @@ def test_voice_config_uses_server_only_elevenlabs_credentials(monkeypatch):
     assert calliope.CalliopeConfig.from_env().voice_enabled is False
 
 
-def test_voice_script_sanitizer_preserves_open_ended_expression_tags_and_markup():
+def test_voice_script_normalizer_preserves_expression_tags_markup_and_urls():
     source = (
         "Spoken version: [dryly amused] **Revenue is $12.4M.** "
         "[with a weary little sigh] Risk remains elevated. "
@@ -66,29 +72,48 @@ def test_voice_script_sanitizer_preserves_open_ended_expression_tags_and_markup(
         "See [the dashboard](https://example.com/private)."
     )
 
-    fast = calliope._clean_voice_script(source, "fast")
-    expressive = calliope._clean_voice_script(source, "expressive")
+    fast = calliope._normalize_voice_script(source, "fast")
+    expressive = calliope._normalize_voice_script(source, "expressive")
 
-    assert "[" not in fast and "]" not in fast
-    assert "https://" not in fast
-    assert "Revenue is $12.4M" in fast
-    assert expressive.count("[") == 3
+    assert fast == expressive
+    assert fast == source
+    assert fast.startswith("Spoken version: [dryly amused]")
+    assert "https://example.com/private" in fast
     assert "[dryly amused]" in expressive
     assert "[with a weary little sigh]" in expressive
     assert "[laughs, then whispers]" in expressive
-    assert "[direction 2]" not in expressive
-    assert "**" not in expressive
+    assert "[direction 2]" in expressive
+    assert "**" in expressive
 
 
-def test_voice_script_sanitizer_bounds_but_does_not_enumerate_expression_tags():
-    source = " ".join(f"[performance cue {chr(97 + index)}] phrase" for index in range(10))
+def test_voice_script_normalizer_only_removes_transport_invalid_controls():
+    source = "\x00Spoken response:  First fact.\n\n[unusual_tag_2]   Final fact.\x7f"
 
-    expressive = calliope._clean_voice_script(source, "expressive")
+    normalized = calliope._normalize_voice_script(source, "expressive")
 
-    assert expressive.count("[") == calliope._MAX_VOICE_EXPRESSION_TAGS
-    assert "[performance cue a]" in expressive
-    assert "[performance cue h]" in expressive
-    assert "[performance cue i]" not in expressive
+    assert normalized == "Spoken response:  First fact.\n\n[unusual_tag_2]   Final fact."
+
+
+def test_voice_script_normalizer_never_clips_a_complete_semantic_rewrite():
+    source = " ".join(f"material-fact-{index}" for index in range(180))
+    source += " FINAL_MATERIAL_FACT"
+
+    cleaned = calliope._normalize_voice_script(source, "fast")
+
+    assert cleaned == source
+    assert len(cleaned.split()) == 181
+    assert cleaned.endswith("FINAL_MATERIAL_FACT")
+    assert not cleaned.endswith("…")
+
+
+def test_voice_fallback_keeps_the_complete_canonical_answer():
+    source = " ".join(f"source-fact-{index}." for index in range(100))
+    source += " FINAL_SOURCE_FACT."
+
+    fallback = calliope._fallback_voice_script(source, "fast")
+
+    assert fallback.endswith("FINAL_SOURCE_FACT.")
+    assert len(fallback.split()) == 101
 
 
 def test_expressive_instruction_follows_personality_without_a_fixed_tag_script():
@@ -109,72 +134,199 @@ def test_expressive_instruction_follows_personality_without_a_fixed_tag_script()
     assert "neutral conversational delivery" in fast
 
 
-def test_current_three_argument_clover_operator_builds_the_digest_and_attributes_it():
-    calls = []
+def test_voice_builder_uses_calliope_chat_without_any_output_cap(monkeypatch, tmp_path):
+    captured = {}
+    source = "SOURCE_OPEN " + ("source-data " * 2_100) + "FINAL_SOURCE_FACT"
+    rewrite = " ".join(f"spoken-fact-{index}" for index in range(180))
+    rewrite += " FINAL_SPOKEN_FACT"
 
-    class Result:
-        def __init__(self, row=None, rows=None):
-            self.row = row
-            self.rows = rows or []
+    class Response:
+        status_code = 200
 
-        def fetchone(self):
-            return self.row
+        def json(self):
+            return {
+                "model": "calliope-voice-test",
+                "choices": [{
+                    "finish_reason": "stop",
+                    "message": {"role": "assistant", "content": rewrite},
+                }],
+            }
 
-        def fetchall(self):
-            return self.rows
+    class Client:
+        def __init__(self, **kwargs):
+            captured["client"] = kwargs
 
-    class Connection:
         def __enter__(self):
             return self
 
         def __exit__(self, *_args):
             return False
 
-        def execute(self, query, params=None):
-            calls.append((query, params))
-            if "set_config('statement_timeout'" in query:
-                return Result({"set_config": params[0]})
-            if "to_regprocedure" in query:
-                return Result({
-                    "clover3": True,
-                    "clover2": False,
-                    "summarize2": True,
-                    "summarize1": False,
-                })
-            if "clover_llm_apply" in query:
-                return Result({
-                    "script": "Revenue reached $12.4 million, while churn remains the main risk. The full cohort detail is on screen."
-                })
-            if "UPDATE rvbbit.receipts" in query:
-                return Result(rows=[])
-            raise AssertionError(query)
+        def post(self, url, **kwargs):
+            captured.update({"url": url, **kwargs})
+            return Response()
 
-    script, provider, model = calliope._generate_voice_script(
-        Connection,
-        "Revenue reached $12.4M. Churn is 4.2%. A long table follows.",
-        "fast",
-        "Warm and concise",
-        "pilot@example.com",
+    monkeypatch.setattr(calliope.httpx, "Client", Client)
+    config = calliope.CalliopeConfig(
+        hermes_url="http://hermes:8642",
+        hermes_api_key="hermes-key",
+        memory_key="company",
+        file_root=tmp_path,
+        max_image_bytes=1024,
+        voice_rewrite_api_key="clover-secret",
+        voice_rewrite_base_url="https://clover.example/v1",
+        voice_rewrite_model="calliope",
     )
 
+    script, provider, model = calliope._generate_voice_script(
+        config,
+        source,
+        "fast",
+        "This must not enter fast mode",
+        "hosted@example.com",
+    )
+
+    assert captured["url"] == "https://clover.example/v1/chat/completions"
+    assert captured["headers"]["Authorization"] == "Bearer clover-secret"
+    assert "clover-secret" not in captured["url"]
+    assert captured["json"]["model"] == "calliope"
+    assert captured["json"]["messages"][1] == {"role": "user", "content": source}
+    instruction = captured["json"]["messages"][0]["content"]
+    assert "Completeness wins over a length target" in instruction
+    assert "This must not enter fast mode" not in instruction
+    assert "max_tokens" not in captured["json"]
+    assert "max_output_tokens" not in captured["json"]
+    assert script == rewrite
+    assert script.endswith("FINAL_SPOKEN_FACT")
     assert provider == "clover"
-    assert model == "clover_llm_apply"
-    assert "$12.4 million" in script
-    timeout_calls = [item for item in calls if "set_config('statement_timeout'" in item[0]]
-    assert len(timeout_calls) == 2
-    assert all(item[1] == ("28000ms",) for item in timeout_calls)
-    assert all(item[0].endswith(",%s,false)") for item in timeout_calls)
-    operator_call = next(item for item in calls if "SELECT rvbbit.clover_llm_apply" in item[0])
-    assert "%s::jsonb" in operator_call[0]
-    assert operator_call[1][2] == "{}"
-    assert "VOICE_PERSONALITY" not in operator_call[1][1]
-    assert "Warm and concise" not in operator_call[1][1]
-    assert "neutral conversational delivery" in operator_call[1][1]
-    receipt_call = next(item for item in calls if "UPDATE rvbbit.receipts" in item[0])
-    assert receipt_call[1][0] == "pilot@example.com"
-    assert "regexp_replace" in receipt_call[0]
-    assert "VOICE_(PREFERENCE|PERSONALITY)" in receipt_call[0]
-    assert "Warm and concise" not in json.dumps(receipt_call[1], default=str)
+    assert model == "calliope-voice-test"
+
+
+def test_voice_builder_trusts_a_short_complete_clover_rewrite(monkeypatch, tmp_path):
+    class Client:
+        def __init__(self, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def post(self, _url, **_kwargs):
+            return types.SimpleNamespace(
+                status_code=200,
+                json=lambda: {
+                    "model": "calliope",
+                    "choices": [{
+                        "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": "All clear."},
+                    }],
+                },
+            )
+
+    monkeypatch.setattr(calliope.httpx, "Client", Client)
+    config = calliope.CalliopeConfig(
+        hermes_url="http://hermes:8642",
+        hermes_api_key="hermes-key",
+        memory_key="company",
+        file_root=tmp_path,
+        max_image_bytes=1024,
+        voice_rewrite_api_key="clover-secret",
+        voice_rewrite_model="calliope",
+    )
+
+    script, provider, model = calliope._generate_voice_script(
+        config,
+        "The canonical answer is longer, but the actual conclusion is uncomplicated.",
+        "fast",
+        "",
+        "hosted@example.com",
+    )
+
+    assert script == "All clear."
+    assert provider == "clover"
+    assert model == "calliope"
+
+
+def test_voice_builder_rejects_provider_length_stop_and_uses_complete_answer(
+    monkeypatch, tmp_path, capsys,
+):
+    source = "**First material fact.**\n\n[firmly] FINAL_SOURCE_FACT."
+
+    class Response:
+        status_code = 200
+
+        def json(self):
+            return {
+                "model": "calliope",
+                "choices": [{
+                    "finish_reason": "length",
+                    "message": {"role": "assistant", "content": "Partial output that"},
+                }],
+            }
+
+    class Client:
+        def __init__(self, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def post(self, _url, **_kwargs):
+            return Response()
+
+    monkeypatch.setattr(calliope.httpx, "Client", Client)
+    config = calliope.CalliopeConfig(
+        hermes_url="http://hermes:8642",
+        hermes_api_key="hermes-key",
+        memory_key="company",
+        file_root=tmp_path,
+        max_image_bytes=1024,
+        voice_rewrite_api_key="clover-secret",
+        voice_rewrite_model="calliope",
+    )
+
+    script, provider, model = calliope._generate_voice_script(
+        config,
+        source,
+        "expressive",
+        "Natural",
+        "hosted@example.com",
+    )
+
+    assert script == source
+    assert "Partial output" not in script
+    assert provider == "canonical"
+    assert model is None
+    assert "incomplete voice rewrite (length)" in capsys.readouterr().err
+
+
+def test_voice_builder_without_clover_key_uses_complete_answer(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        calliope.httpx,
+        "Client",
+        lambda **_kwargs: pytest.fail("Clover must not be called without its key"),
+    )
+    source = "Revenue reached $12.4M. Churn remains the main risk."
+    config = calliope.CalliopeConfig(
+        hermes_url="http://hermes:8642",
+        hermes_api_key="hermes-key",
+        memory_key="company",
+        file_root=tmp_path,
+        max_image_bytes=1024,
+    )
+
+    script, provider, model = calliope._generate_voice_script(
+        config, source, "fast", "", "hosted@example.com"
+    )
+
+    assert script == source
+    assert provider == "canonical"
+    assert model is None
 
 
 def test_saved_voice_receipt_keeps_hash_not_browser_personality(monkeypatch, tmp_path):
@@ -219,7 +371,7 @@ def test_saved_voice_receipt_keeps_hash_not_browser_personality(monkeypatch, tmp
         lambda *_args: (
             "Revenue improved, though the result is still preliminary.",
             "clover",
-            "clover_llm_apply",
+            "calliope",
         ),
     )
     config = calliope.CalliopeConfig(
@@ -243,7 +395,7 @@ def test_saved_voice_receipt_keeps_hash_not_browser_personality(monkeypatch, tmp
     )
 
     assert reused is False
-    assert render["version"] == 2
+    assert render["version"] == 4
     assert render["mode"] == "expressive"
     assert render["tts_model"] == "eleven_v3"
     assert render["tts_stability"] == 0.3
@@ -512,6 +664,8 @@ def test_voice_preparation_deadline_reports_the_stalled_stage():
     backend_source = (HERE / "calliope.py").read_text(encoding="utf-8")
 
     assert '"prepare_timeout_seconds": config.voice_prepare_timeout_seconds' in backend_source
+    assert '"model": config.voice_rewrite_model' in backend_source
+    assert '"output_limit": None' in backend_source
     assert '"code": "VOICE_TEXT_TIMEOUT"' in backend_source
     assert '"stage": "text"' in backend_source
     assert backend_source.count('"code": "VOICE_AUDIO_TIMEOUT"') >= 2
@@ -555,7 +709,7 @@ def test_voice_ui_keeps_the_original_turn_and_streams_pcm_in_the_browser():
     assert "failures: new Map()" in calliope_source
     assert "voicePresentationPending" in calliope_source
     assert "text_to_speech?.render_version" in calliope_source
-    assert r"\[[^\[\]\r\n]{1,96}\]" in calliope_source
+    assert r"\[[^\[\]\r\n]+\]" in calliope_source
     assert "Shaping the spoken version" in calliope_source
     assert "The complete answer is ready · making it conversational" in calliope_source
     assert "voicePreparationTimeoutMs" in calliope_source
@@ -577,7 +731,7 @@ def test_voice_ui_keeps_the_original_turn_and_streams_pcm_in_the_browser():
     assert "turn.response_receipt" in calliope_source
     assert "state.voice.pendingTurns.add(String(pending.id))" in calliope_source
     assert "state.voice.pendingTurns.delete(String(turn.id))" in calliope_source
-    assert "spoken cut shaping" in calliope_source
+    assert "spoken rendering shaping" in calliope_source
     completion_source = calliope_source.split('event === "calliope.turn.completed"', 1)[1]
     assert completion_source.index("state.voice.pendingTurns.add(String(pending.id))") \
         < completion_source.index("renderChat()")
@@ -586,7 +740,7 @@ def test_voice_ui_keeps_the_original_turn_and_streams_pcm_in_the_browser():
     assert 'mode: state.voice.preferences.mode' in calliope_source
     assert 'personality: state.voice.preferences.personality' in calliope_source
     assert 'id="voice-dialog-script"' in calliope_page
-    assert "the conversation follows the concise words Calliope speaks" in calliope_page
+    assert "the conversation follows the words Calliope speaks" in calliope_page
     assert "Copy full answer" in calliope_page
 
     calliope_css = (HERE / "calliope" / "calliope.css").read_text(encoding="utf-8")

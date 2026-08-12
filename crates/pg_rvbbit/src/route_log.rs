@@ -664,13 +664,15 @@ fn write_batch(
                 )?;
                 executions += 1;
                 if !template.query_text.is_empty() && !template.shape_key.is_empty() {
-                    shape_samples.entry(template.shape_key.clone()).or_insert_with(|| {
-                        (
-                            template.shape_family.clone(),
-                            template.query_text.clone(),
-                            template.search_path.clone(),
-                        )
-                    });
+                    shape_samples
+                        .entry(template.shape_key.clone())
+                        .or_insert_with(|| {
+                            (
+                                template.shape_family.clone(),
+                                template.query_text.clone(),
+                                template.search_path.clone(),
+                            )
+                        });
                 }
             }
         }

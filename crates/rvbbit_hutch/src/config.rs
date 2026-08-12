@@ -21,6 +21,12 @@ fn default_max_body() -> usize {
 fn default_lane_grace_ms() -> u64 {
     250
 }
+fn default_provider_cost_reconcile_secs() -> u64 {
+    15
+}
+fn default_provider_price_refresh_secs() -> u64 {
+    6 * 60 * 60
+}
 fn default_timeout_ms() -> u64 {
     30_000
 }
@@ -43,6 +49,12 @@ pub struct HutchConfig {
     /// so this only smooths bursts, it is not a queue.
     #[serde(default = "default_lane_grace_ms")]
     pub lane_grace_ms: u64,
+    /// Generic background cadence for provider-attempt cost reconciliation.
+    #[serde(default = "default_provider_cost_reconcile_secs")]
+    pub provider_cost_reconcile_secs: u64,
+    /// Advisory provider catalog refresh; never blocks Hutch startup.
+    #[serde(default = "default_provider_price_refresh_secs")]
+    pub provider_price_refresh_secs: u64,
     pub upstream: Upstream,
     pub backends: Vec<BackendCfg>,
     /// Hosted LLMs on the OpenAI-compatible surface. Empty = specialist-only.
@@ -221,6 +233,11 @@ pub struct LlmCfg {
     pub entitlement: String,
     #[serde(default = "default_llm_upstream")]
     pub upstream_base: String,
+    /// Explicit provider accounting adapter. When absent, Hutch recognizes
+    /// known provider hosts for backwards compatibility and otherwise uses a
+    /// generic OpenAI-compatible adapter.
+    #[serde(default)]
+    pub provider: Option<String>,
     /// Optional environment variable containing the upstream API token.
     /// When set, Hutch adds `Authorization: Bearer <token>` to the upstream
     /// request.  The variable name is configuration; the credential itself
@@ -273,6 +290,16 @@ impl HutchConfig {
         }
         let mut llm_routes: BTreeMap<&str, &str> = BTreeMap::new();
         for llm in &cfg.llms {
+            if llm
+                .provider
+                .as_deref()
+                .is_some_and(|provider| provider.is_empty() || provider.trim() != provider)
+            {
+                return Err(format!(
+                    "llm '{}' has a blank or whitespace-padded provider id",
+                    llm.name
+                ));
+            }
             if llm.request_overrides.contains_key("model")
                 || llm.request_defaults.contains_key("model")
             {
@@ -322,7 +349,7 @@ mod tests {
             .expect("production-shaped Clover example should parse");
 
         assert_eq!(cfg.backends.len(), 27);
-        assert_eq!(cfg.llms.len(), 1);
+        assert_eq!(cfg.llms.len(), 2);
 
         let cluster = cfg.backend("cluster").expect("cluster backend");
         assert_eq!(cluster.adapter, Adapter::ZooJson);
@@ -381,6 +408,31 @@ mod tests {
             cfg.llm("gemma4").expect("legacy public alias").name,
             "clover"
         );
+
+        let calliope = cfg.llm("calliope").expect("Calliope LLM");
+        assert_eq!(calliope.name, "calliope");
+        assert_eq!(calliope.provider.as_deref(), Some("openrouter"));
+        assert_eq!(calliope.upstream_base, "https://openrouter.ai/api");
+        assert_eq!(
+            calliope.upstream_bearer_token_env.as_deref(),
+            Some("OPENROUTER_API_KEY")
+        );
+        assert_eq!(calliope.upstream_model, "openai/gpt-5.6-luna");
+        assert_eq!(calliope.model_version, "openrouter/openai/gpt-5.6-luna");
+        assert!(calliope.request_defaults.is_empty());
+        assert_eq!(calliope.request_overrides["provider"]["zdr"], true);
+        assert_eq!(
+            calliope.request_overrides["provider"]["data_collection"],
+            "deny"
+        );
+        assert_eq!(calliope.prompt_microusd_per_1k, 1000);
+        assert_eq!(calliope.completion_microusd_per_1k, 6000);
+        assert_eq!(calliope.timeout_ms, 180_000);
+
+        let embed = cfg.backend("embed").expect("OpenAI embedding alias");
+        assert_eq!(embed.adapter, Adapter::OpenaiEmbeddings);
+        assert_eq!(embed.entitlement, "clover");
+        assert_eq!(embed.upstream_path.as_deref(), Some("/v1/embeddings"));
     }
 
     #[test]

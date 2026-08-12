@@ -9553,7 +9553,6 @@ unsafe fn try_implicit_prewarm_rule(query: *mut pg_sys::Query) {
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // Rule B, phase 5: implicit prewarm for INSERT..SELECT and CTE chains
 // ---------------------------------------------------------------------------
@@ -9587,8 +9586,15 @@ struct ComplexCte {
 }
 
 enum LevelSource {
-    Relation { oid: u32, rtindex: i32 },
-    Cte { name: String, rtindex: i32, colnames: Vec<String> },
+    Relation {
+        oid: u32,
+        rtindex: i32,
+    },
+    Cte {
+        name: String,
+        rtindex: i32,
+        colnames: Vec<String>,
+    },
 }
 
 unsafe fn try_implicit_prewarm_complex(query: *mut pg_sys::Query) {
@@ -9605,8 +9611,8 @@ unsafe fn try_implicit_prewarm_complex(query: *mut pg_sys::Query) {
             None => return,
         };
         for i in 0..(*cte_list).length {
-            let cte = (*(*cte_list).elements.add(i as usize)).ptr_value
-                as *mut pg_sys::CommonTableExpr;
+            let cte =
+                (*(*cte_list).elements.add(i as usize)).ptr_value as *mut pg_sys::CommonTableExpr;
             if cte.is_null() || (*cte).ctequery.is_null() || (*cte).ctename.is_null() {
                 return;
             }
@@ -9648,8 +9654,8 @@ unsafe fn try_implicit_prewarm_complex(query: *mut pg_sys::Query) {
             let mut found: Option<*mut pg_sys::Query> = None;
             let mut ambiguous = false;
             for i in 0..(*rtable).length {
-                let rte = (*(*rtable).elements.add(i as usize)).ptr_value
-                    as *mut pg_sys::RangeTblEntry;
+                let rte =
+                    (*(*rtable).elements.add(i as usize)).ptr_value as *mut pg_sys::RangeTblEntry;
                 if !rte.is_null() && (*rte).rtekind == pg_sys::RTEKind::RTE_SUBQUERY {
                     if found.replace((*rte).subquery).is_some() {
                         ambiguous = true;
@@ -9669,9 +9675,8 @@ unsafe fn try_implicit_prewarm_complex(query: *mut pg_sys::Query) {
     let mut any_calls = false;
     let mut plans: Vec<(String, Vec<String>, LevelSource)> = Vec::new();
     for lvl in levels {
-        if lvl.is_null()
-            || !(*lvl).setOperations.is_null()
-            || !(*lvl).cteList.is_null() // nested WITH: name shadowing risk
+        if lvl.is_null() || !(*lvl).setOperations.is_null() || !(*lvl).cteList.is_null()
+        // nested WITH: name shadowing risk
         {
             continue;
         }
@@ -9848,8 +9853,8 @@ unsafe fn single_from_source(lvl: *mut pg_sys::Query) -> Option<LevelSource> {
     if rtable.is_null() || rtindex < 1 || rtindex > (*rtable).length {
         return None;
     }
-    let rte = (*(*rtable).elements.add((rtindex - 1) as usize)).ptr_value
-        as *mut pg_sys::RangeTblEntry;
+    let rte =
+        (*(*rtable).elements.add((rtindex - 1) as usize)).ptr_value as *mut pg_sys::RangeTblEntry;
     if rte.is_null() {
         return None;
     }
@@ -10120,7 +10125,9 @@ unsafe fn render_cte_expr(
                 return None;
             }
             match source {
-                LevelSource::Cte { rtindex, colnames, .. } => {
+                LevelSource::Cte {
+                    rtindex, colnames, ..
+                } => {
                     if (*var).varno as i32 != *rtindex {
                         return None;
                     }
@@ -10180,7 +10187,9 @@ unsafe fn render_cte_expr(
             if name_c.is_null() {
                 return None;
             }
-            let opname = std::ffi::CStr::from_ptr(name_c).to_string_lossy().into_owned();
+            let opname = std::ffi::CStr::from_ptr(name_c)
+                .to_string_lossy()
+                .into_owned();
             let l = render_cte_expr(source, list_nth_node(args, 0)?, depth + 1)?;
             let r = render_cte_expr(source, list_nth_node(args, 1)?, depth + 1)?;
             // OPERATOR(pg_catalog.x) form would be safest, but the prewarm
@@ -10221,7 +10230,11 @@ unsafe fn list_nth_node(list: *mut pg_sys::List, i: i32) -> Option<*mut pg_sys::
         return None;
     }
     let p = pg_sys::list_nth(list, i) as *mut pg_sys::Node;
-    if p.is_null() { None } else { Some(p) }
+    if p.is_null() {
+        None
+    } else {
+        Some(p)
+    }
 }
 
 /// `schema.func` spelled callably, quoting each part as needed. lsyscache
@@ -10231,13 +10244,17 @@ unsafe fn qualified_func_name(funcid: pg_sys::Oid) -> Option<String> {
     if name_c.is_null() {
         return None;
     }
-    let name = std::ffi::CStr::from_ptr(name_c).to_string_lossy().into_owned();
+    let name = std::ffi::CStr::from_ptr(name_c)
+        .to_string_lossy()
+        .into_owned();
     let nsp_oid = pg_sys::get_func_namespace(funcid);
     let nsp_c = pg_sys::get_namespace_name(nsp_oid);
     if nsp_c.is_null() {
         return None;
     }
-    let nsp = std::ffi::CStr::from_ptr(nsp_c).to_string_lossy().into_owned();
+    let nsp = std::ffi::CStr::from_ptr(nsp_c)
+        .to_string_lossy()
+        .into_owned();
     Some(format!("{}.{}", quote_ident(&nsp), quote_ident(&name)))
 }
 
@@ -10290,9 +10307,7 @@ unsafe fn level_contains_op_call(q: *mut pg_sys::Query) -> bool {
                 }
                 false
             }
-            pg_sys::NodeTag::T_WindowFunc => {
-                list_has_op((*(node as *mut pg_sys::WindowFunc)).args)
-            }
+            pg_sys::NodeTag::T_WindowFunc => list_has_op((*(node as *mut pg_sys::WindowFunc)).args),
             _ => false,
         }
     }
@@ -10915,7 +10930,9 @@ unsafe fn render_expr_via_deparse(
     if deparsed.is_null() {
         return None;
     }
-    let sql = std::ffi::CStr::from_ptr(deparsed).to_string_lossy().into_owned();
+    let sql = std::ffi::CStr::from_ptr(deparsed)
+        .to_string_lossy()
+        .into_owned();
     if sql.trim().is_empty() {
         return None;
     }

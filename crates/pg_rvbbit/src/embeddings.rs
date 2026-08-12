@@ -265,7 +265,11 @@ fn apply_mode_prefix(text: &str, mode: &str, model: &str) -> String {
     format!("{prefix}{text}")
 }
 
-pub(crate) fn embed_one(text: &str, specialist_name_arg: &str, mode: &str) -> Result<Vec<f32>, String> {
+pub(crate) fn embed_one(
+    text: &str,
+    specialist_name_arg: &str,
+    mode: &str,
+) -> Result<Vec<f32>, String> {
     let spec = resolve_specialist(specialist_name_arg)?;
     let model = spec_model(&spec);
     // Prefix BEFORE hashing: the cache key and the bytes sent to the model agree,

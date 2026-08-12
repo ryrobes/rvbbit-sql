@@ -9,3 +9,4 @@ sqlglot>=28.10,<29
 python-multipart>=0.0.18
 playwright>=1.49
 cryptography>=42
+numpy>=2.0,<3

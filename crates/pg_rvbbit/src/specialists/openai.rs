@@ -6,7 +6,7 @@
 //!
 //! Wire format (request):
 //!   POST {endpoint_url}
-//!   {"input": [text1, text2, ...], "model": "<from transport_opts>"}
+//!   {"input": [text1, text2, ...], "model": "<optional transport_opts model>"}
 //!
 //! Wire format (response):
 //!   200 OK
@@ -17,7 +17,9 @@
 //!
 //! User catalog wiring expects `inputs.text` (per row); the transport packs
 //! the per-row texts into the OpenAI `input` array. Other input keys are
-//! ignored. The model name lives in `transport_opts.model`.
+//! ignored. When present, the model name lives in `transport_opts.model`;
+//! when absent it is omitted so a managed endpoint can apply its canonical
+//! embedding alias.
 //!
 //! Chat completions are intentionally NOT covered by this transport —
 //! that overlaps with the LLM provider abstraction in providers.rs.
@@ -40,7 +42,8 @@ impl OpenAiEmbeddingsTransport {
 #[derive(Serialize)]
 struct OaiEmbedRequest<'a> {
     input: Vec<&'a str>,
-    model: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<&'a str>,
 }
 
 #[derive(Deserialize)]
@@ -71,16 +74,7 @@ impl Transport for OpenAiEmbeddingsTransport {
         spec: &SpecialistSpec,
         inputs: &[Value],
     ) -> Result<SpecialistResponse, ProviderError> {
-        let model = spec
-            .transport_opts
-            .get("model")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                ProviderError::Config(format!(
-                    "specialist '{}': transport_opts.model is required for openai transport",
-                    spec.name
-                ))
-            })?;
+        let model = spec.transport_opts.get("model").and_then(|v| v.as_str());
 
         // Pull text out of each input. Convention: `inputs.text` is the
         // string to embed. Any other input fields are ignored.
@@ -169,5 +163,33 @@ impl Transport for OpenAiEmbeddingsTransport {
             usage: Vec::new(),
             latency_ms,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OaiEmbedRequest;
+
+    #[test]
+    fn request_omits_model_when_endpoint_owns_the_default_alias() {
+        let request = OaiEmbedRequest {
+            input: vec!["one", "two"],
+            model: None,
+        };
+        let value = serde_json::to_value(request).expect("serialize embedding request");
+
+        assert_eq!(value["input"], serde_json::json!(["one", "two"]));
+        assert!(value.get("model").is_none());
+    }
+
+    #[test]
+    fn request_preserves_an_explicit_model_for_other_openai_endpoints() {
+        let request = OaiEmbedRequest {
+            input: vec!["one"],
+            model: Some("text-embedding-3-small"),
+        };
+        let value = serde_json::to_value(request).expect("serialize embedding request");
+
+        assert_eq!(value["model"], "text-embedding-3-small");
     }
 }

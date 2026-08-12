@@ -1,0 +1,50 @@
+api_version: rvbbit.capability/v1
+kind: runtime_sidecar
+name: dlt_mirror
+title: dlt SQL Mirror Worker
+description: "Canonical-credential SQL database mirroring into RVBBIT-registered Postgres heap tables."
+license: apache-2.0
+system_runtime: true
+capability_role: data_mover
+tags: [runtime, data-mover, mirror, dlt, postgres, mysql, mssql, oracle, db2, cpu, system-runtime]
+source:
+  provider: github
+  model: dlt-hub/dlt
+  revision: 1.29.1
+runtime:
+  template: dlt-mirror
+  language: data_mover
+  handler: dlt_mirror
+  device: cpu
+  port: 9182
+  health_path: /health
+  env:
+    RVBBIT_DSN: "${RVBBIT_MIRROR_CONTROL_DSN:-${RVBBIT_DSN:-postgresql://postgres:rvbbit@postgres:5432/rvbbit}}"
+    RVBBIT_MIRROR_TOKEN: ${RVBBIT_MIRROR_TOKEN:-}
+    RVBBIT_MIRROR_STATE_DIR: /var/lib/rvbbit/dlt
+    RVBBIT_MIRROR_POLL_SECONDS: ${RVBBIT_MIRROR_POLL_SECONDS:-5}
+    RVBBIT_MIRROR_HEARTBEAT_SECONDS: ${RVBBIT_MIRROR_HEARTBEAT_SECONDS:-30}
+    RVBBIT_MIRROR_STALE_SECONDS: ${RVBBIT_MIRROR_STALE_SECONDS:-1800}
+    RVBBIT_MIRROR_MAX_ATTEMPTS: ${RVBBIT_MIRROR_MAX_ATTEMPTS:-5}
+    LOAD__TRUNCATE_STAGING_DATASET: "true"
+  volumes:
+    - name: dlt_mirror_state
+      mount: /var/lib/rvbbit/dlt
+runtime_registration:
+  name: dlt_mirror
+  language: data_mover
+  endpoint_path: /
+  set_default: false
+  labels:
+    language: data_mover
+    capability_kind: runtime_sidecar
+    capability_role: data_mover
+    runtime_handler: dlt_mirror
+    system_runtime: true
+warren:
+  endpoint_path: /
+  health_path: /health
+smoke:
+  sql:
+    - "SELECT name, endpoint_url, status FROM rvbbit.python_runtimes WHERE name = 'dlt_mirror';"
+    - "SELECT to_regclass('rvbbit.mirror_jobs') IS NOT NULL AS mirror_control_plane_ready;"

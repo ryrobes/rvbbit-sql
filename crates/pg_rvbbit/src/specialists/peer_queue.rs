@@ -90,7 +90,12 @@ impl Transport for PeerQueueTransport {
 
         let mut outputs = Vec::with_capacity(inputs.len());
         for input in inputs {
-            outputs.push(dispatch_one(&mut client, &backend_name, input, spec.timeout_ms)?);
+            outputs.push(dispatch_one(
+                &mut client,
+                &backend_name,
+                input,
+                spec.timeout_ms,
+            )?);
         }
 
         let latency_ms = t0.elapsed().as_millis().min(i32::MAX as u128) as i32;

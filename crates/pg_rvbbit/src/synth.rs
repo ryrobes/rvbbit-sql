@@ -78,10 +78,7 @@ fn infer_schema(rows: &[Value]) -> Vec<(String, String)> {
 
 /// Distinct values of low-cardinality text columns (sorted), for the prompt and
 /// the shape key. Columns with > LOW_CARD_MAX distinct values are omitted.
-fn distinct_profile(
-    rows: &[Value],
-    schema: &[(String, String)],
-) -> serde_json::Map<String, Value> {
+fn distinct_profile(rows: &[Value], schema: &[(String, String)]) -> serde_json::Map<String, Value> {
     let mut out = serde_json::Map::new();
     for (col, ty) in schema {
         if ty != "text" {
@@ -211,7 +208,10 @@ fn extract_sql(raw: &str) -> Option<String> {
     }
     let mut s = trimmed;
     if s.starts_with("```") {
-        s = s.trim_start_matches("```sql").trim_start_matches("```").trim();
+        s = s
+            .trim_start_matches("```sql")
+            .trim_start_matches("```")
+            .trim();
         if let Some(idx) = s.rfind("```") {
             s = s[..idx].trim();
         }
@@ -268,7 +268,11 @@ pub(crate) fn run_synth_sql_op(
         inputs.insert("_table_row_count".into(), json!(rows.len()));
         inputs.insert(
             "_last_sql_error".into(),
-            json!(if attempt == 0 { String::new() } else { last_err.clone() }),
+            json!(if attempt == 0 {
+                String::new()
+            } else {
+                last_err.clone()
+            }),
         );
         let inputs_v = Value::Object(inputs);
 
@@ -341,7 +345,14 @@ fn synth_put(operator: &str, prompt: &str, sample_rows: JsonB, generated_sql: &s
     let distinct = distinct_profile(&r, &schema);
     let shape_fp = fingerprint(&schema, &distinct);
     let p_hash = prompt_key(operator, prompt);
-    synth_cache_put(operator, &shape_fp, &p_hash, generated_sql, &json!({}), true);
+    synth_cache_put(
+        operator,
+        &shape_fp,
+        &p_hash,
+        generated_sql,
+        &json!({}),
+        true,
+    );
     shape_fp
 }
 
@@ -422,7 +433,10 @@ fn extract_scalar_expr(raw: &str) -> Option<String> {
     }
     let mut s = t;
     if s.starts_with("```") {
-        s = s.trim_start_matches("```sql").trim_start_matches("```").trim();
+        s = s
+            .trim_start_matches("```sql")
+            .trim_start_matches("```")
+            .trim();
         if let Some(i) = s.rfind("```") {
             s = s[..i].trim();
         }
@@ -470,7 +484,11 @@ pub(crate) fn run_synth_sql_scalar(op: &OpDef, inputs: &Value, opts: &Value) -> 
     let fallback = || value.to_string();
 
     // L1 (in-memory) then L2 (synth_cache).
-    if let Some(expr) = scalar_cache().lock().ok().and_then(|m| m.get(&key).cloned()) {
+    if let Some(expr) = scalar_cache()
+        .lock()
+        .ok()
+        .and_then(|m| m.get(&key).cloned())
+    {
         return apply_scalar(&expr, value).unwrap_or_else(|_| fallback());
     }
     if let Some(expr) = synth_cache_get(&op.name, &shape, &p_hash) {
@@ -491,7 +509,11 @@ pub(crate) fn run_synth_sql_scalar(op: &OpDef, inputs: &Value, opts: &Value) -> 
         llm.insert("example".into(), json!(example));
         llm.insert(
             "_last_sql_error".into(),
-            json!(if attempt == 0 { String::new() } else { last_err.clone() }),
+            json!(if attempt == 0 {
+                String::new()
+            } else {
+                last_err.clone()
+            }),
         );
         let raw = match crate::operators::invoke_with_cache(op, &Value::Object(llm), opts) {
             Ok(r) => r,
@@ -514,7 +536,14 @@ pub(crate) fn run_synth_sql_scalar(op: &OpDef, inputs: &Value, opts: &Value) -> 
         }
         match (apply_scalar(&expr, &example), apply_scalar(&expr, value)) {
             (Ok(_), Ok(out)) => {
-                synth_cache_put(&op.name, &shape, &p_hash, &expr, &json!({ "kind": "scalar", "attempts": attempt + 1 }), false);
+                synth_cache_put(
+                    &op.name,
+                    &shape,
+                    &p_hash,
+                    &expr,
+                    &json!({ "kind": "scalar", "attempts": attempt + 1 }),
+                    false,
+                );
                 if let Ok(mut m) = scalar_cache().lock() {
                     m.insert(l1_key(&op.name, &shape, &p_hash), expr);
                 }
@@ -546,7 +575,14 @@ fn value_shape(value: &str) -> String {
 fn synth_put_scalar(operator: &str, intent: &str, example_value: &str, expr: &str) -> String {
     let shape = scalar_shape(example_value);
     let p_hash = prompt_key(operator, intent);
-    synth_cache_put(operator, &shape, &p_hash, expr, &json!({ "kind": "scalar" }), true);
+    synth_cache_put(
+        operator,
+        &shape,
+        &p_hash,
+        expr,
+        &json!({ "kind": "scalar" }),
+        true,
+    );
     clear_scalar_cache();
     shape
 }
@@ -591,8 +627,15 @@ pub(crate) fn is_single_statement(sql: &str) -> bool {
 /// same context — and thus the same synth_cache key. Returns "" when the catalog is
 /// absent/empty (caller falls back to information_schema).
 fn retrieve_catalog_context(intent: &str, k: i32) -> String {
-    let sql = format!("SELECT rvbbit._synth_retrieve('{}', {})", esc(intent), k.max(1));
-    Spi::get_one::<String>(&sql).ok().flatten().unwrap_or_default()
+    let sql = format!(
+        "SELECT rvbbit._synth_retrieve('{}', {})",
+        esc(intent),
+        k.max(1)
+    );
+    Spi::get_one::<String>(&sql)
+        .ok()
+        .flatten()
+        .unwrap_or_default()
 }
 
 /// Fallback schema context when the catalog has not been crawled: one compact line
@@ -612,9 +655,14 @@ pub(crate) fn information_schema_context(max_tables: i32) -> String {
             LIMIT {max_tables} \
          ) s",
     );
-    pgrx::PgTryBuilder::new(move || Spi::get_one::<String>(&sql).ok().flatten().unwrap_or_default())
-        .catch_others(|_| String::new())
-        .execute()
+    pgrx::PgTryBuilder::new(move || {
+        Spi::get_one::<String>(&sql)
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+    })
+    .catch_others(|_| String::new())
+    .execute()
 }
 
 /// Assemble the schema context for a prompt. Prefers the crawled catalog
@@ -674,7 +722,10 @@ pub(crate) fn run_synth_query_sql(
         .and_then(|v| v.as_i64())
         .unwrap_or(DEFAULT_RETRIEVE_K as i64) as i32)
         .max(1);
-    let validate = opts.get("validate").and_then(|v| v.as_bool()).unwrap_or(true);
+    let validate = opts
+        .get("validate")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
 
     let (schema_context, grounded) = build_schema_context(intent, k);
     if schema_context.trim().is_empty() {
@@ -700,7 +751,11 @@ pub(crate) fn run_synth_query_sql(
         inputs.insert("_schema_context".into(), json!(schema_context));
         inputs.insert(
             "_last_sql_error".into(),
-            json!(if attempt == 0 { String::new() } else { last_err.clone() }),
+            json!(if attempt == 0 {
+                String::new()
+            } else {
+                last_err.clone()
+            }),
         );
         let inputs_v = Value::Object(inputs);
 
@@ -749,7 +804,10 @@ pub(crate) fn run_synth_query_sql(
     // Validation never passed: hand back the best-effort generation (visibly marked,
     // NOT cached) so the user can see and fix it, rather than nothing.
     if !last_sql.is_empty() {
-        Ok((format!("-- synth: unvalidated ({last_err})\n{last_sql}"), json!([])))
+        Ok((
+            format!("-- synth: unvalidated ({last_err})\n{last_sql}"),
+            json!([]),
+        ))
     } else {
         Err(format!(
             "synth: no SQL after {MAX_QUERY_ATTEMPTS} attempts: {last_err}"
@@ -770,7 +828,11 @@ fn capture_schema(sql: &str) -> Value {
 }
 
 /// Read the cached generated SQL + its result schema for a query-synth key.
-fn synth_cache_get_query(operator: &str, shape_fp: &str, prompt_hash: &str) -> Option<(String, Value)> {
+fn synth_cache_get_query(
+    operator: &str,
+    shape_fp: &str,
+    prompt_hash: &str,
+) -> Option<(String, Value)> {
     let sql = format!(
         "SELECT generated_sql, coalesce(result_schema, '[]'::jsonb) FROM rvbbit.synth_cache \
          WHERE operator = '{}' AND shape_fingerprint = '{}' AND prompt_hash = '{}' AND status = 'valid'",

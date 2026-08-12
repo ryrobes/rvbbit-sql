@@ -1,0 +1,21 @@
+name: rvbbit-clover-edge
+
+# TLS edge for the centrally hosted Clover/Hutch API. Hutch keeps its existing
+# host-network listener on 8090 during migration; Caddy owns 80/443 and obtains
+# the certificate for clover.rvbb.it automatically.
+services:
+  caddy:
+    image: caddy@sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648
+    container_name: rvbbit-clover-edge
+    network_mode: host
+    volumes:
+      - ./clover/Caddyfile:/etc/caddy/Caddyfile:ro
+      - clover_edge_data:/data
+      - clover_edge_config:/config
+    restart: unless-stopped
+
+volumes:
+  clover_edge_data:
+    name: rvbbit_clover_edge_data
+  clover_edge_config:
+    name: rvbbit_clover_edge_config

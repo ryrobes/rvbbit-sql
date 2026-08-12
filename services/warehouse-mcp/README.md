@@ -16,7 +16,7 @@ read-only connection** — per-user role scoping is Phase 1.
 | `metric(name, params?, as_of?, def_as_of?)` | a governed scalar number (bitemporal) | `rvbbit.metric_scalar()` |
 | `cube_pivot(cube, rows?, cols?, measures?)` | direct grouped table or crosstab; accepts multiple dimensions and aggregated numeric values without requiring a metric definition | validated, read-only `cubes.<name>` aggregation |
 | `validate_sql(sql, as_of?)` | plan, **don't execute** (self-correct loop) | `route_explain` |
-| `run_sql(sql, as_of?, limit?)` | **read-only** execute (validate → safe_select gate → run) | engine |
+| `run_sql(sql, as_of?, limit?, default_view='table')` | **read-only** execute (validate → safe_select gate → run); `default_view='chart'` is an explicit presentation intent | engine |
 
 `as_of` (data-time) flows in as the engine's `-- rvbbit: as_of <ts>` directive; the
 read-only guard rejects anything that isn't a `safe_select`.
@@ -58,6 +58,42 @@ python server.py --http        # serves http://0.0.0.0:8765/mcp  (/health is ope
 python server.py --selftest    # exercise every tool against the warehouse
 python server.py               # stdio (local Claude Code only)
 ```
+
+### Business Topology workflow worker
+
+Warehouse MCP also owns the standing executor for durable Business Topology
+excavations. PostgreSQL owns the job, lease, progress, and final status; this
+process owns only the resumable private work artifacts and bounded model calls.
+It starts automatically in both HTTP and stdio modes once migration `0285` is
+installed. On an older database it waits quietly and begins polling after the
+database is upgraded.
+
+```bash
+# Defaults shown; the Docker image stores this under the existing /app/data volume.
+export WAREHOUSE_BUSINESS_TOPOLOGY_WORKER=1
+# Optional: use a private executor role when WAREHOUSE_DSN is read-only.
+export WAREHOUSE_BUSINESS_TOPOLOGY_DSN='postgresql://topology_worker:...@postgres/rvbbit'
+export WAREHOUSE_BUSINESS_TOPOLOGY_DIR=/app/data/business-topology
+export WAREHOUSE_BUSINESS_TOPOLOGY_POLL_SECONDS=2
+export WAREHOUSE_BUSINESS_TOPOLOGY_LEASE_SECONDS=300
+```
+
+The optional executor DSN is important when the public Warehouse MCP connection
+uses `warehouse_reader`: a complete excavation needs caller-readable access to
+its source relations plus permission to lease/update workflow rows, resolve the
+registered Hutch backend, and stage proposal bundles. Keep that credential
+appliance-internal; it is never exposed through the MCP endpoint or DataRabbit.
+
+For a source checkout, run from this repository so the shared
+`bench/business_topology` package is available. The release image embeds that
+package and needs no extra sidecar. Start a complete run with:
+
+```sql
+SELECT rvbbit.business_topology_start_workflow();
+```
+
+See [`docs/BUSINESS_TOPOLOGY.md`](../../docs/BUSINESS_TOPOLOGY.md) for scoped
+starts, status inspection, cancellation, and the proposal-only safety boundary.
 
 ### Make it remotely reachable (no open ports, no exposed Postgres)
 Run `--http` **next to the warehouse** (DB over localhost) and expose only the MCP
@@ -353,6 +389,15 @@ The value is a comma-separated list and is a one-way, idempotent enrollment path
 administrator adds durable replacements through Calliope, remove the environment value
 before removing that bootstrap member; otherwise the next service restart will restore it.
 
+For the hosted first boot, set `WAREHOUSE_TEAM_BOOTSTRAP_ADMINS` and
+`WAREHOUSE_ALLOWED_EMAILS` to the same one exact address, then open
+`/calliope/setup`. The setup notebook reports whether that session was verified by Google or
+Postgres, constrained by the exact one-email bootstrap, or is still on the weaker shared-
+password path. It then runs managed-service preflight, reviews the durable company profile,
+guides the first dlt mirror, requires a human-verified local query result, and records final
+launch approval. Google Workspace delegation, documents, and MCP services remain optional
+projects after launch. See `docs/HOSTED_APPLIANCE_BOOTSTRAP.md` for the complete contract.
+
 ## Artifact access and lifecycle
 
 Newly published artifacts are private to their verified human owner. Existing artifacts
@@ -496,7 +541,12 @@ rail, a newest-first living artifact record, and chat. Hermes owns the agent run
 its current/default profile and shared company memory; the warehouse stores only the
 email-owned UI index, mirrored turn prose, image attachments, and immutable projections
 of MCP results. Queries, KPI timelines, dashboards, apps, and downloadable documents
-appear as stage surfaces linked back to their source message. Visual-validation captures
+appear as stage surfaces linked back to their source message.
+Ordinary query results are table-only on the Stage—even when they contain numeric columns.
+Calliope must deliberately request `default_view='chart'` for a chart-shaped query before
+the Chart view exists; identifiers and incidental numeric fields never trigger visualization.
+Explicit chart queries retain Table and SQL as inspectable companion views.
+Visual-validation captures
 are retained as exact-version companions to their live artifact rather than duplicated
 as a second Stage card. The artifact's **Markup** action reuses that companion—or renders
 one on demand—so pen, arrow, box, and optional selected-element targets annotate the same
@@ -689,14 +739,40 @@ cannot fail invisibly. Pausing, resuming, running now, disabling, unpublishing, 
 also updates or removes the corresponding Hermes job. No additional environment variables
 are required beyond the normal Calliope/Hermes setup.
 
+Personal scheduled work uses the lighter **Assigned to Callie** surface inside Work Inbox.
+It is intentionally different from a Workflow: a person describes an outcome and a time or
+cadence in an ordinary notebook, Calliope saves a private draft, and only that person can
+activate its managed schedule. The durable work order—not the Hermes cron record—is the
+source of truth. Hermes only wakes it; each occurrence validates the exact job and definition
+binding, snapshots the approved instruction and inert context, and creates a fresh private
+run notebook. Assignment runs collect under one collapsible group in **Runs**, so repeated
+checks do not crowd ordinary Chats.
+
+Every result remains inspectable in its run notebook. Work Inbox is the attention layer, not
+the job database: its default `attention` policy delivers failures, blockers, requested
+attention, and meaningful changes while suppressing healthy unchanged checks. `always`,
+`failure`, and `never` policies are also explicit. Headless assignments default to
+`read_only`; `propose_changes` may recommend a mutation but still cannot perform one without
+a human. Overlapping occurrences are skipped. If Hermes reaches a terminal execution state
+without the required finish receipt, Calliope fails the saved run closed and publishes a
+diagnostic handoff instead of leaving it permanently active.
+
+For accurate per-user MCP attribution, the trusted Warehouse MCP entry in Hermes should use
+`forward_session_identity: true`. Cron provenance forwards only the opaque Hermes session id,
+never an asserted human email; Warehouse joins that session or managed job back to its own
+user-owned work-order ledger. The tables deliberately retain broader assignee, trigger, and
+execution primitives so future human todos, reminders, and Workflow-backed assignments can
+share this lifecycle without turning the first version into a generic project-management UI.
+
 The header's **Library** control is an outcome-oriented front door to the SQL-first
 administration and capability catalog. People can search for goals such as “use Linear in
 my Brief” instead of knowing an MCP server, Brain provider, or catalog capability by name.
 Each result exposes what it unlocks, its current requirements, and one of two paths:
 guided actions seed a fresh Calliope notebook with a structured contract, while typed
-actions use a bounded native form. Typed changes always produce an immutable plan first;
-**Apply change** is a separate human approval and records progress through apply, probe,
-verify, and receipt steps. Receipts retain redacted inputs and rollback guidance, and can
+actions use a bounded native form. An authenticated Admins Team member applies and verifies
+a typed appliance change in one submit; the durable redacted plan is retained as its audit
+receipt rather than presented as a separate approval gate. Receipts record apply, probe,
+verify, redacted inputs, and rollback guidance, and can
 be reopened from both the Library and the Calliope stage. Guided notebooks are collected
 under the **Actions** tab in the session rail. Grouping is derived from their durable
 Library handoff surface, so ordinary conversations that merely use an action remain under
@@ -704,24 +780,51 @@ Library handoff surface, so ordinary conversations that merely use an action rem
 
 Workflow readiness links missing declared requirements directly to matching Library
 actions. A successful repair returns to the blocked Workflow and reruns its side-effect-free
-readiness check. In this first version, authenticated organization members are trusted to
-use the Library; the eventual unified role and policy system is intentionally not modeled
-piecemeal here.
+readiness check. Ordinary organization actions retain the trusted-appliance boundary.
+Company-wide mirror controls and MCP credential changes are narrower: they are generated
+only for protected Admins Team members and recheck that membership at execution
+time, without introducing per-source or per-connector roles.
 
-MCP credentials never enter a Calliope prompt or PostgreSQL. Secret fields are password
-controls whose values are sent only with the explicit apply request, immediately cleared
-in the browser, and forwarded to the MCP gateway's encrypted secret route. Existing saved
-secret names may be shown, but values are never returned. Set the same
+MCP credentials never enter a Calliope prompt. Secret fields are password controls whose
+values are sent only with the direct native execution request, immediately cleared in the browser,
+and forwarded to the MCP gateway's secret route. The gateway writes canonical encrypted
+credential envelopes to PostgreSQL when migration 0286 and the independent RVBBIT
+credential wrapping key are available; its older encrypted file is a migration fallback.
+Existing saved secret references may be shown, but values are never returned. Set the same
 `RVBBIT_GATEWAY_TOKEN` on PostgreSQL, Warehouse, Warren, and the MCP gateway in deployed
 environments; `MCP_GATEWAY_URL` can override endpoint discovery when needed. An absent
 required credential or an unavailable gateway fails the action closed before activation.
+Registered MCP servers also receive an admin-only credential action for named add/rotation
+and revocation. Its receipt freezes the current canonical version and status; the gateway locks
+and compares that revision before writing so a stale request cannot overwrite a newer
+change. Rotation actively probes the server after cache eviction. The value remains absent
+from the receipt, model tool call, action run, Stage surface, and error text.
+Revocation retains a versioned row with no ciphertext, which prevents a legacy
+same-named process-environment fallback from silently becoming active after restart.
+
+Database mirror jobs appear in Library inventory as local dlt control-plane objects. Their
+admin-only actions can run now, retry the exact latest failed receipt, pause future runs,
+resume, or change cadence. Every action freezes the observed job and latest-run revision,
+uses the existing dlt queue, and verifies the resulting local job/run receipt. Neither
+Hermes nor a direct assistant connection contacts the production source database.
+
+An authenticated Admins Team member can also ask Calliope to perform appliance-local DBA
+work through `administer_local_sql` when no narrower typed action exists. Ordinary analysis
+continues to use read-only `run_sql`. One `SELECT`/`WITH`-shaped administration statement
+runs directly on the writable local connection, which intentionally includes RVBBIT table
+functions that update settings, catalogs, operators, or acceleration metadata. Explicit
+DDL/DML/CALL/DO/GRANT/REVOKE first creates a durable receipt containing the exact SQL and
+SHA-256 hash; Calliope must show it and wait for explicit approval before executing that
+receipt. The lane rejects multiple statements, credential-shaped literals, host filesystem
+access, instance roles/databases, foreign servers, and dblink. Remote source databases remain
+exclusive to the dlt mirror controller.
 
 The Library's **Connect a custom MCP server** action exposes the same generic RVBBIT
 connection path for servers that are not in `capability_catalog`. It supports streamable
 HTTP (no authentication or one Bearer token) and stdio executables that run on the MCP
 gateway host/container. Stdio arguments are an explicit array rather than a shell command;
 non-secret environment values stay in the registration while `${NAME}` values resolve from
-the gateway's secret store. Apply registers the reviewed transport, calls
+the gateway's canonical-backed in-memory cache. Apply registers the reviewed transport, calls
 `refresh_mcp_server` to introspect live tools and resources, generates both per-tool typed
 functions such as `server_name.tool_name(...)` and optional RVBBIT operators, then runs an
 active probe and records the resulting counts. The universal fallback remains
@@ -788,17 +891,25 @@ fallback audio and does not persist it.
 
 Spoken responses are an independent, opt-in browser preference in the shared
 **Appearance** dialog. **Off** is the default. **Fast** rewrites each newly completed
-answer into a factual two- or three-sentence spoken digest and streams it through
+answer into a concise, complete spoken digest and streams it through
 ElevenLabs Flash without performance tags or personality direction. **Expressive** uses
 the same factual boundary while letting the browser-local speaking personality materially
 shape wording, cadence, punctuation, and open-ended audible v3 performance tags before
 synthesizing with ElevenLabs v3.
+The semantic rewrite calls Clover's `calliope` chat model directly with the appliance's
+managed Clover credential. It never uses the short-form `rvbbit.clover_llm_apply` operator,
+falls through to `rvbbit.summarize`, or assumes an appliance-local OpenRouter credential.
+Warehouse sends no `max_tokens` value. Concision is semantic guidance, not a word, sentence,
+character, source, or expression-tag cutoff: Warehouse preserves the complete Clover rewrite,
+and if Clover reports a length stop or cannot produce one, uses the complete canonical answer
+rather than accepting partial output. The rewrite is not sanitized or reshaped afterward; only
+transport-invalid control bytes are removed before synthesis.
 The full assistant answer remains canonical and unchanged in the turn record. While voice
-is enabled, the conversation displays the concise spoken cut and the small Voice control
+is enabled, the conversation displays the spoken rendering and the small Voice control
 opens the complete answer; switching voice off restores the complete answer directly in
 chat. The latest derived script and non-secret render metadata live under that turn's
 response receipt for reload-safe replay and debugging. The optional speaking-personality
-text lives only in browser storage. Warehouse sends it transiently as bounded performance
+text lives only in browser storage. Warehouse sends it transiently as performance
 direction and retains only its hash. Provider credentials remain server-side. The timed
 ElevenLabs stream supplies per-character alignment alongside PCM, so the browser decorates
 each word as it is spoken; a cadence estimate is used only when alignment is absent. Audio
@@ -1075,7 +1186,9 @@ No `rvbbitQuery`/metric found ⇒ flagged `materialized` (a "dead tree" — nudg
 `WAREHOUSE_SCHEMAS` (CSV allowlist; default = all but rvbbit/pg_*) ·
 `WAREHOUSE_ROW_CAP` (1000) · `WAREHOUSE_STMT_TIMEOUT_MS` (30000) ·
 `WAREHOUSE_CUBE_PIVOT_CELL_CAP` (2500) ·
-`WAREHOUSE_MCP_HOST` (0.0.0.0) · `WAREHOUSE_MCP_PORT` (8765)
+`WAREHOUSE_MCP_HOST` (0.0.0.0) · `WAREHOUSE_MCP_PORT` (8765) ·
+`WAREHOUSE_MCP_ALLOWED_HOSTS` (optional CSV additions to the protected HTTP Host
+allowlist; loopback and the packaged `warehouse-mcp` service names are built in)
 **OAuth mode:** `WAREHOUSE_PUBLIC_URL` (enables it) · `WAREHOUSE_LOGIN_PASSWORD` (req) ·
 `WAREHOUSE_JWT_SECRET` (req, ≠ MCP_KEY) · `WAREHOUSE_ALLOWED_EMAILS` (opt) ·
 `WAREHOUSE_ACCESS_TTL` (3600) · `WAREHOUSE_REFRESH_TTL` (30d) ·
@@ -1098,6 +1211,8 @@ opt-in for private/local Design Profile URL references) ·
 `WAREHOUSE_CALLIOPE_EXPORT_ROOTS` (OS-path-separated allowed Hermes output roots) ·
 `WAREHOUSE_CALLIOPE_MAX_EXPORT_BYTES` (128 MiB default, 512 MiB ceiling; in uber
 Compose set the single shared host path with `WAREHOUSE_CALLIOPE_EXPORT_DIR`) ·
+`WAREHOUSE_BRAIN_IMPORT_ROOTS` (OS-path-separated server-local roots allowed for
+explicit folder ingestion; default `/app/data/brain-imports`, filesystem root is always rejected) ·
 `WAREHOUSE_CALLIOPE_DREAMS` (`1` by default) ·
 `WAREHOUSE_CALLIOPE_DREAM_EVIDENCE_LAB` (`1` by default) ·
 `WAREHOUSE_CALLIOPE_DREAM_SQL_ROLE` (optional least-privilege PostgreSQL role) ·

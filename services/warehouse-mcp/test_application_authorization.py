@@ -18,6 +18,23 @@ import auth  # noqa: E402
 import server  # noqa: E402
 
 
+def test_mcp_dns_rebinding_protection_allows_named_appliance_peers(monkeypatch):
+    monkeypatch.delenv("WAREHOUSE_MCP_ALLOWED_HOSTS", raising=False)
+    settings = server._mcp_transport_security()
+
+    assert settings.enable_dns_rebinding_protection is True
+    assert "warehouse-mcp:*" in settings.allowed_hosts
+    assert "rvbbit-warehouse-mcp:*" in settings.allowed_hosts
+    assert "*" not in settings.allowed_hosts
+
+    monkeypatch.setenv("WAREHOUSE_MCP_ALLOWED_HOSTS", "warehouse.internal:8765")
+    public_settings = server._mcp_transport_security("https://calliope.example")
+    assert "calliope.example" in public_settings.allowed_hosts
+    assert "calliope.example:*" in public_settings.allowed_hosts
+    assert "warehouse.internal:8765" in public_settings.allowed_hosts
+    assert "https://calliope.example" in public_settings.allowed_origins
+
+
 def _context(
     email="person@example.com",
     *,
@@ -377,6 +394,8 @@ def test_activity_receipt_persists_actor_subject_and_delegation(monkeypatch):
         None,
         "google_chat_delegation",
         "google_chat",
+        None,
+        None,
     )
     assert len(activity_inserts) == 1
     query, params = activity_inserts[0]

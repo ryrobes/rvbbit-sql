@@ -1,0 +1,34 @@
+_config_version: 34
+
+model:
+  default: calliope
+  provider: custom
+  base_url: "${env:RVBBIT_CLOVER_OPENAI_BASE_URL}"
+  api_key: "${env:RVBBIT_CLOVER_KEY}"
+
+memory:
+  memory_enabled: true
+  user_profile_enabled: true
+  write_approval: false
+  provider: hindsight
+  memory_char_limit: 2200
+  user_char_limit: 1375
+  nudge_interval: 10
+  flush_min_turns: 6
+
+platforms:
+  api_server:
+    enabled: true
+    extra:
+      host: 0.0.0.0
+      port: 8642
+      model_name: calliope
+
+mcp_servers:
+  Warehouse:
+    url: http://warehouse-mcp:8765/mcp
+    headers:
+      Authorization: "Bearer ${env:WAREHOUSE_HERMES_MCP_KEY}"
+    forward_session_identity: true
+    supports_parallel_tool_calls: true
+    timeout: 300

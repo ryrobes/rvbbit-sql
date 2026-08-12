@@ -4,7 +4,7 @@ const baseURL = process.env.WAREHOUSE_TEST_URL || "http://127.0.0.1:8766";
 const password = process.env.WAREHOUSE_TEST_LOGIN_PASSWORD || "";
 test.use({ launchOptions: { executablePath: process.env.PLAYWRIGHT_CHROMIUM_PATH || "/usr/bin/chromium" } });
 
-test("Action Library plans, applies, verifies, and remediates a Workflow", async ({ page }) => {
+test("Action Library directly applies, verifies, and remediates a Workflow", async ({ page }) => {
   test.skip(!password, "WAREHOUSE_TEST_LOGIN_PASSWORD is required for the local authenticated UI test");
   await page.setViewportSize({ width: 1440, height: 1000 });
   await page.goto(`${baseURL}/login?next=/calliope`);
@@ -44,16 +44,10 @@ test("Action Library plans, applies, verifies, and remediates a Workflow", async
       + "now() AS occurred_at, "
       + "'A source document created by the typed Action Library smoke test.'::text AS body",
   );
-  const planned = page.waitForResponse((response) => response.url().endsWith("/admin.brain_query_source/plan") && response.status() === 201);
+  const applied = page.waitForResponse((response) => response.url().endsWith("/admin.brain_query_source/execute") && response.status() === 200);
   await page.locator("#action-create-plan").click();
-  await planned;
-  await expect(page.locator("#action-plan")).toBeVisible();
-  await expect(page.locator("#action-plan-status")).toHaveText("Awaiting approval");
-  await expect(page.locator("#action-plan-steps .action-plan-step")).toHaveCount(5);
-
-  const applied = page.waitForResponse((response) => response.url().includes("/api/calliope/action-runs/") && response.url().endsWith("/execute"));
-  await page.locator("#action-apply").click();
   await applied;
+  await expect(page.locator("#action-plan")).toBeVisible();
   await expect(page.locator("#action-plan-status")).toHaveText("Verified", { timeout: 20_000 });
   await expect(page.locator("#action-plan-steps .action-plan-step.complete")).toHaveCount(5);
   await expect(page.locator("#action-detail-note")).toContainText("Applied and verified");

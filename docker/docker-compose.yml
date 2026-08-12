@@ -67,6 +67,10 @@ services:
     environment:
       POSTGRES_PASSWORD: rvbbit
       POSTGRES_DB: bench
+      RVBBIT_CREDENTIAL_KEY: ${RVBBIT_CREDENTIAL_KEY:-}
+      RVBBIT_CREDENTIAL_KEYS: ${RVBBIT_CREDENTIAL_KEYS:-}
+      RVBBIT_CREDENTIAL_KEY_FILE: ${RVBBIT_CREDENTIAL_KEY_FILE:-}
+      RVBBIT_CREDENTIAL_KEYS_FILE: ${RVBBIT_CREDENTIAL_KEYS_FILE:-}
       # Pass through OpenRouter API key for semantic operators (R5+).
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
       # Optional direct provider keys. These are env var names referenced

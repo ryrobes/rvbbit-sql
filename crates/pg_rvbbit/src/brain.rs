@@ -29,8 +29,15 @@ fn jsonb_lit(v: &Value) -> String {
 /// Sync one remote source: trigger its connector, extract new/changed files, reconcile.
 #[pg_extern]
 fn brain_sync_source(p_source_id: i64, p_trigger: default!(String, "'manual'")) -> JsonB {
-    let trigger = if p_trigger.trim().is_empty() { "manual".to_string() } else { p_trigger };
-    JsonB(sync_one(p_source_id, &trigger).unwrap_or_else(|e| json!({"source_id": p_source_id, "error": e})))
+    let trigger = if p_trigger.trim().is_empty() {
+        "manual".to_string()
+    } else {
+        p_trigger
+    };
+    JsonB(
+        sync_one(p_source_id, &trigger)
+            .unwrap_or_else(|e| json!({"source_id": p_source_id, "error": e})),
+    )
 }
 
 /// Sync every enabled connector-backed source. Manual/local Brain collections
@@ -38,7 +45,11 @@ fn brain_sync_source(p_source_id: i64, p_trigger: default!(String, "'manual'")) 
 /// not make an unrelated manual source look remotely refreshable.
 #[pg_extern]
 fn brain_sync_sources(p_trigger: default!(String, "'auto'")) -> JsonB {
-    let trigger = if p_trigger.trim().is_empty() { "auto".to_string() } else { p_trigger };
+    let trigger = if p_trigger.trim().is_empty() {
+        "auto".to_string()
+    } else {
+        p_trigger
+    };
     let ids: Vec<i64> = Spi::connect(|client| {
         let mut out = Vec::new();
         if let Ok(table) = client.select(
@@ -90,7 +101,10 @@ fn sync_one(source_id: i64, trigger: &str) -> Result<Value, String> {
         ))?
         .to_string();
     let payload = req.get("payload").cloned().unwrap_or_else(|| json!({}));
-    let auth_env = req.get("auth_env").and_then(Value::as_str).filter(|s| !s.is_empty());
+    let auth_env = req
+        .get("auth_env")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty());
 
     // 2. Trigger the connector.
     let mut http = crate::specialists::http_client()
@@ -102,17 +116,32 @@ fn sync_one(source_id: i64, trigger: &str) -> Result<Value, String> {
             http = http.bearer_auth(token);
         }
     }
-    let resp = http.send().map_err(|e| format!("connector POST {endpoint} failed: {e}"))?;
+    let resp = http
+        .send()
+        .map_err(|e| format!("connector POST {endpoint} failed: {e}"))?;
     let status = resp.status();
-    let body = resp.text().map_err(|e| format!("connector response read failed: {e}"))?;
+    let body = resp
+        .text()
+        .map_err(|e| format!("connector response read failed: {e}"))?;
     if !status.is_success() {
-        return Err(format!("connector returned HTTP {}: {}", status.as_u16(), truncate(&body, 400)));
+        return Err(format!(
+            "connector returned HTTP {}: {}",
+            status.as_u16(),
+            truncate(&body, 400)
+        ));
     }
-    let parsed: Value = serde_json::from_str(&body)
-        .map_err(|e| format!("connector returned invalid JSON: {e}: {}", truncate(&body, 400)))?;
+    let parsed: Value = serde_json::from_str(&body).map_err(|e| {
+        format!(
+            "connector returned invalid JSON: {e}: {}",
+            truncate(&body, 400)
+        )
+    })?;
 
     let files = parsed.get("files").cloned().unwrap_or_else(|| json!([]));
-    let pending = parsed.get("pending_grants").cloned().unwrap_or_else(|| json!([]));
+    let pending = parsed
+        .get("pending_grants")
+        .cloned()
+        .unwrap_or_else(|| json!([]));
     let connector_stats = parsed.get("stats").cloned();
     let cursor_sql = match parsed.get("cursor").and_then(Value::as_str) {
         Some(c) => sql_lit(c),
@@ -122,7 +151,9 @@ fn sync_one(source_id: i64, trigger: &str) -> Result<Value, String> {
     // 3. Land the manifest (single writer).
     Spi::run(&format!(
         "SELECT rvbbit.brain_sync_write_manifest({source_id}::bigint, {}, {}, {})",
-        jsonb_lit(&files), jsonb_lit(&pending), cursor_sql
+        jsonb_lit(&files),
+        jsonb_lit(&pending),
+        cursor_sql
     ))
     .map_err(|e| format!("brain_sync_write_manifest: {e}"))?;
 
@@ -170,5 +201,9 @@ fn sync_one(source_id: i64, trigger: &str) -> Result<Value, String> {
 }
 
 fn truncate(s: &str, n: usize) -> String {
-    if s.len() <= n { s.to_string() } else { format!("{}…", &s[..n]) }
+    if s.len() <= n {
+        s.to_string()
+    } else {
+        format!("{}…", &s[..n])
+    }
 }

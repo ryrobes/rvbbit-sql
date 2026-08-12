@@ -9,6 +9,8 @@ use std::time::Instant;
 pub struct ForwardOk {
     pub outputs: Vec<Value>,
     pub upstream_ms: f64,
+    /// Provider-supplied OpenAI usage metadata, when that adapter exposes it.
+    pub usage: Option<Value>,
 }
 
 #[derive(Debug)]
@@ -39,12 +41,14 @@ pub async fn forward(
             Ok(ForwardOk {
                 outputs: vec![one; inputs.len()],
                 upstream_ms: t0.elapsed().as_secs_f64() * 1000.0,
+                usage: None,
             })
         }
         Upstream::Proxy { base_url } => {
             let path = backend.upstream_path.as_deref().unwrap_or("/predict");
             let base_url = backend.upstream_base.as_deref().unwrap_or(base_url);
             let url = format!("{}{}", base_url.trim_end_matches('/'), path);
+            let mut usage = None;
             let outputs = match backend.adapter {
                 Adapter::Predict => {
                     let parsed = post_json_scoped(
@@ -64,6 +68,7 @@ pub async fn forward(
                 Adapter::OpenaiEmbeddings => {
                     let texts = input_texts(inputs)?;
                     let parsed = post_json(http, &url, backend, &json!({ "input": texts })).await?;
+                    usage = parsed.get("usage").cloned();
                     json_array(&parsed, "data")?
                         .iter()
                         .map(|item| {
@@ -222,6 +227,7 @@ pub async fn forward(
             Ok(ForwardOk {
                 outputs,
                 upstream_ms: t0.elapsed().as_secs_f64() * 1000.0,
+                usage,
             })
         }
     }

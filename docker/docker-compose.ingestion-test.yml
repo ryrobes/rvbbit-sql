@@ -1,0 +1,186 @@
+name: rvbbit-ingestion-fixtures
+
+# Disposable source databases for exercising the hosted appliance mirror path.
+# These services join the appliance network but publish no host ports.  Every
+# DSN used by dlt authenticates as a dedicated SELECT-only source principal.
+services:
+  # Implements only the Hermes session lifecycle needed to exercise Calliope's
+  # setup notebook. Its detailed health is deliberately degraded: this is not
+  # an LLM or memory substitute, and hosted preflight must continue to say so.
+  sample-hermes:
+    image: ${SAMPLE_HERMES_IMAGE:-python:3.12.11-slim-bookworm@sha256:519591d6871b7bc437060736b9f7456b8731f1499a57e22e6c285135ae657bf7}
+    container_name: rvbbit-sample-hermes
+    command: ["python", "/fixture/hermes-stub.py"]
+    volumes:
+      - ./sample-sources/hermes-stub.py:/fixture/hermes-stub.py:ro
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import json,urllib.request;
+          data=json.load(urllib.request.urlopen('http://127.0.0.1:8642/health/detailed'));
+          raise SystemExit(0 if data.get('fixture') is True else 1)
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    labels:
+      rvbbit.fixture: "true"
+      rvbbit.fixture.role: hermes-session-api
+    networks: [rvbbit]
+    restart: unless-stopped
+
+  sample-postgres:
+    image: ${SAMPLE_POSTGRES_IMAGE:-postgres@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777}
+    container_name: rvbbit-sample-postgres
+    environment:
+      POSTGRES_DB: commerce
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${SAMPLE_POSTGRES_ADMIN_PASSWORD:-rvbbit_fixture_admin}
+    volumes:
+      - sample_postgres_data:/var/lib/postgresql/data
+      - ./sample-sources/postgres-init.sql:/docker-entrypoint-initdb.d/10-fixture.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d commerce"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    labels:
+      rvbbit.fixture: "true"
+      rvbbit.fixture.dialect: postgresql
+    networks: [rvbbit]
+    restart: unless-stopped
+
+  sample-mysql:
+    image: ${SAMPLE_MYSQL_IMAGE:-mysql@sha256:7dcddc01f13bab2f15cde676d44d01f61fc9f99fe7785e86196dfc07d358ae2b}
+    container_name: rvbbit-sample-mysql
+    environment:
+      MYSQL_DATABASE: crm
+      MYSQL_ROOT_PASSWORD: ${SAMPLE_MYSQL_ADMIN_PASSWORD:-rvbbit_fixture_admin}
+    command: ["--default-authentication-plugin=mysql_native_password"]
+    volumes:
+      - sample_mysql_data:/var/lib/mysql
+      - ./sample-sources/mysql-init.sql:/docker-entrypoint-initdb.d/10-fixture.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 40
+    labels:
+      rvbbit.fixture: "true"
+      rvbbit.fixture.dialect: mysql
+    networks: [rvbbit]
+    restart: unless-stopped
+
+  sample-mssql:
+    image: ${SAMPLE_MSSQL_IMAGE:-mcr.microsoft.com/mssql/server@sha256:ba4c8329f48fb8f02e1416be6a930ebfd71268caee78aa985f3af4315e457c89}
+    container_name: rvbbit-sample-mssql
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_PID: Developer
+      MSSQL_SA_PASSWORD: ${SAMPLE_MSSQL_ADMIN_PASSWORD:-Rvbbit_Fixture_Admin_2026!}
+    volumes:
+      - sample_mssql_data:/var/opt/mssql
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - /opt/mssql-tools18/bin/sqlcmd -S 127.0.0.1 -U sa -P "$$MSSQL_SA_PASSWORD" -C -Q "SELECT 1" -b >/dev/null
+      interval: 10s
+      timeout: 5s
+      retries: 40
+      start_period: 20s
+    labels:
+      rvbbit.fixture: "true"
+      rvbbit.fixture.dialect: mssql
+    networks: [rvbbit]
+    restart: unless-stopped
+
+  sample-mssql-init:
+    image: ${SAMPLE_MSSQL_IMAGE:-mcr.microsoft.com/mssql/server@sha256:ba4c8329f48fb8f02e1416be6a930ebfd71268caee78aa985f3af4315e457c89}
+    container_name: rvbbit-sample-mssql-init
+    depends_on:
+      sample-mssql:
+        condition: service_healthy
+    environment:
+      MSSQL_SA_PASSWORD: ${SAMPLE_MSSQL_ADMIN_PASSWORD:-Rvbbit_Fixture_Admin_2026!}
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - >-
+        /opt/mssql-tools18/bin/sqlcmd
+        -S sample-mssql -U sa -P "$$MSSQL_SA_PASSWORD" -C -b
+        -i /seed/mssql-init.sql
+    volumes:
+      - ./sample-sources/mssql-init.sql:/seed/mssql-init.sql:ro
+    labels:
+      rvbbit.fixture: "true"
+      rvbbit.fixture.role: initializer
+    networks: [rvbbit]
+    restart: "no"
+
+  sample-oracle:
+    image: ${SAMPLE_ORACLE_IMAGE:-rvbbit-oracle-samples:23.26.2-6660bad}
+    build:
+      context: ./sample-sources/oracle
+      args:
+        ORACLE_BASE_IMAGE: ${SAMPLE_ORACLE_BASE_IMAGE:-gvenzl/oracle-free:23.26.2-slim-faststart@sha256:d8913e4e4769b6e60197949bef30a4391713afe662b4b4e71a2665c881bdac8b}
+    container_name: rvbbit-sample-oracle
+    environment:
+      ORACLE_PASSWORD: ${SAMPLE_ORACLE_ADMIN_PASSWORD:-Rvbbit_Fixture_Admin_2026!}
+    volumes:
+      - sample_oracle_data:/opt/oracle/oradata
+    healthcheck:
+      test: ["CMD", "healthcheck.sh"]
+      interval: 10s
+      timeout: 5s
+      retries: 60
+      start_period: 30s
+    labels:
+      rvbbit.fixture: "true"
+      rvbbit.fixture.dialect: oracle
+      rvbbit.fixture.sample_revision: 6660bad68c07bd143430ace58565b3f727e17263
+    networks: [rvbbit]
+    restart: unless-stopped
+
+  sample-oracle-init:
+    image: ${SAMPLE_ORACLE_IMAGE:-rvbbit-oracle-samples:23.26.2-6660bad}
+    build:
+      context: ./sample-sources/oracle
+      args:
+        ORACLE_BASE_IMAGE: ${SAMPLE_ORACLE_BASE_IMAGE:-gvenzl/oracle-free:23.26.2-slim-faststart@sha256:d8913e4e4769b6e60197949bef30a4391713afe662b4b4e71a2665c881bdac8b}
+    container_name: rvbbit-sample-oracle-init
+    depends_on:
+      sample-oracle:
+        condition: service_healthy
+    environment:
+      ORACLE_HOST: sample-oracle
+      ORACLE_SERVICE: FREEPDB1
+      ORACLE_PASSWORD: ${SAMPLE_ORACLE_ADMIN_PASSWORD:-Rvbbit_Fixture_Admin_2026!}
+      ORACLE_READER_PASSWORD: ${SAMPLE_ORACLE_READER_PASSWORD:-Rvbbit_Oracle_Readonly_2026!}
+    entrypoint: ["/bin/bash", "/opt/rvbbit-samples/rvbbit-init.sh"]
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /tmp/rvbbit-oracle-fixture-ready"]
+      interval: 2s
+      timeout: 1s
+      retries: 900
+      start_period: 5s
+    labels:
+      rvbbit.fixture: "true"
+      rvbbit.fixture.role: initializer
+    networks: [rvbbit]
+    restart: "no"
+
+networks:
+  rvbbit:
+    name: ${RVBBIT_DOCKER_NETWORK:-rvbbit_uber}
+    external: true
+
+volumes:
+  sample_postgres_data:
+    name: rvbbit_fixture_postgres_data
+  sample_mysql_data:
+    name: rvbbit_fixture_mysql_data
+  sample_mssql_data:
+    name: rvbbit_fixture_mssql_data
+  sample_oracle_data:
+    name: rvbbit_fixture_oracle_data

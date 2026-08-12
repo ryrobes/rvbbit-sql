@@ -1,0 +1,8 @@
+dlt[postgres,sql_database]==1.29.1
+fastapi==0.141.1
+uvicorn[standard]==0.52.1
+psycopg[binary]==3.3.4
+PyMySQL==1.2.0
+pymssql==2.3.13
+oracledb==4.0.2
+ibm-db-sa==0.4.4

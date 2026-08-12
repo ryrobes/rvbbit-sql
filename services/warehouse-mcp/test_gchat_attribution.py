@@ -442,6 +442,7 @@ def test_run_sql_compatibly_binds_only_the_active_selected_sheet(monkeypatch):
             "as_of": None,
             "limit": 25,
             "read_mode": "snapshot",
+            "default_view": "table",
             "ctx": "active-context",
         },
     }
@@ -510,6 +511,7 @@ def test_run_sql_multi_compatibly_binds_selected_sheet_queries(monkeypatch):
             "as_of": None,
             "limit": 25,
             "read_mode": "snapshot",
+            "default_view": "table",
             "ctx": "active-context",
         },
     )]
@@ -731,6 +733,7 @@ def test_real_mcp_meta_shape_is_read_and_context_stays_out_of_tool_schemas(monke
     mcp = FastMCP("attribution-schema")
     server._register(mcp)
     tools = asyncio.run(mcp.list_tools())
+    tool_index = {tool.name: tool for tool in tools}
     schemas = {
         tool.name: set((tool.inputSchema.get("properties") or {}).keys())
         for tool in tools
@@ -744,6 +747,10 @@ def test_real_mcp_meta_shape_is_read_and_context_stays_out_of_tool_schemas(monke
     ):
         assert "ctx" not in schemas[name]
     assert "read_mode" in schemas["calliope_sheet_query"]
+    for name in ("calliope_sheet_query", "run_sql", "run_sql_multi"):
+        view_schema = tool_index[name].inputSchema["properties"]["default_view"]
+        assert view_schema["default"] == "table"
+        assert view_schema["enum"] == ["table", "chart"]
 
 
 def test_request_metadata_attributes_an_ordinary_tool_without_injected_context(monkeypatch):

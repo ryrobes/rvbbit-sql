@@ -2,9 +2,10 @@ diff --git a/tools/mcp_tool.py b/tools/mcp_tool.py
 index fe5ab9cfd..57dd41cde 100644
 --- a/tools/mcp_tool.py
 +++ b/tools/mcp_tool.py
-@@ -38,6 +38,11 @@ Example config::
-         headers:
-           Authorization: "Bearer sk-..."
+@@ -42,7 +42,12 @@ Example config::
+           value_from: "static" # "static" (default) or "profile"
+           value: "alice"       # required for static; profile mode uses the
+                                # active Hermes profile name
          timeout: 180
 +        # Opt in only for a trusted first-party server. Requests then carry
 +        # bounded platform/session provenance as MCP metadata; native Google

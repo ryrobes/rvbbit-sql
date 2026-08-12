@@ -219,3 +219,17 @@ llms:
     model_version: "gemma-4-31b-it-nvfp4"
     prompt_microusd_per_1k: 100
     completion_microusd_per_1k: 200
+  - name: calliope
+    entitlement: clover_llm
+    provider: openrouter
+    upstream_base: "https://openrouter.ai/api"
+    upstream_bearer_token_env: OPENROUTER_API_KEY
+    upstream_model: "openai/gpt-5.6-luna"
+    model_version: "openrouter/openai/gpt-5.6-luna"
+    request_overrides:
+      provider:
+        zdr: true
+        data_collection: deny
+    prompt_microusd_per_1k: 1000
+    completion_microusd_per_1k: 6000
+    timeout_ms: 180000

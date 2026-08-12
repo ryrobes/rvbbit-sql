@@ -37,6 +37,12 @@ SCOPE_KINDS = {"company", "personal"}
 RELEVANCE_KINDS = {
     "active_work", "follow_up", "leverage", "learning", "system_meta",
 }
+PLAYBOOK_CONTRACT_ARRAY_FIELDS = (
+    "when_to_use", "triggers", "when_not_to_use", "context_to_gather",
+    "method", "guardrails", "completion_criteria", "fallbacks",
+    "required_capabilities", "preferred_capabilities", "optional_capabilities",
+)
+PLAYBOOK_REQUIRED_ARRAY_FIELDS = {"when_to_use", "method", "completion_criteria"}
 DOSSIER_FIELDS = (
     "focus_areas", "active_threads", "recurring_questions", "frictions",
     "successful_patterns", "preferences", "open_loops", "avoid",
@@ -512,12 +518,21 @@ Return ONLY one JSON object with exactly this shape:
   "probe_ids":["probe:1"],
   "entities":["topic or governed object"],"novelty":0.75,"confidence":0.8,
   "impact":"low|medium|high","effort":"small|medium|large",
-  "output":{"artifact_type":"dashboard|briefing_module|workflow|metric_set|analysis|project|question",
+  "output":{"artifact_type":"dashboard|briefing_module|workflow|playbook|metric_set|analysis|project|question",
     "headline":"the concrete thing made or proposed","summary":"what a person can inspect now",
     "sections":[{"title":"section","content":"specific content"}],
     "suggested_metrics":["optional metric"],"phases":[{"name":"phase","outcome":"specific outcome"}],
     "success_measures":["observable measure"],
-    "implementation_prompt":"a grounded prompt that lets Calliope continue this in a governed notebook"}
+    "implementation_prompt":"a grounded prompt that lets Calliope continue this in a governed notebook",
+    "playbook":{"title":"required only when artifact_type is playbook",
+      "synopsis":"short reusable-method description","readiness":"ready|degraded|blocked",
+      "contract":{"outcome":"observable outcome","when_to_use":["situation"],
+        "triggers":["recognizable request language"],"when_not_to_use":["boundary"],
+        "context_to_gather":["needed context"],"method":["adaptive ordered step"],
+        "guardrails":["safety or quality constraint"],"deliverable":"inspectable result",
+        "completion_criteria":["observable completion evidence"],"fallbacks":["safe fallback"],
+        "required_capabilities":["capability family"],"preferred_capabilities":["capability family"],
+        "optional_capabilities":["capability family"]}}}
 }]}
 
 Return up to twelve candidates when the evidence supports them; six to twelve is
@@ -530,6 +545,13 @@ advice. Use project_plan when implementation needs new ingestion, writes,
 credentials, production changes, organizational ownership, or several uncertain
 stages. Update or deepen an existing idea instead of restating it. An empty dreams
 array is correct when nothing clears the evidence and novelty bar.
+
+A Playbook is a reusable, outcome-focused method learned from repeatable work,
+not a fixed tool graph or schedule. Propose artifact_type=playbook when the
+evidence reveals a successful pattern, recurring investigation, or useful way
+of working that should become discoverable later. Its contract must be complete
+enough to review now, but choose concrete tools at run time. Omit `playbook`
+unless artifact_type is exactly `playbook`.
 
 Deduplication is part of the task, not an editorial afterthought. Reuse the
 exact `matches_prior_dream_id` whenever the candidate has the same underlying
@@ -600,12 +622,21 @@ Return ONLY one JSON object with exactly this shape:
   "entities":["non-sensitive object or project"],
   "novelty":0.0,"confidence":0.0,"impact":"low|medium|high",
   "effort":"small|medium|large","output":{
-    "artifact_type":"analysis|dashboard|brief|workflow|instrument|question",
+    "artifact_type":"analysis|dashboard|brief|workflow|playbook|instrument|question",
     "headline":"short outcome","summary":"what an inspectable draft would show",
     "sections":[{"title":"section","content":"specific content"}],
     "phases":[{"name":"phase","outcome":"observable result"}],
     "suggested_metrics":["metric"],"success_measures":["measure"],
-    "implementation_prompt":"safe prompt for a follow-on Calliope session"
+    "implementation_prompt":"safe prompt for a follow-on Calliope session",
+    "playbook":{"title":"required only when artifact_type is playbook",
+      "synopsis":"short reusable-method description","readiness":"ready|degraded|blocked",
+      "contract":{"outcome":"observable outcome","when_to_use":["situation"],
+        "triggers":["recognizable request language"],"when_not_to_use":["boundary"],
+        "context_to_gather":["needed context"],"method":["adaptive ordered step"],
+        "guardrails":["safety or quality constraint"],"deliverable":"inspectable result",
+        "completion_criteria":["observable completion evidence"],"fallbacks":["safe fallback"],
+        "required_capabilities":["capability family"],"preferred_capabilities":["capability family"],
+        "optional_capabilities":["capability family"]}}
   }
 }]}
 
@@ -617,6 +648,12 @@ when new credentials, ingestion, writes, organizational ownership, or several
 uncertain stages are required. Return at most eight candidates and prefer three
 to six strong, diverse possibilities. An empty Dreams array is correct when
 nothing is timely or meaningfully new.
+
+When the private evidence shows a repeated successful method, recurring
+investigation, or useful personal working pattern, prefer a complete
+artifact_type=playbook draft over another prose recommendation. A Playbook is
+an adaptive method, not a schedule or fixed tool graph; concrete tools remain a
+run-time choice. Omit `playbook` for every other artifact type.
 """.strip()
 
 
@@ -2734,6 +2771,49 @@ def persist_probe_receipts(
                 )
 
 
+def normalize_dream_playbook(value: Any) -> dict[str, Any] | None:
+    """Normalize the model's proposed Playbook without creating durable state.
+
+    This mirrors the strict persistent contract closely enough that a Dream can
+    be rendered as a real review surface. The accepting route still runs the
+    canonical Playbook validator before writing an immutable version.
+    """
+    if not isinstance(value, dict):
+        return None
+    title = _text(value.get("title"), 180)
+    synopsis = _text(value.get("synopsis"), 1_200)
+    readiness = str(value.get("readiness") or "ready").strip().lower()
+    raw_contract = value.get("contract")
+    if len(title) < 1 or len(synopsis) < 1 or readiness not in {"ready", "degraded", "blocked"}:
+        return None
+    if not isinstance(raw_contract, dict):
+        return None
+    allowed = {"outcome", "deliverable", *PLAYBOOK_CONTRACT_ARRAY_FIELDS}
+    if set(raw_contract) - allowed:
+        return None
+    outcome = _text(raw_contract.get("outcome"), 1_200)
+    deliverable = _text(raw_contract.get("deliverable"), 1_200)
+    if not outcome or not deliverable:
+        return None
+    contract: dict[str, Any] = {"outcome": outcome, "deliverable": deliverable}
+    for field in PLAYBOOK_CONTRACT_ARRAY_FIELDS:
+        raw_items = raw_contract.get(field, [])
+        if not isinstance(raw_items, list):
+            return None
+        items = list(dict.fromkeys(
+            _text(item, 800) for item in raw_items if isinstance(item, str) and _text(item, 800)
+        ))[:60]
+        if field in PLAYBOOK_REQUIRED_ARRAY_FIELDS and not items:
+            return None
+        contract[field] = items
+    return {
+        "title": title,
+        "synopsis": synopsis,
+        "readiness": readiness,
+        "contract": contract,
+    }
+
+
 def normalize_candidates(
     value: Any,
     observations: list[dict[str, Any]],
@@ -2788,6 +2868,21 @@ def normalize_candidates(
             "implementation_prompt",
             f"Investigate and safely develop the pinned Dream “{title}”. Verify its evidence first, then build a reversible draft or refine its project plan.",
         )
+        artifact_type = str(output.get("artifact_type") or "analysis").strip().lower()
+        if artifact_type == "playbook":
+            playbook = normalize_dream_playbook(output.get("playbook"))
+            if playbook:
+                output["artifact_type"] = "playbook"
+                output["playbook"] = playbook
+            else:
+                # Keep a useful Dream even when the model omitted part of the
+                # typed method, but do not present an unacceptably partial
+                # object as a one-click durable Playbook.
+                output["artifact_type"] = "analysis"
+                output.pop("playbook", None)
+        else:
+            output["artifact_type"] = artifact_type
+            output.pop("playbook", None)
         if scope_kind == "personal":
             personal_reason = _text(item.get("personal_reason"), 800)
             if personal_reason:
@@ -3887,7 +3982,7 @@ def snapshot(
             (scope_kind, scoped_owner),
         ).fetchall()]
         ids = [str(row["id"]) for row in rows]
-        events, feedback = [], []
+        events, feedback, playbook_receipts = [], [], []
         if ids:
             events = [dict(row) for row in conn.execute(
                 "SELECT DISTINCT ON (dream_id) * FROM rvbbit.calliope_dream_events "
@@ -3901,6 +3996,12 @@ def snapshot(
                 + "GROUP BY dream_id,event_kind",
                 (ids, owner) if scope_kind == "personal" else (ids,),
             ).fetchall()]
+            playbook_receipts = [dict(row) for row in conn.execute(
+                "SELECT dream_id::text,playbook_id::text,session_id::text,status,updated_at "
+                "FROM rvbbit.calliope_dream_playbooks WHERE owner_email=%s "
+                "AND dream_id=ANY(%s::uuid[]) AND status='complete'",
+                (owner, ids),
+            ).fetchall()]
         latest_cycle = conn.execute(
             "SELECT * FROM rvbbit.calliope_dream_cycles WHERE scope_kind=%s "
             "AND owner_email IS NOT DISTINCT FROM %s ORDER BY started_at DESC LIMIT 1",
@@ -3910,10 +4011,23 @@ def snapshot(
     feedback_by_id: dict[str, dict[str, int]] = {}
     for row in feedback:
         feedback_by_id.setdefault(str(row["dream_id"]), {})[str(row["event_kind"])] = int(row["count"] or 0)
+    playbook_by_id = {
+        str(row["dream_id"]): {
+            "id": str(row["playbook_id"]),
+            "session_id": str(row["session_id"]) if row.get("session_id") else None,
+            "status": str(row.get("status") or "complete"),
+            "url": (
+                f"/calliope?session={row['session_id']}" if row.get("session_id") else None
+            ),
+            "updated_at": _iso(row.get("updated_at")),
+        }
+        for row in playbook_receipts if row.get("playbook_id")
+    }
     all_dreams = []
     for row in rows:
         item = dream_public(row, event_by_id.get(str(row["id"])))
         item["feedback"] = feedback_by_id.get(item["id"], {})
+        item["accepted_playbook"] = playbook_by_id.get(item["id"])
         all_dreams.append(item)
 
     def included(item: dict[str, Any], selected: str) -> bool:
@@ -3949,6 +4063,7 @@ def record_event(
     *,
     note: Any = "",
     days: Any = None,
+    event_payload: Any = None,
 ) -> dict[str, Any]:
     try:
         dream_uuid = str(uuid.UUID(str(dream_id)))
@@ -3958,13 +4073,16 @@ def record_event(
     event_kind = aliases.get(str(action or "").strip().lower(), str(action or "").strip().lower())
     if event_kind not in EVENT_KINDS:
         raise ValueError("Unknown Dream feedback action")
-    payload: dict[str, Any] = {}
+    payload = _object(_bounded(event_payload))
     if event_kind == "sleeping":
         try:
             sleep_days = max(1, min(int(days or 30), 365))
         except (TypeError, ValueError):
             sleep_days = 30
-        payload = {"days": sleep_days, "wake_at": (datetime.now(timezone.utc) + timedelta(days=sleep_days)).isoformat()}
+        payload.update({
+            "days": sleep_days,
+            "wake_at": (datetime.now(timezone.utc) + timedelta(days=sleep_days)).isoformat(),
+        })
     with conn_factory() as conn:
         with conn.transaction():
             row = conn.execute(

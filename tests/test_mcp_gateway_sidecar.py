@@ -11,6 +11,7 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
+from cryptography.fernet import Fernet
 
 
 def _load_gateway(monkeypatch, tmp_path):
@@ -128,6 +129,157 @@ def test_mcp_gateway_secret_store_is_owner_only(monkeypatch, tmp_path):
     mode = stat.S_IMODE((tmp_path / "mcp-secrets.bin").stat().st_mode)
 
     assert mode == 0o600
+
+
+def test_mcp_gateway_secret_request_masks_its_value(monkeypatch, tmp_path):
+    gateway = _load_gateway(monkeypatch, tmp_path)
+
+    request = gateway.SecretRequest(
+        server="linear", name="LINEAR_API_KEY", value="secret-token"
+    )
+
+    assert "secret-token" not in repr(request)
+    assert request.value.get_secret_value() == "secret-token"
+
+
+def test_mcp_gateway_repairs_existing_legacy_key_permissions(monkeypatch, tmp_path):
+    key_path = tmp_path / "mcp-secrets.bin.key"
+    key_path.write_bytes(Fernet.generate_key())
+    key_path.chmod(0o644)
+
+    _load_gateway(monkeypatch, tmp_path)
+
+    assert stat.S_IMODE(key_path.stat().st_mode) == 0o600
+
+
+def test_mcp_gateway_migrates_legacy_cache_without_overwriting_canonical(monkeypatch, tmp_path):
+    gateway = _load_gateway(monkeypatch, tmp_path)
+    gateway.secrets.replace({
+        "linear": {"LINEAR_API_KEY": "legacy-linear"},
+        "fireflies": {"FIREFLIES_API_KEY": "legacy-fireflies"},
+        "github": {"GITHUB_TOKEN": "must-stay-revoked"},
+    })
+
+    class Connection:
+        def __init__(self):
+            self.values = {
+                ("linear", "LINEAR_API_KEY"): "canonical-linear",
+            }
+            self.revoked = {("github", "GITHUB_TOKEN")}
+
+        async def fetchval(self, sql, *args):
+            if "to_regprocedure" in sql or "credential_key_available" in sql:
+                return True
+            if "set_mcp_credential" in sql:
+                server, name, value = args
+                self.values[(server, name)] = value
+                return f"mcp/{server}/{name}"
+            if "resolve_mcp_credential" in sql:
+                return self.values.get((args[0], args[1]))
+            raise AssertionError(f"unexpected query: {sql}")
+
+        async def fetch(self, sql, *args):
+            assert "list_credentials('mcp',NULL)" in sql
+            return [
+                {"server_name": server, "secret_name": name, "status": "active"}
+                for server, name in self.values
+            ] + [
+                {"server_name": server, "secret_name": name, "status": "revoked"}
+                for server, name in self.revoked
+            ]
+
+    class Acquire:
+        def __init__(self, conn):
+            self.conn = conn
+
+        async def __aenter__(self):
+            return self.conn
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class Pool:
+        def __init__(self, conn):
+            self.conn = conn
+
+        def acquire(self):
+            return Acquire(self.conn)
+
+    connection = Connection()
+    gateway.db_pool = Pool(connection)
+
+    asyncio.run(gateway._initialize_canonical_credentials())
+
+    assert gateway.canonical_credentials is True
+    assert gateway.secrets.for_server("linear") == {
+        "LINEAR_API_KEY": "canonical-linear"
+    }
+    assert gateway.secrets.for_server("fireflies") == {
+        "FIREFLIES_API_KEY": "legacy-fireflies"
+    }
+    assert gateway.secrets.for_server("github") == {}
+    assert gateway.revoked_credentials == {("github", "GITHUB_TOKEN")}
+    assert connection.values[("linear", "LINEAR_API_KEY")] == "canonical-linear"
+
+
+def test_mcp_gateway_revoked_tombstone_blocks_environment_fallback(monkeypatch, tmp_path):
+    monkeypatch.setenv("LINEAR_API_KEY", "environment-fallback")
+    gateway = _load_gateway(monkeypatch, tmp_path)
+    gateway.canonical_credentials = True
+    gateway.revoked_credentials = {("linear", "LINEAR_API_KEY")}
+
+    cfg = _config(gateway)
+    cfg.name = "linear"
+    cfg.transport = "http"
+    cfg.auth_header_env = "LINEAR_API_KEY"
+
+    assert gateway.resolve_auth_headers(cfg) == {}
+    assert gateway.resolve_env(
+        {"LINEAR_API_KEY": "${LINEAR_API_KEY}"}, "linear"
+    ) == {"LINEAR_API_KEY": ""}
+
+
+def test_mcp_gateway_credential_revision_check_is_atomic_and_fails_stale_plans(
+    monkeypatch, tmp_path
+):
+    gateway = _load_gateway(monkeypatch, tmp_path)
+
+    class Connection:
+        def __init__(self, row):
+            self.row = row
+            self.queries = []
+
+        async def fetchrow(self, query, *args):
+            self.queries.append((query, args))
+            return self.row
+
+    exact = gateway.SecretRequest(
+        server="linear",
+        name="LINEAR_API_KEY",
+        value="new-value",
+        expected_version=3,
+        expected_status="active",
+    )
+    connection = Connection({"version": 3, "status": "active"})
+    asyncio.run(gateway._check_credential_revision(connection, exact))
+    assert "FOR UPDATE" in connection.queries[0][0]
+
+    stale = Connection({"version": 4, "status": "active"})
+    with pytest.raises(gateway.HTTPException) as error:
+        asyncio.run(gateway._check_credential_revision(stale, exact))
+    assert error.value.status_code == 409
+
+    create = gateway.SecretRequest(
+        server="linear",
+        name="NEW_TOKEN",
+        value="new-value",
+        expect_absent=True,
+    )
+    with pytest.raises(gateway.HTTPException) as error:
+        asyncio.run(gateway._check_credential_revision(
+            Connection({"version": 1, "status": "active"}), create
+        ))
+    assert error.value.status_code == 409
 
 
 def test_mcp_gateway_streamable_kwargs_uses_http_client(monkeypatch, tmp_path):

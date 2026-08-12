@@ -16,5 +16,10 @@ extension_sql_file!(
     "../sql/catalog_kg.sql",
     name = "catalog_kg",
     // triples_bootstrap: data_crawl() calls rvbbit.triples_row() from that block.
-    requires = ["rvbbit_bootstrap", "kg_bootstrap", "create_embedding_cache", "triples_bootstrap"]
+    requires = [
+        "rvbbit_bootstrap",
+        "kg_bootstrap",
+        "create_embedding_cache",
+        "triples_bootstrap"
+    ]
 );

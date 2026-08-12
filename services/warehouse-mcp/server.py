@@ -31,6 +31,8 @@ OAuth mode (for Claude Desktop/Cowork's native connector) — set a public URL:
   WAREHOUSE_HERMES_MCP_KEY  optional Hermes-only bearer; unlike the legacy shared key,
                             this may carry bounded delegated-human authorization context
   WAREHOUSE_HERMES_MCP_CALLER optional service actor label (defaults to STATIC_CALLER)
+  WAREHOUSE_MCP_ALLOWED_HOSTS optional CSV additions to the MCP DNS-rebinding
+                            allowlist (loopback and the appliance service names are built in)
 """
 from __future__ import annotations
 # psycopg's dict_row factory + sql.SQL composition trip Pyright's strict overloads
@@ -43,15 +45,18 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from html.parser import HTMLParser
 from pathlib import Path
+from typing import Annotated, Literal
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import psycopg
 from psycopg import sql as pgsql
 from psycopg.rows import dict_row
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 import application_teams
 import artifact_access
 import calliope_access
+import playbook_access
 
 DSN = os.environ.get(
     "WAREHOUSE_DSN", "host=localhost port=55433 dbname=bench user=postgres password=rvbbit"
@@ -339,16 +344,19 @@ def _freshness(cur, schema: str, rel: str):
 
 # ── tools ───────────────────────────────────────────────────────────────────
 
-def tool_capability_search(query: str, limit: int = 8, kinds=None) -> dict:
+def tool_capability_search(
+    query: str, limit: int = 8, kinds=None, _caller_override=None
+) -> dict:
     """Search WHAT THIS WAREHOUSE CAN DO — the same just-in-time discovery the
     built-in assistant uses: semantic SQL operators (means()/about()/extract/
     classify/forecast/...), installed MCP servers and their tools, installable
     capability packs, SQL syntax patterns, models and providers. Ask in plain
     language ("extract entities from text", "search the web", "forecast this
     series") and get callable names + signatures back — operators are directly
-    usable inside run_sql. Complements search_data (which finds DATA: tables,
-    metrics, cubes); this finds ABILITIES. kinds filter (optional):
-    cap_operator | cap_mcp_tool | cap_pack | cap_syntax | model | provider."""
+    usable inside run_sql and approved Playbooks can be loaded as reusable
+    methods. Complements search_data (which finds DATA: tables, metrics, cubes);
+    this finds ABILITIES. kinds filter (optional): cap_playbook | cap_operator |
+    cap_mcp_tool | cap_pack | cap_syntax | model | provider."""
     limit = max(1, min(int(limit or 8), 25))
     ks = None
     if kinds:
@@ -373,17 +381,51 @@ def tool_capability_search(query: str, limit: int = 8, kinds=None) -> dict:
                 rebuilt = True
         except Exception:  # noqa: BLE001
             pass  # search whatever index exists; never fail discovery on upkeep
-        rows = c.execute(
-            "SELECT kind, name, score, doc FROM rvbbit.capability_search(%s, %s, %s)",
-            (query, limit, ks),
-        ).fetchall()
+        # Approved Playbooks are projected independently of the installation
+        # catalog crawler.  Revisions leave the former approved version live
+        # until approval moves the pointer, and this cheap probe repairs any
+        # interrupted approval/archive projection before discovery.
+        try:
+            probe = c.execute(
+                "SELECT to_regprocedure('rvbbit.capability_playbook_search_stale()') IS NOT NULL AS ok"
+            ).fetchone()
+            if probe and probe["ok"] and bool(
+                c.execute(
+                    "SELECT rvbbit.capability_playbook_search_stale() AS s"
+                ).fetchone()["s"]
+            ):
+                c.execute("SELECT rvbbit.sync_calliope_playbook_capabilities()")
+                rebuilt = True
+        except Exception:  # noqa: BLE001
+            pass
+        # The human subject comes from Warehouse's frozen request context, not
+        # from the public tool schema. Scheduled Assignment/Workflow calls may
+        # recover it only from their Warehouse-owned job ledger.
+        subject = _capability_discovery_subject(
+            c, caller_override=_caller_override
+        )
+        try:
+            rows = c.execute(
+                "SELECT kind,name,score,doc FROM "
+                "rvbbit.capability_search_for(%s,%s,%s,%s)",
+                (subject, query, limit, ks),
+            ).fetchall()
+        except psycopg.errors.UndefinedFunction:
+            # A Warehouse image can briefly lead its pg_rvbbit image during a
+            # rolling upgrade. The old database cannot contain access policies,
+            # so its historical unscoped search is the compatible fallback.
+            rows = c.execute(
+                "SELECT kind,name,score,doc FROM "
+                "rvbbit.capability_search(%s,%s,%s)",
+                (query, limit, ks),
+            ).fetchall()
     out = {
         "query": query,
         "matches": [
             {"kind": r["kind"], "name": r["name"], "score": round(float(r["score"] or 0), 3), "doc": r["doc"]}
             for r in rows
         ],
-        "hint": "cap_operator results are SQL functions (use via run_sql); cap_pack results are installable capabilities; cap_mcp_tool results are tools on MCP servers already installed in the warehouse.",
+        "hint": "Results are already filtered for this caller. cap_playbook results are approved reusable methods (load with read_calliope_playbook); cap_operator results are SQL functions (use via run_sql); cap_pack results are installable capabilities; cap_mcp_tool results are tools on MCP servers already installed in the warehouse.",
     }
     if rebuilt:
         out["index_rebuilt"] = "capability index was stale — rebuilt automatically before this search"
@@ -1920,18 +1962,57 @@ def tool_brain_facets(caller_email=None) -> dict:
             "note": "Pass to ask_brain as filters={\"type\": …, \"source\": …} to pre-narrow the search."}
 
 
-def tool_brain_browse(caller_email=None) -> dict:
-    """The document brain as a file tree — every folder + doc YOU may see (ACL-enforced). Powers a
-    file-explorer view and lets you navigate before asking. Returns folders + docs with folder_path,
-    title, source, mime, occurred_at, chunk count."""
+def tool_brain_browse(caller_email=None, source=None, folder=None, limit=100, offset=0) -> dict:
+    """Browse one bounded page of the visible document tree (ACL-enforced).
+
+    This is navigation metadata, not semantic retrieval and not evidence that a
+    source or document is absent. Use brain_facets to discover visible sources
+    and ask_brain to search their contents. Filter by an exact source label or a
+    folder (including descendants), then follow next_offset when has_more=true.
+    """
     if not caller_email:
         return {"error": {"code": "NO_IDENTITY", "message": "brain access requires an authenticated caller"}}
+    page_limit = max(1, min(int(limit or 100), 250))
+    page_offset = max(0, int(offset or 0))
+    source_filter = str(source or "").strip() or None
+    folder_filter = str(folder or "").strip() or None
+    if folder_filter:
+        folder_filter = "/" + folder_filter.strip("/") if folder_filter != "/" else "/"
+
+    clauses = []
+    params = [caller_email]
+    if source_filter:
+        clauses.append("lower(source) = lower(%s)")
+        params.append(source_filter)
+    if folder_filter and folder_filter != "/":
+        clauses.append(
+            "(folder_path = %s OR left(folder_path, length(%s) + 1) = %s || '/')"
+        )
+        params.extend((folder_filter, folder_filter, folder_filter))
+    where = " WHERE " + " AND ".join(clauses) if clauses else ""
+    params.extend((page_limit + 1, page_offset))
     with _ro() as c:
         rows = c.execute(
             "SELECT folder_path, doc_id, title, source, mime, author, occurred_at::text AS occurred_at, "
-            "ingested_at::text AS ingested_at, chunks FROM rvbbit.brain_tree(%s)", (caller_email,)).fetchall()
-    return {"as": caller_email, "folders": sorted({r["folder_path"] for r in rows}),
-            "documents": rows, "count": len(rows)}
+            "ingested_at::text AS ingested_at, chunks FROM rvbbit.brain_tree(%s)"
+            + where
+            + " ORDER BY source, folder_path, title, doc_id LIMIT %s OFFSET %s",
+            tuple(params),
+        ).fetchall()
+    has_more = len(rows) > page_limit
+    documents = rows[:page_limit]
+    return {
+        "as": caller_email,
+        "filters": {"source": source_filter, "folder": folder_filter},
+        "folders": sorted({r["folder_path"] for r in documents}),
+        "documents": documents,
+        "count": len(documents),
+        "limit": page_limit,
+        "offset": page_offset,
+        "has_more": has_more,
+        "next_offset": page_offset + page_limit if has_more else None,
+        "note": "Bounded navigation metadata only. Use brain_facets + ask_brain for corpus retrieval or absence checks.",
+    }
 
 
 def tool_brain_get_doc(doc_id, caller_email=None) -> dict:
@@ -2477,22 +2558,76 @@ def tool_brain_set_doc_roles(doc_id, roles=None) -> dict:
 
 
 _BRAIN_TEXT_EXT = {".md", ".markdown", ".mdx", ".txt", ".text", ".rst", ".org", ".log"}
+_DEFAULT_BRAIN_IMPORT_ROOTS = ("/app/data/brain-imports",)
+
+
+def _brain_import_roots() -> tuple[str, ...]:
+    """Return canonical server-local roots explicitly available for Brain imports."""
+    configured = os.environ.get(
+        "WAREHOUSE_BRAIN_IMPORT_ROOTS", os.pathsep.join(_DEFAULT_BRAIN_IMPORT_ROOTS)
+    )
+    roots = []
+    for raw in configured.split(os.pathsep):
+        value = raw.strip()
+        if not value:
+            continue
+        resolved = os.path.realpath(os.path.abspath(os.path.expanduser(value)))
+        # A configured filesystem root would defeat the purpose of the scope boundary.
+        if resolved != os.path.sep and resolved not in roots:
+            roots.append(resolved)
+    return tuple(roots)
+
+
+def _brain_import_path(path) -> tuple[str | None, tuple[str, ...]]:
+    """Resolve an import path and reject broad roots or symlink escapes."""
+    roots = _brain_import_roots()
+    requested = str(path or "").strip()
+    if not requested:
+        return None, roots
+    resolved = os.path.realpath(os.path.abspath(os.path.expanduser(requested)))
+    if resolved == os.path.sep:
+        return None, roots
+    for allowed in roots:
+        try:
+            if os.path.commonpath((resolved, allowed)) == allowed:
+                return resolved, roots
+        except ValueError:
+            continue
+    return None, roots
 
 
 def tool_brain_crawl_folder(path, source=None, roles=None, base_folder=None,
                             recursive=True, max_files=500, max_bytes=1_000_000) -> dict:
-    """Crawl a SERVER-LOCAL folder and ingest its text documents into the brain — the on-disk folder
-    structure becomes the brain's folder tree (e.g. <root>/HR/policy.md → folder /<source>/HR). `path`
-    must be readable by the MCP process (mount it into the container). roles = access roles applied to
-    EVERY ingested doc (omit → the source's defaults → DEFAULT-DENY: nobody sees them). Handles
-    .md/.markdown/.mdx/.txt/.text/.rst/.org/.log; skips binaries + files over max_bytes. Re-crawl is
-    idempotent (keyed on each file's path), so it doubles as a sync."""
-    root = os.path.abspath(os.path.expanduser(path or ""))
+    """INGEST files from one configured SERVER-LOCAL import folder into the Brain.
+
+    This mutates the document corpus; it never searches or inspects documents
+    already in the Brain. The user must explicitly request a folder import and
+    supply a source label. `path` must resolve beneath one of the read-only roots
+    in WAREHOUSE_BRAIN_IMPORT_ROOTS (default /app/data/brain-imports); `/` and
+    symlink escapes are always rejected. Re-import is idempotent by file path.
+    """
+    root, allowed_roots = _brain_import_path(path)
+    if root is None:
+        return {
+            "error": {
+                "code": "PATH_OUTSIDE_BRAIN_IMPORT_ROOTS",
+                "message": "path must be beneath a configured Brain import root; broad roots such as / are never allowed",
+                "allowed_roots": list(allowed_roots),
+            }
+        }
     if not os.path.isdir(root):
         return {"error": {"code": "BAD_PATH", "message": f"not a readable directory: {root}"}}
-    src = source or (os.path.basename(root.rstrip("/")) or "crawl")
+    src = str(source or "").strip()
+    if not src:
+        return {
+            "error": {
+                "code": "SOURCE_REQUIRED",
+                "message": "folder ingestion requires an explicit Company Brain source label",
+            }
+        }
     base = (base_folder or ("/" + src)).rstrip("/") or "/"
     cap = max(1, min(int(max_files or 500), 5000))
+    byte_cap = max(1, min(int(max_bytes or 1_000_000), 10_000_000))
     ingested, skipped, errors = [], 0, []
     n = 0
     with _conn() as c:
@@ -2503,25 +2638,33 @@ def tool_brain_crawl_folder(path, source=None, roles=None, base_folder=None,
                 if n >= cap:
                     break
                 fp = os.path.join(dirpath, fn)
+                real_fp = os.path.realpath(fp)
+                try:
+                    if os.path.commonpath((real_fp, root)) != root:
+                        skipped += 1
+                        continue
+                except ValueError:
+                    skipped += 1
+                    continue
                 if os.path.splitext(fn)[1].lower() not in _BRAIN_TEXT_EXT:
                     skipped += 1
                     continue
                 try:
-                    if os.path.getsize(fp) > max_bytes:
+                    if os.path.getsize(real_fp) > byte_cap:
                         skipped += 1
                         continue
-                    with open(fp, "r", encoding="utf-8", errors="replace") as fh:
+                    with open(real_fp, "r", encoding="utf-8", errors="replace") as fh:
                         body = fh.read()
                 except Exception as e:  # noqa: BLE001
                     errors.append({"file": fp, "error": str(e)})
                     continue
-                subdir = os.path.dirname(os.path.relpath(fp, root)).replace(os.sep, "/")
+                subdir = os.path.dirname(os.path.relpath(real_fp, root)).replace(os.sep, "/")
                 folder = base + ("/" + subdir if subdir else "")
-                title = os.path.splitext(os.path.basename(fp))[0]
+                title = os.path.splitext(os.path.basename(real_fp))[0]
                 try:
                     row = c.execute(
                         "SELECT rvbbit.brain_ingest(%s, %s, %s, %s::text[], %s, %s) AS id",
-                        (src, title, body, roles, folder, fp)).fetchone()
+                        (src, title, body, roles, folder, real_fp)).fetchone()
                     ingested.append({"doc_id": row["id"] if row else None, "title": title, "folder": folder})
                     n += 1
                 except Exception as e:  # noqa: BLE001
@@ -2579,9 +2722,18 @@ def tool_run_sql(sql: str, as_of=None, limit=None) -> dict:
                  for d in cur.description] if cur.description else [])
         rows = cur.fetchmany(limit)
         truncated = cur.fetchone() is not None
+    # Keep query provenance on the governed result itself.  Consumers such as
+    # Calliope setup must be able to prove that a useful result came from a
+    # successfully mirrored local relation without reparsing model-authored
+    # SQL or trusting prose.  Planner resolution also catches ordinary heap
+    # relations, views, and joins rather than only RVBBIT acceleration targets.
+    warehouse_objects = _referenced_tables(sql)
     return {"columns": cols, "rows": rows, "row_count": len(rows), "truncated": truncated,
             "engine": v.get("engine"), "elapsed_ms": int((time.time() - t0) * 1000),
-            "as_of_applied": normalized_as_of}
+            "as_of_applied": normalized_as_of,
+            "warehouse_objects": warehouse_objects,
+            "rvbbit_tables": v.get("rvbbit_tables") or [],
+            "lineage": {"warehouse_objects": warehouse_objects}}
 
 
 def tool_run_sql_multi(queries, as_of=None, limit=None, result_mode="full", preview_rows=3) -> dict:
@@ -3148,6 +3300,78 @@ def _require_application_subject(ctx=None):
     return authorization
 
 
+def _capability_discovery_subject(conn=None, *, caller_override=None):
+    """Resolve capability visibility without accepting an ``acting_as`` value.
+
+    Direct OAuth, Google Chat delegation, and signed Calliope browser sessions
+    already have an application subject. Hermes cron intentionally does not:
+    arbitrary scheduled jobs must not impersonate their metadata ``user_id``.
+    A managed Calliope Assignment or legacy Workflow is the narrow exception;
+    its opaque session reference can be joined to Warehouse's own ownership
+    ledger for discovery only. This does not broaden mutation authorization.
+    """
+    authorization = _application_authorization_context(
+        caller_override=caller_override
+    )
+    if authorization.subject:
+        return _email_identity(authorization.subject)
+    if (
+        not _is_trusted_hermes_transport(authorization.client_id)
+        or authorization.platform != "cron"
+        or not authorization.session_ref
+    ):
+        return None
+    try:
+        if conn is not None:
+            linked = _calliope_activity_for_hermes_session(
+                conn, authorization.session_ref
+            )
+        else:
+            with _conn() as local_conn:
+                linked = _calliope_activity_for_hermes_session(
+                    local_conn, authorization.session_ref
+                )
+    except Exception:  # noqa: BLE001 — a missing ledger fails closed
+        return None
+    if (linked or {}).get("kind") not in {"work_order", "workflow"}:
+        return None
+    return _email_identity((linked or {}).get("owner"))
+
+
+def _capability_visible_names(kind, names, *, caller_override=None):
+    """Return the names this request may discover for one capability kind.
+
+    The public discovery tools intentionally have no identity argument.  They
+    run inside ``_logged()``, so the same frozen direct/Hermes/browser subject
+    used by semantic capability search is available here.  Checking the whole
+    shortlist in one SQL call keeps an 80-tool catalog from becoming 80 policy
+    round trips.
+    """
+    capability_kind = str(kind or "").strip()
+    ordered_names = list(dict.fromkeys(
+        str(name).strip() for name in (names or []) if str(name).strip()
+    ))
+    if not capability_kind or not ordered_names:
+        return set()
+    with _conn() as conn:
+        subject = _capability_discovery_subject(
+            conn, caller_override=caller_override
+        )
+        try:
+            rows = conn.execute(
+                "SELECT candidate.name "
+                "FROM unnest(%s::text[]) AS candidate(name) "
+                "WHERE rvbbit.capability_can_use(%s,candidate.name,%s)",
+                (ordered_names, capability_kind, subject),
+            ).fetchall()
+        except psycopg.errors.UndefinedFunction:
+            # During a rolling upgrade the old database cannot yet contain
+            # capability policies, so historical all-visible behavior is the
+            # only compatible interpretation.
+            return set(ordered_names)
+    return {str(row["name"]) for row in rows}
+
+
 def _with_forwarded_mcp_caller(ctx, fn):
     """Compatibility wrapper that also freezes the application auth context."""
     authorization = _application_authorization_context(ctx)
@@ -3200,6 +3424,23 @@ def _objects(tool, args, res):
         session = res.get("session") if isinstance(res.get("session"), dict) else {}
         session_id = session.get("id") or args.get("session_id")
         return [f"calliope_session:{session_id}"] if session_id else None
+    if tool in {
+        "create_calliope_sketch", "read_calliope_sketch", "update_calliope_sketch",
+    }:
+        sketch = res.get("sketch") if isinstance(res.get("sketch"), dict) else {}
+        sketch_id = sketch.get("id") or args.get("sketch_id")
+        return [f"calliope_sketch:{sketch_id}"] if sketch_id else None
+    if tool in {
+        "draft_calliope_playbook", "read_calliope_playbook",
+        "approve_calliope_playbook", "set_calliope_playbook_access",
+        "archive_calliope_playbook",
+    }:
+        playbook = res.get("playbook") if isinstance(res.get("playbook"), dict) else {}
+        reference = (
+            playbook.get("capability_name")
+            or args.get("playbook_ref")
+        )
+        return [f"calliope_playbook:{reference}"] if reference else None
     if tool == "search_data":
         return [m.get("object") for m in res.get("matches", []) if m.get("object")] or None
     if tool == "describe_table":
@@ -3218,7 +3459,14 @@ def _objects(tool, args, res):
             for item in [sheet_object, *(res.get("warehouse_objects") or [])]
             if item
         ] or None
-    if tool in ("validate_sql", "run_sql"):
+    if tool == "run_sql":
+        return res.get("warehouse_objects") or res.get("rvbbit_tables") or None
+    if tool == "administer_local_sql":
+        run = res.get("run") if isinstance(res.get("run"), dict) else {}
+        values = run.get("input_values") if isinstance(run.get("input_values"), dict) else {}
+        statement = values.get("sql") or args.get("sql")
+        return _referenced_tables(str(statement or "")) or ["rvbbit.local_database"]
+    if tool == "validate_sql":
         return res.get("rvbbit_tables") or None
     return None
 
@@ -3230,7 +3478,21 @@ def _summary(tool, res):
         return {"matches": [{"object": m.get("object"), "score": m.get("score")} for m in res.get("matches", [])]}
     if tool == "run_sql":
         return {"columns": [c.get("name") for c in res.get("columns", [])],
-                "row_count": res.get("row_count"), "truncated": res.get("truncated")}
+                "row_count": res.get("row_count"), "truncated": res.get("truncated"),
+                "warehouse_objects": res.get("warehouse_objects") or []}
+    if tool == "administer_local_sql":
+        run = res.get("run") if isinstance(res.get("run"), dict) else {}
+        values = run.get("input_values") if isinstance(run.get("input_values"), dict) else {}
+        result = run.get("result") if isinstance(run.get("result"), dict) else {}
+        return {
+            "run_id": run.get("id"),
+            "status": run.get("status"),
+            "statement_type": values.get("statement_type"),
+            "sql_sha256": values.get("sql_sha256"),
+            "approval_required": res.get("approval_required"),
+            "row_count": result.get("row_count"),
+            "rows_affected": result.get("rows_affected"),
+        }
     if tool == "calliope_sheet_query":
         sheet = res.get("sheet") if isinstance(res.get("sheet"), dict) else {}
         return {
@@ -3242,6 +3504,310 @@ def _summary(tool, res):
             "sheet_snapshot_hash": sheet.get("snapshot_hash"),
             "warehouse_objects": res.get("warehouse_objects") or [],
         }
+    return _summary_after_playbook(tool, res)
+
+
+# ── Calliope Playbooks ─────────────────────────────────────────────────────
+
+class _PlaybookStrictInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class _PlaybookContractInput(_PlaybookStrictInput):
+    """A fuzzy reusable method; concrete tools are selected at run time."""
+
+    outcome: str = Field(min_length=1, max_length=1200)
+    when_to_use: list[str] = Field(min_length=1, max_length=60)
+    triggers: list[str] = Field(default_factory=list, max_length=60)
+    when_not_to_use: list[str] = Field(default_factory=list, max_length=60)
+    context_to_gather: list[str] = Field(default_factory=list, max_length=60)
+    method: list[str] = Field(
+        min_length=1,
+        max_length=60,
+        description="Intent-level method steps, not a brittle fixed tool graph.",
+    )
+    guardrails: list[str] = Field(default_factory=list, max_length=60)
+    deliverable: str = Field(min_length=1, max_length=1200)
+    completion_criteria: list[str] = Field(min_length=1, max_length=60)
+    fallbacks: list[str] = Field(default_factory=list, max_length=60)
+    required_capabilities: list[str] = Field(default_factory=list, max_length=60)
+    preferred_capabilities: list[str] = Field(default_factory=list, max_length=60)
+    optional_capabilities: list[str] = Field(default_factory=list, max_length=60)
+
+
+def _playbook_result(thunk):
+    try:
+        return thunk()
+    except playbook_access.PlaybookError as exc:
+        return {
+            "error": {"code": exc.code, "message": str(exc)},
+            "_http_status": exc.status,
+        }
+
+
+def _playbook_authorization(caller_override=None):
+    authorization = _application_authorization_context(
+        caller_override=caller_override
+    )
+    if not authorization.subject:
+        raise playbook_access.PlaybookError(
+            "APPLICATION_SUBJECT_REQUIRED",
+            "Playbooks require a direct signed-in user or trusted Calliope delegation.",
+            403,
+        )
+    return authorization
+
+
+def tool_draft_calliope_playbook(
+    session_id,
+    title,
+    synopsis,
+    contract,
+    readiness="ready",
+    playbook_ref=None,
+    expected_version=None,
+    change_summary="",
+    evidence_refs=None,
+    sketch_id=None,
+    source_turn_id=None,
+    _caller_override=None,
+):
+    return _playbook_result(lambda: playbook_access.draft(
+        _conn,
+        _playbook_authorization(_caller_override),
+        session_id=session_id,
+        title=title,
+        synopsis=synopsis,
+        contract=contract,
+        readiness=readiness,
+        playbook_ref=playbook_ref,
+        expected_version=expected_version,
+        change_summary=change_summary,
+        evidence_refs=evidence_refs,
+        sketch_id=sketch_id,
+        source_turn_id=source_turn_id,
+    ))
+
+
+def tool_read_calliope_playbook(
+    playbook_ref, version=None, _caller_override=None
+):
+    def read():
+        subject = _capability_discovery_subject(
+            caller_override=_caller_override
+        )
+        if not subject:
+            raise playbook_access.PlaybookError(
+                "APPLICATION_SUBJECT_REQUIRED",
+                "Playbooks require a verified user identity.",
+                403,
+            )
+        return playbook_access.read(_conn, subject, playbook_ref, version)
+
+    return _playbook_result(read)
+
+
+def tool_approve_calliope_playbook(
+    playbook_ref, version, _caller_override=None
+):
+    return _playbook_result(lambda: playbook_access.approve(
+        _conn,
+        _playbook_authorization(_caller_override),
+        playbook_ref,
+        version,
+    ))
+
+
+def tool_set_calliope_playbook_access(
+    playbook_ref,
+    expected_revision,
+    team_ids=None,
+    people=None,
+    confirm_everyone=False,
+    _caller_override=None,
+):
+    return _playbook_result(lambda: playbook_access.replace_access(
+        _conn,
+        _playbook_authorization(_caller_override),
+        playbook_ref,
+        expected_revision,
+        team_ids=team_ids,
+        people=people,
+        confirm_everyone=confirm_everyone,
+    ))
+
+
+def tool_archive_calliope_playbook(
+    playbook_ref, expected_revision, archived=True, _caller_override=None
+):
+    return _playbook_result(lambda: playbook_access.set_archived(
+        _conn,
+        _playbook_authorization(_caller_override),
+        playbook_ref,
+        expected_revision,
+        archived,
+    ))
+
+
+def _mcp_draft_calliope_playbook(
+    session_id,
+    title,
+    synopsis,
+    contract,
+    readiness="ready",
+    playbook_ref=None,
+    expected_version=None,
+    change_summary="",
+    evidence_refs=None,
+    sketch_id=None,
+    source_turn_id=None,
+):
+    """Draft a private reusable Playbook from successful Calliope work.
+
+    A Playbook captures the outcome, applicability, intent-level method,
+    guardrails, and completion evidence—not a fixed sequence of tool calls.
+    Use the exact source Calliope session and source_turn_id supplied by the
+    Calliope web notebook; Warehouse pins the bounded turn range, Stage outputs,
+    artifact versions, and optional current Sketch revision itself. New
+    Playbooks are private and unsearchable until their owner explicitly approves a version.
+    To revise one, read it first and pass its latest expected_version; the
+    currently approved capability remains live until the new draft is approved.
+    """
+    if isinstance(contract, BaseModel):
+        contract = contract.model_dump()
+    args = {
+        "session_id": session_id,
+        "title": title,
+        "synopsis": synopsis,
+        "contract": contract,
+        "readiness": readiness,
+        "playbook_ref": playbook_ref,
+        "expected_version": expected_version,
+        "change_summary": change_summary,
+        "evidence_refs": evidence_refs,
+        "sketch_id": sketch_id,
+        "source_turn_id": source_turn_id,
+    }
+    return _logged(
+        "draft_calliope_playbook",
+        args,
+        lambda: tool_draft_calliope_playbook(**args),
+    )
+
+
+def _mcp_read_calliope_playbook(playbook_ref, version=None):
+    """Load one identity-authorized Playbook contract before applying it.
+
+    Owners may inspect any immutable version and see private provenance plus
+    sharing controls. Other authorized people receive only the approved
+    version; source/evidence references are included only when they can also
+    view the source notebook. No caller identity argument is accepted.
+    """
+    return _logged(
+        "read_calliope_playbook",
+        {"playbook_ref": playbook_ref, "version": version},
+        lambda: tool_read_calliope_playbook(playbook_ref, version),
+    )
+
+
+def _mcp_approve_calliope_playbook(playbook_ref, version):
+    """Approve the latest owned Playbook draft for capability discovery.
+
+    Call this only after the human explicitly confirms the reviewed version.
+    Approval moves the searchable pointer atomically; immutable older versions
+    and their provenance remain available to the owner.
+    """
+    return _logged(
+        "approve_calliope_playbook",
+        {"playbook_ref": playbook_ref, "version": version},
+        lambda: tool_approve_calliope_playbook(playbook_ref, version),
+    )
+
+
+def _mcp_set_calliope_playbook_access(
+    playbook_ref,
+    expected_revision,
+    team_ids=None,
+    people=None,
+    confirm_everyone=False,
+):
+    """Replace an owned Playbook's audience with exact Teams and people.
+
+    Read the Playbook first and pass its access_revision. The owner is always
+    implicit. Emails must be observed application principals; adding the
+    protected Everyone Team requires confirm_everyone=true.
+    """
+    args = {
+        "playbook_ref": playbook_ref,
+        "expected_revision": expected_revision,
+        "team_ids": team_ids,
+        "people": people,
+        "confirm_everyone": confirm_everyone,
+    }
+    return _logged(
+        "set_calliope_playbook_access",
+        args,
+        lambda: tool_set_calliope_playbook_access(**args),
+    )
+
+
+def _mcp_archive_calliope_playbook(
+    playbook_ref, expected_revision, archived=True
+):
+    """Archive or restore an owned Playbook without deleting its history.
+
+    Archive removes the approved projection from discovery for everyone.
+    Restore reinstates the same approved version and prior audience.
+    """
+    return _logged(
+        "archive_calliope_playbook",
+        {
+            "playbook_ref": playbook_ref,
+            "expected_revision": expected_revision,
+            "archived": archived,
+        },
+        lambda: tool_archive_calliope_playbook(
+            playbook_ref, expected_revision, archived
+        ),
+    )
+
+
+_mcp_draft_calliope_playbook.__annotations__ = {
+    "session_id": str,
+    "title": str,
+    "synopsis": str,
+    "contract": _PlaybookContractInput,
+    "readiness": Literal["ready", "degraded", "blocked"],
+    "playbook_ref": str | None,
+    "expected_version": int | None,
+    "change_summary": str,
+    "evidence_refs": list[dict] | None,
+    "sketch_id": str | None,
+    "source_turn_id": str | None,
+}
+_mcp_read_calliope_playbook.__annotations__ = {
+    "playbook_ref": str,
+    "version": int | None,
+}
+_mcp_approve_calliope_playbook.__annotations__ = {
+    "playbook_ref": str,
+    "version": int,
+}
+_mcp_set_calliope_playbook_access.__annotations__ = {
+    "playbook_ref": str,
+    "expected_revision": int,
+    "team_ids": list[str] | None,
+    "people": list[str] | None,
+    "confirm_everyone": bool,
+}
+_mcp_archive_calliope_playbook.__annotations__ = {
+    "playbook_ref": str,
+    "expected_revision": int,
+    "archived": bool,
+}
+
+
+def _summary_after_playbook(tool, res):
     if tool == "run_sql_multi":
         rs = res.get("results") or {}
         return {"queries": {k: {"row_count": (v or {}).get("row_count"),
@@ -3274,6 +3840,32 @@ def _summary(tool, res):
             "people": len(grants.get("people") or []),
             "private": res.get("private"),
             "changed": res.get("changed"),
+        }
+    if tool in {
+        "create_calliope_sketch", "read_calliope_sketch", "update_calliope_sketch",
+    }:
+        sketch = res.get("sketch") if isinstance(res.get("sketch"), dict) else {}
+        return {
+            "id": sketch.get("id"),
+            "session_id": sketch.get("session_id"),
+            "revision": sketch.get("revision"),
+            "element_count": sketch.get("element_count"),
+            "last_actor": sketch.get("last_actor"),
+            "changed": res.get("updated") or res.get("created"),
+        }
+    if tool in {
+        "draft_calliope_playbook", "read_calliope_playbook",
+        "approve_calliope_playbook", "set_calliope_playbook_access",
+        "archive_calliope_playbook",
+    }:
+        playbook = res.get("playbook") if isinstance(res.get("playbook"), dict) else {}
+        return {
+            "id": playbook.get("id"),
+            "capability_name": playbook.get("capability_name"),
+            "version": playbook.get("version"),
+            "approved_version": playbook.get("approved_version"),
+            "archived": playbook.get("archived"),
+            "changed": res.get("changed") if "changed" in res else res.get("created"),
         }
     if tool in (
         "create_live_app", "update_live_app", "get_live_app", "debug_live_app",
@@ -3477,8 +4069,28 @@ def _calliope_activity_for_hermes_session(conn, session_ref):
         return None
     available = conn.execute(
         "SELECT to_regclass('rvbbit.calliope_sessions') IS NOT NULL AS sessions,"
-        "to_regclass('rvbbit.calliope_workflow_runs') IS NOT NULL AS workflow_runs"
+        "to_regclass('rvbbit.calliope_workflow_runs') IS NOT NULL AS workflow_runs,"
+        "to_regclass('rvbbit.calliope_workflows') IS NOT NULL AS workflows,"
+        "to_regclass('rvbbit.calliope_work_order_runs') IS NOT NULL AS work_order_runs,"
+        "to_regclass('rvbbit.calliope_work_orders') IS NOT NULL AS work_orders"
     ).fetchone() or {}
+    if available.get("work_order_runs"):
+        assignment_run = conn.execute(
+            "SELECT owner_email,session_id::text AS calliope_session_id,trigger_kind,status "
+            "FROM rvbbit.calliope_work_order_runs WHERE hermes_session_id=%s "
+            "ORDER BY started_at DESC LIMIT 1",
+            (session_ref,),
+        ).fetchone()
+        if assignment_run:
+            return {
+                "owner": str(assignment_run.get("owner_email") or "").strip().lower(),
+                "calliope_session_id": str(
+                    assignment_run.get("calliope_session_id") or ""
+                ),
+                "kind": "work_order",
+                "trigger_kind": str(assignment_run.get("trigger_kind") or "scheduled"),
+                "status": str(assignment_run.get("status") or ""),
+            }
     if available.get("workflow_runs"):
         workflow = conn.execute(
             "SELECT owner_email,session_id::text AS calliope_session_id,trigger_kind,status "
@@ -3494,6 +4106,44 @@ def _calliope_activity_for_hermes_session(conn, session_ref):
                 "kind": "workflow",
                 "trigger_kind": str(workflow.get("trigger_kind") or "manual"),
                 "status": str(workflow.get("status") or ""),
+            }
+    cron_match = re.match(r"^cron_([^_]+)_", str(session_ref))
+    cron_job_id = cron_match.group(1) if cron_match else None
+    if cron_job_id and available.get("work_orders"):
+        assignment = conn.execute(
+            "SELECT owner_email,source_session_id::text AS calliope_session_id,status "
+            "FROM rvbbit.calliope_work_orders WHERE hermes_job_id=%s LIMIT 1",
+            (cron_job_id,),
+        ).fetchone()
+        if assignment:
+            return {
+                "owner": str(assignment.get("owner_email") or "").strip().lower(),
+                "calliope_session_id": str(
+                    assignment.get("calliope_session_id") or ""
+                ),
+                "kind": "work_order",
+                "trigger_kind": "scheduled",
+                "status": (
+                    "running" if str(assignment.get("status") or "") == "active"
+                    else str(assignment.get("status") or "")
+                ),
+            }
+    if cron_job_id and available.get("workflows"):
+        scheduled_workflow = conn.execute(
+            "SELECT owner_email,source_session_id::text AS calliope_session_id,"
+            "schedule_enabled FROM rvbbit.calliope_workflows "
+            "WHERE hermes_job_id=%s LIMIT 1",
+            (cron_job_id,),
+        ).fetchone()
+        if scheduled_workflow:
+            return {
+                "owner": str(scheduled_workflow.get("owner_email") or "").strip().lower(),
+                "calliope_session_id": str(
+                    scheduled_workflow.get("calliope_session_id") or ""
+                ),
+                "kind": "workflow",
+                "trigger_kind": "scheduled",
+                "status": "running" if scheduled_workflow.get("schedule_enabled") else "paused",
             }
     if available.get("sessions"):
         session = conn.execute(
@@ -3522,17 +4172,24 @@ def _resolve_activity_context(conn, context, caller, client_id, *, tool=None):
         )
         if linked:
             scheduled = (
-                linked.get("kind") == "workflow"
+                linked.get("kind") in {"workflow", "work_order"}
                 and linked.get("trigger_kind") == "scheduled"
                 and (
                     linked.get("status") == "running"
-                    or tool == "finish_calliope_workflow_run"
+                    or tool in {
+                        "begin_calliope_workflow_run",
+                        "finish_calliope_workflow_run",
+                        "begin_calliope_work_order_run",
+                        "finish_calliope_work_order_run",
+                    }
                 )
             )
             context["channel"] = "automation" if scheduled else "web"
             context["client_app"] = (
                 "calliope_workflow"
                 if linked.get("kind") == "workflow"
+                else "calliope_work_order"
+                if linked.get("kind") == "work_order"
                 else "calliope"
             )
             context["provenance"].update({
@@ -3672,6 +4329,34 @@ def _logged(tool, args, thunk):
         # connector mid-build).
         err = {"code": "EXCEPTION", "message": f"{type(e).__name__}: {e}",
                "hint": "unexpected server-side failure in this one tool; other tools are unaffected"}
+        res = {"error": err}
+        return res
+    finally:
+        _record(tool, args, res, err, int((time.time() - t0) * 1000))
+        if authorization_token is not None:
+            _AUTHORIZATION_CONTEXT.reset(authorization_token)
+
+
+async def _logged_async(tool, args, thunk):
+    """Async counterpart used by tools that actively probe managed services."""
+    authorization_token = None
+    if _AUTHORIZATION_CONTEXT.get() is None:
+        authorization_token = _AUTHORIZATION_CONTEXT.set(
+            _application_authorization_context()
+        )
+    t0 = time.time()
+    res = err = None
+    try:
+        res = await thunk()
+        if isinstance(res, dict) and res.get("error"):
+            err = res["error"]
+        return res
+    except Exception as e:  # noqa: BLE001
+        err = {
+            "code": "EXCEPTION",
+            "message": f"{type(e).__name__}: {e}",
+            "hint": "unexpected server-side failure in this one tool; other tools are unaffected",
+        }
         res = {"error": err}
         return res
     finally:
@@ -4257,6 +4942,195 @@ def _private_document_read_caller(doc_id, ctx=None):
     return _selected_calliope_private_document_caller(doc_id, ctx) or _caller()[0]
 
 
+def _mcp_search_data(query: str, limit: int = 8, schema: str | None = None):
+    """Search WAREHOUSE RELATIONS: tables, columns, metrics, cubes, and catalog metadata.
+
+    This does not search Company Brain documents, tickets, meeting notes, or
+    other document-store content and cannot establish whether those documents
+    exist. For the document corpus, use brain_facets followed by ask_brain.
+    """
+    return _logged(
+        "search_data",
+        {"query": query, "limit": limit, "schema": schema},
+        lambda: tool_search_data(query, limit, schema),
+    )
+
+
+def _mcp_ask_brain(query: str, k: int = 8, filters: dict | None = None):
+    """Semantic search over visible COMPANY BRAIN / DOCUMENT STORE contents.
+
+    Use this for documents, Linear/Jira tickets, meeting notes, policies, and
+    other indexed knowledge. Resolve exact visible source/type labels with
+    brain_facets, then pass filters such as {"source": "Linear Issues",
+    "type": "ticket"}. Returns grounded chunks to cite, not a synthesized
+    answer. For broad synthesis, make a few distinct filtered searches and
+    deepen useful hits with brain_context, brain_get_doc, or brain_related.
+    """
+    return _logged(
+        "ask_brain",
+        {"query": query, "k": k, "filters": filters},
+        lambda: tool_ask_brain(query, k, filters, _caller()[0]),
+    )
+
+
+def _mcp_brain_facets():
+    """List visible Company Brain document types and source labels with counts.
+
+    Call before ask_brain whenever a user names a corpus, connector, or document
+    class such as Linear tickets and the exact stored source/type is uncertain.
+    """
+    return _logged("brain_facets", {}, lambda: tool_brain_facets(_caller()[0]))
+
+
+def _mcp_brain_browse(
+    source: str | None = None,
+    folder: str | None = None,
+    limit: int = 100,
+    offset: int = 0,
+):
+    """Browse a bounded page of visible Company Brain tree metadata.
+
+    This is for folder/file navigation only. It does not search document text,
+    and an incomplete or empty page is never evidence that a source/document is
+    absent. Use brain_facets + ask_brain for corpus questions.
+    """
+    return _logged(
+        "brain_browse",
+        {"source": source, "folder": folder, "limit": limit, "offset": offset},
+        lambda: tool_brain_browse(_caller()[0], source, folder, limit, offset),
+    )
+
+
+def _mcp_brain_entity(name: str):
+    """Retrieve visible Company Brain evidence connected to one named entity."""
+    return _logged(
+        "brain_entity", {"name": name}, lambda: tool_brain_entity(name, _caller()[0])
+    )
+
+
+def _mcp_brain_ingest(
+    source: str,
+    title: str,
+    body: str,
+    roles: list[str] | None = None,
+    folder: str | None = None,
+    uri: str | None = None,
+    author: str | None = None,
+    occurred_at: str | None = None,
+):
+    """MUTATION: ingest one supplied document into a named Company Brain source.
+
+    This does not retrieve or search existing documents. Use only when the user
+    asks to add content; omitted roles retain the source defaults/default-deny.
+    """
+    return _logged(
+        "brain_ingest",
+        {"source": source, "title": title, "roles": roles},
+        lambda: tool_brain_ingest(
+            source, title, body, roles, folder, uri, author, occurred_at
+        ),
+    )
+
+
+def _mcp_brain_grant(role: str, principal: str, on: bool = True):
+    """MUTATION: grant or revoke one principal's Company Brain access role."""
+    return _logged(
+        "brain_grant",
+        {"role": role, "principal": principal, "on": on},
+        lambda: tool_brain_grant(role, principal, on),
+    )
+
+
+def _mcp_brain_exclude(doc_id: int, principal: str, reason: str | None = None):
+    """MUTATION: exclude one principal from one Company Brain document."""
+    return _logged(
+        "brain_exclude",
+        {"doc_id": doc_id, "principal": principal},
+        lambda: tool_brain_exclude(doc_id, principal, reason),
+    )
+
+
+def _mcp_brain_crawl_folder(
+    path: str,
+    source: str,
+    roles: list[str] | None = None,
+    base_folder: str | None = None,
+    recursive: bool = True,
+    max_files: int = 500,
+    max_bytes: int = 1_000_000,
+):
+    """MUTATING INGESTION TOOL — import files from an allowed SERVER folder.
+
+    This never searches or browses the existing Company Brain. Call only when
+    the user explicitly requests a folder import. The path must be beneath
+    WAREHOUSE_BRAIN_IMPORT_ROOTS; broad roots such as `/` are always rejected,
+    and an explicit source label is required.
+    """
+    return _logged(
+        "brain_crawl_folder",
+        {
+            "path": path,
+            "source": source,
+            "roles": roles,
+            "recursive": recursive,
+            "max_files": max_files,
+        },
+        lambda: tool_brain_crawl_folder(
+            path, source, roles, base_folder, recursive, max_files, max_bytes
+        ),
+    )
+
+
+def _mcp_brain_set_doc_roles(doc_id: int, roles: list[str] | None = None):
+    """MUTATION: replace the Company Brain access-role set for one document."""
+    return _logged(
+        "brain_set_doc_roles",
+        {"doc_id": doc_id, "roles": roles},
+        lambda: tool_brain_set_doc_roles(doc_id, roles),
+    )
+
+
+# FastMCP in the appliance inspects raw annotations. Keep concrete runtime
+# types so progressive disclosure receives real integer/boolean/object schemas
+# rather than the old lambda wrappers' all-string contracts.
+_mcp_search_data.__annotations__ = {"query": str, "limit": int, "schema": str | None}
+_mcp_ask_brain.__annotations__ = {"query": str, "k": int, "filters": dict | None}
+_mcp_brain_facets.__annotations__ = {}
+_mcp_brain_browse.__annotations__ = {
+    "source": str | None,
+    "folder": str | None,
+    "limit": int,
+    "offset": int,
+}
+_mcp_brain_entity.__annotations__ = {"name": str}
+_mcp_brain_ingest.__annotations__ = {
+    "source": str,
+    "title": str,
+    "body": str,
+    "roles": list[str] | None,
+    "folder": str | None,
+    "uri": str | None,
+    "author": str | None,
+    "occurred_at": str | None,
+}
+_mcp_brain_grant.__annotations__ = {"role": str, "principal": str, "on": bool}
+_mcp_brain_exclude.__annotations__ = {
+    "doc_id": int,
+    "principal": str,
+    "reason": str | None,
+}
+_mcp_brain_crawl_folder.__annotations__ = {
+    "path": str,
+    "source": str,
+    "roles": list[str] | None,
+    "base_folder": str | None,
+    "recursive": bool,
+    "max_files": int,
+    "max_bytes": int,
+}
+_mcp_brain_set_doc_roles.__annotations__ = {"doc_id": int, "roles": list[str] | None}
+
+
 def _mcp_brain_get_doc(doc_id, ctx=None):
     """Open one visible Brain document; selected private Calliope Docs are turn-scoped."""
     return _logged(
@@ -4593,6 +5467,7 @@ def _mcp_calliope_sheet_query(
     as_of=None,
     limit=None,
     read_mode="snapshot",
+    default_view="table",
     ctx=None,
 ):
     """Join a selected private Google Sheet to governed warehouse SQL.
@@ -4604,7 +5479,8 @@ def _mcp_calliope_sheet_query(
     selected-surface context or by ``calliope_sheet_snapshot``. The statement must be one
     read-only SELECT/CTE and reference ``selected_sheet``; ordinary warehouse relations may be
     joined normally. The result retains the Sheet observation and resolved warehouse objects as
-    lineage.
+    lineage. Keep default_view=table unless the user explicitly requested a chart and the query
+    was deliberately shaped with a meaningful axis and measure.
     """
     args = {
         "surface_id": surface_id,
@@ -4612,6 +5488,7 @@ def _mcp_calliope_sheet_query(
         "as_of": as_of,
         "limit": limit,
         "read_mode": read_mode,
+        "default_view": default_view,
     }
 
     def query_snapshot():
@@ -4808,7 +5685,13 @@ _SELECTED_SHEET_FROM_RE = re.compile(
 )
 
 
-def _mcp_run_sql(sql, as_of=None, limit=None, ctx=None):
+def _mcp_run_sql(
+    sql,
+    as_of=None,
+    limit=None,
+    default_view="table",
+    ctx=None,
+):
     """Run governed SQL, binding the active private Sheet when referenced.
 
     The ordinary behavior is unchanged. The reserved, unqualified
@@ -4816,6 +5699,8 @@ def _mcp_run_sql(sql, as_of=None, limit=None, ctx=None):
     an active browser-owned Calliope turn with a selected Sheet. Execution then
     delegates to the same owner-checked implementation as
     ``calliope_sheet_query``; this is not a second or weaker authorization path.
+    Keep default_view=table for ordinary data; request chart only for a result
+    deliberately shaped as a chart in response to explicit user intent.
     """
     query_sql = _sheet_query_sql(sql)
     if _SELECTED_SHEET_FROM_RE.search(query_sql):
@@ -4827,11 +5712,17 @@ def _mcp_run_sql(sql, as_of=None, limit=None, ctx=None):
                 as_of=as_of,
                 limit=limit,
                 read_mode="snapshot",
+                default_view=default_view,
                 ctx=ctx,
             )
     return _logged(
         "run_sql",
-        {"sql": sql, "as_of": as_of, "limit": limit},
+        {
+            "sql": sql,
+            "as_of": as_of,
+            "limit": limit,
+            "default_view": default_view,
+        },
         lambda: tool_run_sql(sql, as_of, limit),
     )
 
@@ -4842,6 +5733,7 @@ def _mcp_run_sql_multi(
     limit=None,
     result_mode="full",
     preview_rows=3,
+    default_view="table",
     ctx=None,
 ):
     """Batch governed SQL with the same selected-Sheet compatibility binding.
@@ -4851,7 +5743,8 @@ def _mcp_run_sql_multi(
     active private Sheet selection, execute each Sheet statement through the
     exact same authorization/query gate as ``calliope_sheet_query``. This
     covers older Hermes catalogs without teaching generic SQL about private
-    rows or exposing request context in the public schema.
+    rows or exposing request context in the public schema. Keep
+    default_view=table unless every returned query is intentionally chart-shaped.
     """
     args = {
         "queries": queries,
@@ -4859,6 +5752,7 @@ def _mcp_run_sql_multi(
         "limit": limit,
         "result_mode": result_mode,
         "preview_rows": preview_rows,
+        "default_view": default_view,
     }
     if not isinstance(queries, dict) or not any(
         _SELECTED_SHEET_FROM_RE.search(_sheet_query_sql(statement))
@@ -4922,6 +5816,7 @@ def _mcp_run_sql_multi(
                     as_of=normalized_as_of,
                     limit=limit,
                     read_mode="snapshot",
+                    default_view=default_view,
                     ctx=ctx,
                 )
             else:
@@ -9834,6 +10729,362 @@ def _mcp_calliope_work_item(
     return _logged("calliope_work_item", args, publish)
 
 
+class _SketchStrictInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+
+class _SketchStyleInput(_SketchStrictInput):
+    """Agent-facing names; Calliope translates them to Excalidraw internals."""
+
+    stroke_color: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("stroke_color", "strokeColor", "color"),
+        description="Border, line, or text color as #RRGGBB or transparent.",
+    )
+    background_color: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("background_color", "backgroundColor"),
+        description="Shape fill color as #RRGGBB or transparent.",
+    )
+    fill_style: Literal["hachure", "cross-hatch", "solid", "zigzag"] | None = Field(
+        default=None, validation_alias=AliasChoices("fill_style", "fillStyle")
+    )
+    stroke_width: float | None = Field(
+        default=None, ge=1, le=8,
+        validation_alias=AliasChoices("stroke_width", "strokeWidth"),
+    )
+    stroke_style: Literal["solid", "dashed", "dotted"] | None = Field(
+        default=None, validation_alias=AliasChoices("stroke_style", "strokeStyle")
+    )
+    roughness: float | None = Field(default=None, ge=0, le=2)
+    opacity: float | None = Field(default=None, ge=5, le=100)
+    font_size: float | None = Field(
+        default=None, ge=8, le=120,
+        validation_alias=AliasChoices("font_size", "fontSize"),
+        description="Text or bound-label size.",
+    )
+    font_family: int | None = Field(
+        default=None, ge=1, le=20,
+        validation_alias=AliasChoices("font_family", "fontFamily"),
+    )
+    text_align: Literal["left", "center", "right"] | None = Field(
+        default=None, validation_alias=AliasChoices("text_align", "textAlign")
+    )
+    vertical_align: Literal["top", "middle", "bottom"] | None = Field(
+        default=None, validation_alias=AliasChoices("vertical_align", "verticalAlign")
+    )
+    start_arrowhead: Literal["arrow", "bar", "dot", "triangle"] | None = Field(
+        default=None, validation_alias=AliasChoices("start_arrowhead", "startArrowhead")
+    )
+    end_arrowhead: Literal["arrow", "bar", "dot", "triangle"] | None = Field(
+        default=None, validation_alias=AliasChoices("end_arrowhead", "endArrowhead")
+    )
+
+
+class _SketchStyledOperation(_SketchStrictInput):
+    id: str = Field(description="Stable descriptive element id, reused by later edits.")
+    style: _SketchStyleInput | None = Field(
+        default=None,
+        description="Strict visual style. Prefer these snake_case fields.",
+    )
+    # These compatibility shorthands make the most common generated payloads
+    # do what the model intended while the nested style object remains canonical.
+    stroke_color: str | None = Field(
+        default=None, validation_alias=AliasChoices("stroke_color", "strokeColor", "color"),
+        deprecated=True, description="Shorthand for style.stroke_color.",
+    )
+    background_color: str | None = Field(
+        default=None, validation_alias=AliasChoices("background_color", "backgroundColor"),
+        deprecated=True, description="Shorthand for style.background_color.",
+    )
+    fill_style: Literal["hachure", "cross-hatch", "solid", "zigzag"] | None = Field(
+        default=None, validation_alias=AliasChoices("fill_style", "fillStyle"), deprecated=True
+    )
+    stroke_width: float | None = Field(
+        default=None, ge=1, le=8,
+        validation_alias=AliasChoices("stroke_width", "strokeWidth"), deprecated=True,
+    )
+    stroke_style: Literal["solid", "dashed", "dotted"] | None = Field(
+        default=None, validation_alias=AliasChoices("stroke_style", "strokeStyle"), deprecated=True
+    )
+    roughness: float | None = Field(default=None, ge=0, le=2, deprecated=True)
+    opacity: float | None = Field(default=None, ge=5, le=100, deprecated=True)
+    font_size: float | None = Field(
+        default=None, ge=8, le=120,
+        validation_alias=AliasChoices("font_size", "fontSize"), deprecated=True,
+        description="Shorthand for style.font_size.",
+    )
+    font_family: int | None = Field(
+        default=None, ge=1, le=20,
+        validation_alias=AliasChoices("font_family", "fontFamily"), deprecated=True,
+    )
+    text_align: Literal["left", "center", "right"] | None = Field(
+        default=None, validation_alias=AliasChoices("text_align", "textAlign"), deprecated=True
+    )
+    vertical_align: Literal["top", "middle", "bottom"] | None = Field(
+        default=None, validation_alias=AliasChoices("vertical_align", "verticalAlign"), deprecated=True
+    )
+    start_arrowhead: Literal["arrow", "bar", "dot", "triangle"] | None = Field(
+        default=None, validation_alias=AliasChoices("start_arrowhead", "startArrowhead"), deprecated=True
+    )
+    end_arrowhead: Literal["arrow", "bar", "dot", "triangle"] | None = Field(
+        default=None, validation_alias=AliasChoices("end_arrowhead", "endArrowhead"), deprecated=True
+    )
+
+
+class _SketchAddText(_SketchStyledOperation):
+    op: Literal["add_text"]
+    text: str = Field(description="Visible text.")
+    x: float = 0
+    y: float = 0
+    width: float | None = Field(default=None, gt=0, description="Optional fixed wrapping width.")
+    height: float | None = Field(default=None, gt=0, description="Optional fixed text box height.")
+
+
+class _SketchAddShape(_SketchStyledOperation):
+    op: Literal["add_shape"]
+    shape: Literal["rectangle", "ellipse", "diamond"] = "rectangle"
+    x: float = 0
+    y: float = 0
+    width: float = Field(default=220, ge=20)
+    height: float = Field(default=100, ge=20)
+    label: str | None = Field(
+        default=None, description="Visible text bound to and moving with the shape."
+    )
+    text: str | None = Field(
+        default=None, deprecated=True, description="Accepted alias for label."
+    )
+
+
+class _SketchConnect(_SketchStyledOperation):
+    op: Literal["connect"]
+    from_id: str = Field(description="Existing shape or text element id.")
+    to_id: str = Field(description="Different existing shape or text element id.")
+    label: str | None = Field(
+        default=None, description="Visible text bound to and moving with the connector."
+    )
+    text: str | None = Field(
+        default=None, deprecated=True, description="Accepted alias for label."
+    )
+    line_type: Literal["arrow", "line"] = Field(
+        default="arrow", description="Line remains bound; line omits the ending arrowhead."
+    )
+
+
+class _SketchSetText(_SketchStrictInput):
+    op: Literal["set_text"]
+    id: str
+    text: str
+
+
+class _SketchMove(_SketchStrictInput):
+    op: Literal["move"]
+    id: str
+    x: float | None = None
+    y: float | None = None
+    dx: float | None = None
+    dy: float | None = None
+
+
+class _SketchResize(_SketchStrictInput):
+    op: Literal["resize"]
+    id: str
+    width: float = Field(gt=0)
+    height: float = Field(gt=0)
+    x: float | None = None
+    y: float | None = None
+
+
+class _SketchStyle(_SketchStyledOperation):
+    op: Literal["style"]
+
+
+class _SketchGroup(_SketchStrictInput):
+    op: Literal["group"]
+    group_id: str
+    element_ids: list[str] = Field(min_length=2)
+
+
+class _SketchDelete(_SketchStrictInput):
+    op: Literal["delete"]
+    id: str | None = None
+    element_ids: list[str] | None = None
+
+
+_SketchOperation = Annotated[
+    _SketchAddText
+    | _SketchAddShape
+    | _SketchConnect
+    | _SketchSetText
+    | _SketchMove
+    | _SketchResize
+    | _SketchStyle
+    | _SketchGroup
+    | _SketchDelete,
+    Field(discriminator="op"),
+]
+
+
+def _sketch_operation_payloads(operations):
+    if not isinstance(operations, list):
+        return operations
+    return [
+        operation.model_dump(exclude_unset=True)
+        if isinstance(operation, BaseModel)
+        else operation
+        for operation in operations
+    ]
+
+
+def _agent_sketch_result(result):
+    """Keep the typed semantic scene, but not the editor persistence envelope."""
+    compact = dict(result or {})
+    sketch = dict(compact.get("sketch") or {})
+    sketch.pop("scene", None)
+    compact["sketch"] = sketch
+    return compact
+
+
+def _mcp_create_calliope_sketch(session_id, title, operations):
+    """Create the one collaborative visual Sketch in a Calliope notebook.
+
+    The surrounding Calliope web-notebook prompt may authorize proactive use;
+    in other clients, use this only after an explicit human request. A process,
+    system map, comparison, spatial explanation, or evolving set of ideas is a
+    good fit when it communicates better visually than prose and does not need
+    a dashboard. `session_id` must be the exact originating Calliope
+    session. `operations` is a strict, discoverable union of typed edits.
+    add_shape.label and connect.label render as bound text that follows its
+    element; `text` is also accepted as a compatibility alias. Connectors use
+    from_id/to_id and route themselves between current element bounds. Put
+    visual fields in `style` using the documented snake_case schema. Each
+    element needs a stable descriptive id. Do not supply raw Excalidraw JSON.
+    New Calliope web notebooks already contain one untouched blank Sketch; this
+    call safely adopts and populates that blank canvas rather than creating a
+    duplicate. Read and update instead once it contains human or agent work.
+    The human can edit the resulting canvas directly; later changes must update
+    this same Sketch.
+    """
+    operations = _sketch_operation_payloads(operations)
+    args = {"session_id": session_id, "title": title, "operations": operations}
+
+    def create():
+        import calliope
+
+        if not calliope.is_enabled():
+            raise RuntimeError("Calliope is not configured on this Warehouse")
+        authorization = _require_application_subject()
+        return _agent_sketch_result(calliope.create_sketch(
+            _conn,
+            authorization.subject,
+            session_id,
+            title,
+            operations,
+        ))
+
+    return _logged("create_calliope_sketch", args, create)
+
+
+def _mcp_read_calliope_sketch(
+    session_id,
+    sketch_id=None,
+    since_revision=None,
+):
+    """Read the current semantic contents and recent edit deltas of a Sketch.
+
+    Call this before editing an existing Sketch, especially after the human has
+    changed it. The result contains normalized element summaries and revisions,
+    not raw editor JSON. It also returns the current compact DSL contract.
+    `since_revision` can bound the edit history while the current semantic
+    scene is always returned.
+    """
+    args = {
+        "session_id": session_id,
+        "sketch_id": sketch_id,
+        "since_revision": since_revision,
+    }
+
+    def read():
+        import calliope
+
+        if not calliope.is_enabled():
+            raise RuntimeError("Calliope is not configured on this Warehouse")
+        authorization = _require_application_subject()
+        return calliope.read_sketch(
+            _conn,
+            authorization.subject,
+            session_id,
+            sketch_id,
+            since_revision,
+        )
+
+    return _logged("read_calliope_sketch", args, read)
+
+
+def _mcp_update_calliope_sketch(
+    session_id,
+    sketch_id,
+    expected_revision,
+    operations,
+    title=None,
+):
+    """Apply typed edits to the existing collaborative Sketch.
+
+    Read the Sketch first and pass its exact current `expected_revision`; a
+    concurrent human edit fails safely instead of being overwritten. Supported
+    operations are add_text, add_shape, connect, set_text, move, resize, style,
+    group, and delete. Shape and connector labels stay bound, and connectors
+    reroute when an endpoint is moved or resized through this DSL. Preserve
+    useful human-authored elements and use stable element ids. Do not author or
+    replace raw Excalidraw scene JSON.
+    """
+    operations = _sketch_operation_payloads(operations)
+    args = {
+        "session_id": session_id,
+        "sketch_id": sketch_id,
+        "expected_revision": expected_revision,
+        "operations": operations,
+        "title": title,
+    }
+
+    def update():
+        import calliope
+
+        if not calliope.is_enabled():
+            raise RuntimeError("Calliope is not configured on this Warehouse")
+        authorization = _require_application_subject()
+        return _agent_sketch_result(calliope.update_sketch(
+            _conn,
+            authorization.subject,
+            session_id,
+            sketch_id,
+            expected_revision,
+            operations,
+            title,
+        ))
+
+    return _logged("update_calliope_sketch", args, update)
+
+
+_mcp_create_calliope_sketch.__annotations__ = {
+    "session_id": str,
+    "title": str,
+    "operations": list[_SketchOperation],
+}
+_mcp_read_calliope_sketch.__annotations__ = {
+    "session_id": str,
+    "sketch_id": str | None,
+    "since_revision": int | None,
+}
+_mcp_update_calliope_sketch.__annotations__ = {
+    "session_id": str,
+    "sketch_id": str,
+    "expected_revision": int,
+    "operations": list[_SketchOperation],
+    "title": str | None,
+}
+
+
 def _mcp_search_calliope_actions(
     session_id: str,
     query: str,
@@ -9844,10 +11095,14 @@ def _mcp_search_calliope_actions(
 
     Use the exact `session_id` from Calliope's internal work-routing context;
     it resolves the owning human and current runtime state. Search in ordinary
-    language such as "connect Linear", "add tickets to company knowledge", or
-    "monitor a metric". Results distinguish ready, connect/install, and blocked
-    actions and include structured question fields. For typed changes, call
-    `plan_calliope_action` next. Never ask the user to put a secret in chat.
+    language such as "connect Linear", "retry the ERP mirror", "rotate the Linear key",
+    "add tickets to company knowledge", or "monitor a metric". Results distinguish
+    ready, connect/install, and blocked actions and include structured question
+    fields. For any typed appliance installation, configuration, repair,
+    mirror-control, Company Brain source, or credential action requested by an
+    administrator, call `administer_calliope_action` next. It applies and tests
+    the change directly; do not ask for a separate plan approval. Never ask the
+    user to put a secret in chat.
     """
     args = {
         "session_id": session_id,
@@ -9879,7 +11134,7 @@ def _mcp_plan_calliope_action(
     originating Calliope session id. The plan records human-readable steps,
     change scope, verification, and rollback guidance, but does not apply the
     change. Explain it and wait for explicit user approval before calling
-    `execute_calliope_action`. Secret-required MCP connections are deliberately
+    `execute_calliope_action`. Secret-required MCP connections and credential changes are deliberately
     completed only in the native Library form; never request or pass secrets.
     """
     args = {"session_id": session_id, "action_id": action_id, "inputs": inputs}
@@ -9915,6 +11170,98 @@ def _mcp_execute_calliope_action(session_id: str, run_id: str):
         return calliope.execute_action_for_session(_conn, session_id, run_id)
 
     return _logged("execute_calliope_action", args, execute)
+
+
+async def _mcp_administer_calliope_action(
+    session_id: str,
+    action_id: str,
+    inputs: dict | None = None,
+):
+    """Install, configure, repair, or test one organization capability directly.
+
+    This is the normal path for a signed-in Calliope administrator. Use an exact
+    action id returned by `search_calliope_actions`. The tool creates its own
+    durable, redacted audit receipt, applies the bounded change, actively tests
+    it, and returns failed-step detail that can be used for a repair/retry. It
+    never accepts credentials. If a required key is not already in the canonical
+    store, it returns `secure_input_required` and the exact missing names so the
+    user can enter only those values in the native secure form. Submitting that
+    secure form applies and verifies the action directly; there is no separate
+    approval step. Credential revocation can be executed here without a form.
+    """
+    args = {"session_id": session_id, "action_id": action_id, "inputs": inputs}
+
+    async def administer():
+        import calliope
+
+        if not calliope.is_enabled():
+            raise RuntimeError("Calliope is not configured on this Warehouse")
+        return await calliope.administer_action_for_session(
+            _conn, session_id, action_id, inputs
+        )
+
+    return await _logged_async("administer_calliope_action", args, administer)
+
+
+def _mcp_administer_local_sql(
+    session_id: str,
+    sql: str | None = None,
+    approved_run_id: str | None = None,
+):
+    """Execute appliance-local RVBBIT SQL as the signed-in Calliope administrator.
+
+    Use ordinary `run_sql` for analysis. Use this tool when the user asks Callie
+    to create, alter, repair, or otherwise administer objects in her own RVBBIT
+    PostgreSQL database. One SELECT/WITH-shaped statement executes directly on
+    the writable local connection, including RVBBIT table functions that mutate
+    settings or catalogs. Explicit DDL/DML/CALL/DO/GRANT statements are frozen
+    into a durable receipt and return `approval_required=true`; show the exact
+    SQL and wait for explicit user approval, then call this tool again with only
+    `session_id` and `approved_run_id`.
+
+    Never place credentials or source database DSNs in SQL. This tool cannot use
+    host filesystem escapes, instance roles, foreign servers, or dblink; remote
+    source access remains solely the dlt mirror controller's responsibility.
+    """
+    args = {
+        "session_id": session_id,
+        "sql": sql,
+        "approved_run_id": approved_run_id,
+    }
+
+    def administer():
+        import calliope
+
+        if not calliope.is_enabled():
+            raise RuntimeError("Calliope is not configured on this Warehouse")
+        authorization = _require_application_subject()
+        return calliope.administer_local_sql_for_session(
+            _conn,
+            session_id,
+            sql,
+            approved_run_id,
+            authorized_owner=authorization.subject,
+        )
+
+    return _logged("administer_local_sql", args, administer)
+
+
+async def _mcp_mirror_status(session_id: str):
+    """Read local dlt mirror controller health, schedules, and durable run status.
+
+    This never connects to a remote source database. It reads the local RVBBIT
+    control plane and actively probes only the managed dlt worker.
+    """
+    args = {"session_id": session_id}
+
+    async def status():
+        import calliope
+
+        if not calliope.is_enabled():
+            raise RuntimeError("Calliope is not configured on this Warehouse")
+        return await calliope.mirror_status_for_session(_conn, session_id)
+
+    return await _logged_async("mirror_status", args, status)
 
 
 def _mcp_export_to_google_sheets(
@@ -10011,6 +11358,17 @@ _mcp_execute_calliope_action.__annotations__ = {
     "session_id": str,
     "run_id": str,
 }
+_mcp_administer_calliope_action.__annotations__ = {
+    "session_id": str,
+    "action_id": str,
+    "inputs": dict | None,
+}
+_mcp_administer_local_sql.__annotations__ = {
+    "session_id": str,
+    "sql": str | None,
+    "approved_run_id": str | None,
+}
+_mcp_mirror_status.__annotations__ = {"session_id": str}
 _mcp_export_to_google_sheets.__annotations__ = {
     "session_id": str,
     "sql": str,
@@ -10138,6 +11496,217 @@ def _mcp_draft_calliope_workflow(
         )}
 
     return _logged("draft_calliope_workflow", args, draft)
+
+
+def _mcp_draft_calliope_work_order(
+    session_id: str,
+    title: str,
+    instruction: str,
+    schedule: str | None = None,
+    trigger_kind: str | None = None,
+    timezone_name: str | None = None,
+    notification_policy: str = "attention",
+    approval_policy: str = "read_only",
+    context: dict | None = None,
+):
+    """Draft private work assigned to Calliope for later or recurring execution.
+
+    Use the exact originating Calliope session UUID; ownership is resolved from
+    that server-side capability. A draft never schedules itself. `schedule` uses
+    Hermes syntax: an ISO timestamp or duration for one-time work, and `every …`
+    or five-field cron for recurring work. Recurring schedules currently use the
+    Hermes installation timezone. `notification_policy=attention` keeps healthy
+    unchanged runs out of Work Inbox while preserving their run notebooks. The
+    default read-only approval policy permits research and analysis, not external
+    or organizational mutations. A human reviews and activates every draft.
+    """
+    args = {
+        "session_id": session_id,
+        "title": title,
+        "instruction": instruction,
+        "schedule": schedule,
+        "trigger_kind": trigger_kind,
+        "timezone_name": timezone_name,
+        "notification_policy": notification_policy,
+        "approval_policy": approval_policy,
+        "context": context,
+    }
+
+    def draft():
+        import calliope
+
+        if not calliope.is_enabled():
+            raise RuntimeError("Calliope is not configured on this Warehouse")
+        return {"work_order": calliope.draft_work_order(
+            _conn,
+            session_id,
+            title,
+            instruction,
+            schedule,
+            trigger_kind,
+            timezone_name,
+            notification_policy,
+            approval_policy,
+            context,
+        )}
+
+    return _logged("draft_calliope_work_order", args, draft)
+
+
+def _mcp_begin_calliope_work_order_run(
+    work_order_id: str,
+    source_session_id: str,
+    definition_version: int,
+    hermes_job_id: str,
+):
+    """Begin one approved private Calliope assignment occurrence.
+
+    This lifecycle tool is only for the managed Hermes prompt created when the
+    owner activates an assignment. Pass its exact work-order, source-session,
+    definition-version, and Hermes-job values. The server validates the binding,
+    skips overlapping runs, creates a fresh private run notebook, and returns the
+    immutable execution contract. Finish every successful begin exactly once.
+    """
+    args = {
+        "work_order_id": work_order_id,
+        "source_session_id": source_session_id,
+        "definition_version": definition_version,
+        "hermes_job_id": hermes_job_id,
+    }
+
+    def begin():
+        import calliope
+
+        if not calliope.is_enabled():
+            raise RuntimeError("Calliope is not configured on this Warehouse")
+        envelope = _hermes_mcp_envelope() or {}
+        return calliope.begin_work_order_run(
+            _conn,
+            work_order_id,
+            source_session_id,
+            definition_version,
+            hermes_job_id,
+            trigger_kind="scheduled",
+            scheduler_session_id=envelope.get("session_id"),
+        )
+
+    return _logged("begin_calliope_work_order_run", args, begin)
+
+
+def _mcp_get_calliope_work_order_personal_context(
+    run_id: str,
+    include_resolved: bool = True,
+    limit: int = 30,
+):
+    """Read the assignment owner's latest private Brief, notes, and Work Inbox.
+
+    The exact assignment run UUID is the opaque capability; there is no email
+    argument and ownership is always resolved server-side. Use this only when
+    the returned assignment contract says the owner's personal context matters.
+    """
+    args = {
+        "run_id": run_id,
+        "include_resolved": include_resolved,
+        "limit": limit,
+    }
+
+    def resolve():
+        import calliope
+
+        if not calliope.is_enabled():
+            raise RuntimeError("Calliope is not configured on this Warehouse")
+        return calliope.work_order_personal_context(
+            _conn, run_id, include_resolved, limit
+        )
+
+    return _logged("get_calliope_work_order_personal_context", args, resolve)
+
+
+def _mcp_finish_calliope_work_order_run(
+    run_id: str,
+    status: str,
+    summary: str,
+    details: dict | list | None = None,
+    steps: list[dict | str] | None = None,
+    artifacts: list[dict | str] | None = None,
+    action_prompt: str | None = None,
+    attention_required: bool = True,
+    changed: bool = True,
+):
+    """Finish one managed assignment and apply its notification policy.
+
+    Call exactly once after a successful begin. Report only user-visible steps,
+    never hidden reasoning. For a healthy recurring check with no meaningful
+    change, set both `attention_required` and `changed` false; the result remains
+    in its run notebook but `attention` notification policy will not clutter the
+    Work Inbox. Exact artifact refs are verified against the owner's access.
+    """
+    args = {
+        "run_id": run_id,
+        "status": status,
+        "summary": summary,
+        "details": details,
+        "steps": steps,
+        "artifacts": artifacts,
+        "action_prompt": action_prompt,
+        "attention_required": attention_required,
+        "changed": changed,
+    }
+
+    def finish():
+        import calliope
+
+        if not calliope.is_enabled():
+            raise RuntimeError("Calliope is not configured on this Warehouse")
+        return calliope.finish_work_order_run(
+            _conn,
+            run_id,
+            status,
+            summary,
+            details,
+            steps,
+            artifacts,
+            action_prompt,
+            attention_required,
+            changed,
+        )
+
+    return _logged("finish_calliope_work_order_run", args, finish)
+
+
+_mcp_draft_calliope_work_order.__annotations__ = {
+    "session_id": str,
+    "title": str,
+    "instruction": str,
+    "schedule": str | None,
+    "trigger_kind": str | None,
+    "timezone_name": str | None,
+    "notification_policy": str,
+    "approval_policy": str,
+    "context": dict | None,
+}
+_mcp_begin_calliope_work_order_run.__annotations__ = {
+    "work_order_id": str,
+    "source_session_id": str,
+    "definition_version": int,
+    "hermes_job_id": str,
+}
+_mcp_get_calliope_work_order_personal_context.__annotations__ = {
+    "run_id": str,
+    "include_resolved": bool,
+    "limit": int,
+}
+_mcp_finish_calliope_work_order_run.__annotations__ = {
+    "run_id": str,
+    "status": str,
+    "summary": str,
+    "details": dict | list | None,
+    "steps": list[dict | str] | None,
+    "artifacts": list[dict | str] | None,
+    "action_prompt": str | None,
+    "attention_required": bool,
+    "changed": bool,
+}
 
 
 def _mcp_begin_calliope_workflow_run(workflow_id, source_session_id, version):
@@ -16567,10 +18136,19 @@ def _register(mcp):
         _mcp_run_sql_multi,
     ):
         attributed_tool.__annotations__["ctx"] = FastMCPContext
+    # This file postpones annotations, while the bundled FastMCP registrar
+    # inspects raw signature objects. Attach the real enum at the same boundary
+    # so it publishes a strict table|chart schema instead of seeing a string.
+    for query_presentation_tool in (
+        _mcp_calliope_sheet_query,
+        _mcp_run_sql,
+        _mcp_run_sql_multi,
+    ):
+        query_presentation_tool.__annotations__["default_view"] = Literal[
+            "table", "chart"
+        ]
 
-    mcp.tool(name="search_data")(lambda query, limit=8, schema=None: _logged(
-        "search_data", {"query": query, "limit": limit, "schema": schema},
-        lambda: tool_search_data(query, limit, schema)))
+    mcp.tool(name="search_data")(_mcp_search_data)
     mcp.tool(name="capability_search")(lambda query, limit=8, kinds=None: _logged(
         "capability_search", {"query": query, "limit": limit, "kinds": kinds},
         lambda: tool_capability_search(query, limit, kinds)))
@@ -16686,41 +18264,26 @@ def _register(mcp):
         "compare", {"metric": metric, "period_a": period_a, "period_b": period_b, "by": by},
         lambda: tool_compare(metric, period_a, period_b, by, params)))
     # document brain — caller identity comes from the OAuth token (_caller), never a tool argument
-    mcp.tool(name="ask_brain")(lambda query, k=8, filters=None: _logged(
-        "ask_brain", {"query": query, "k": k, "filters": filters},
-        lambda: tool_ask_brain(query, k, filters, _caller()[0])))
+    mcp.tool(name="ask_brain")(_mcp_ask_brain)
     mcp.tool(name="system_learning_status")(lambda: _logged(
         "system_learning_status", {}, tool_system_learning_status))
     mcp.tool(name="sync_system_learning")(_mcp_sync_system_learning)
     mcp.tool(name="ask_system_learning")(lambda query, k=8: _logged(
         "ask_system_learning", {"query": query, "k": k},
         lambda: tool_ask_system_learning(query, k, _caller()[0])))
-    mcp.tool(name="brain_facets")(lambda: _logged(
-        "brain_facets", {}, lambda: tool_brain_facets(_caller()[0])))
-    mcp.tool(name="brain_browse")(lambda: _logged(
-        "brain_browse", {}, lambda: tool_brain_browse(_caller()[0])))
+    mcp.tool(name="brain_facets")(_mcp_brain_facets)
+    mcp.tool(name="brain_browse")(_mcp_brain_browse)
     mcp.tool(name="brain_get_doc")(_mcp_brain_get_doc)
     mcp.tool(name="brain_context")(_mcp_brain_context)
     mcp.tool(name="brain_related")(_mcp_brain_related)
     mcp.tool(name="calliope_sheet_snapshot")(_mcp_calliope_sheet_snapshot)
     mcp.tool(name="calliope_sheet_query")(_mcp_calliope_sheet_query)
-    mcp.tool(name="brain_entity")(lambda name: _logged(
-        "brain_entity", {"name": name}, lambda: tool_brain_entity(name, _caller()[0])))
-    mcp.tool(name="brain_ingest")(lambda source, title, body, roles=None, folder=None, uri=None, author=None, occurred_at=None: _logged(
-        "brain_ingest", {"source": source, "title": title, "roles": roles},
-        lambda: tool_brain_ingest(source, title, body, roles, folder, uri, author, occurred_at)))
-    mcp.tool(name="brain_grant")(lambda role, principal, on=True: _logged(
-        "brain_grant", {"role": role, "principal": principal, "on": on},
-        lambda: tool_brain_grant(role, principal, on)))
-    mcp.tool(name="brain_exclude")(lambda doc_id, principal, reason=None: _logged(
-        "brain_exclude", {"doc_id": doc_id, "principal": principal},
-        lambda: tool_brain_exclude(doc_id, principal, reason)))
-    mcp.tool(name="brain_crawl_folder")(lambda path, source=None, roles=None, base_folder=None, recursive=True, max_files=500: _logged(
-        "brain_crawl_folder", {"path": path, "source": source, "roles": roles, "recursive": recursive},
-        lambda: tool_brain_crawl_folder(path, source, roles, base_folder, recursive, max_files)))
-    mcp.tool(name="brain_set_doc_roles")(lambda doc_id, roles=None: _logged(
-        "brain_set_doc_roles", {"doc_id": doc_id, "roles": roles},
-        lambda: tool_brain_set_doc_roles(doc_id, roles)))
+    mcp.tool(name="brain_entity")(_mcp_brain_entity)
+    mcp.tool(name="brain_ingest")(_mcp_brain_ingest)
+    mcp.tool(name="brain_grant")(_mcp_brain_grant)
+    mcp.tool(name="brain_exclude")(_mcp_brain_exclude)
+    mcp.tool(name="brain_crawl_folder")(_mcp_brain_crawl_folder)
+    mcp.tool(name="brain_set_doc_roles")(_mcp_brain_set_doc_roles)
     mcp.tool(name="validate_sql")(lambda sql, as_of=None: _logged(
         "validate_sql", {"sql": sql, "as_of": as_of}, lambda: tool_validate_sql(sql, as_of)))
     mcp.tool(name="run_sql")(_mcp_run_sql)
@@ -16748,6 +18311,10 @@ def _register(mcp):
         import re as _re
         limit = max(1, min(int(limit or 8), 25))
         index = [t for t in _tool_index() if t["name"] not in ("search_tools", "get_tool_help")]
+        visible_names = _capability_visible_names(
+            "cap_mcp_tool", [t["name"] for t in index]
+        )
+        index = [t for t in index if t["name"] in visible_names]
         words = [w for w in _re.split(r"[^a-z0-9]+", (query or "").lower()) if len(w) > 1]
         if not words:
             names = sorted(t["name"] for t in index)
@@ -16786,9 +18353,11 @@ def _register(mcp):
             names = [names]
         if not isinstance(names, list) or not names:
             return {"error": {"code": "BAD_NAMES", "message": "names must be a non-empty list of tool names"}}
-        by_name = {}
-        for t in mcp._tool_manager.list_tools():
-            by_name[t.name] = t
+        tools = list(mcp._tool_manager.list_tools())
+        visible_names = _capability_visible_names(
+            "cap_mcp_tool", [t.name for t in tools]
+        )
+        by_name = {t.name: t for t in tools if t.name in visible_names}
         out, missing = [], []
         for n in [str(x) for x in names][:16]:
             t = by_name.get(n)
@@ -16843,15 +18412,32 @@ def _register(mcp):
     mcp.tool(name="artifact_restore")(_mcp_artifact_restore)
     mcp.tool(name="calliope_session_access_get")(_mcp_calliope_session_access_get)
     mcp.tool(name="calliope_session_access_update")(_mcp_calliope_session_access_update)
+    mcp.tool(name="create_calliope_sketch")(_mcp_create_calliope_sketch)
+    mcp.tool(name="read_calliope_sketch")(_mcp_read_calliope_sketch)
+    mcp.tool(name="update_calliope_sketch")(_mcp_update_calliope_sketch)
+    mcp.tool(name="draft_calliope_playbook")(_mcp_draft_calliope_playbook)
+    mcp.tool(name="read_calliope_playbook")(_mcp_read_calliope_playbook)
+    mcp.tool(name="approve_calliope_playbook")(_mcp_approve_calliope_playbook)
+    mcp.tool(name="set_calliope_playbook_access")(
+        _mcp_set_calliope_playbook_access
+    )
+    mcp.tool(name="archive_calliope_playbook")(_mcp_archive_calliope_playbook)
     mcp.tool(name="draft_calliope_instrument")(_mcp_draft_calliope_instrument)
     mcp.tool(name="draft_calliope_workflow")(_mcp_draft_calliope_workflow)
+    mcp.tool(name="draft_calliope_work_order")(_mcp_draft_calliope_work_order)
     mcp.tool(name="search_calliope_actions")(_mcp_search_calliope_actions)
-    mcp.tool(name="plan_calliope_action")(_mcp_plan_calliope_action)
-    mcp.tool(name="execute_calliope_action")(_mcp_execute_calliope_action)
+    mcp.tool(name="administer_calliope_action")(_mcp_administer_calliope_action)
+    mcp.tool(name="administer_local_sql")(_mcp_administer_local_sql)
+    mcp.tool(name="mirror_status")(_mcp_mirror_status)
     mcp.tool(name="export_to_google_sheets")(_mcp_export_to_google_sheets)
     mcp.tool(name="begin_calliope_workflow_run")(_mcp_begin_calliope_workflow_run)
     mcp.tool(name="get_calliope_personal_context")(_mcp_get_calliope_personal_context)
     mcp.tool(name="finish_calliope_workflow_run")(_mcp_finish_calliope_workflow_run)
+    mcp.tool(name="begin_calliope_work_order_run")(_mcp_begin_calliope_work_order_run)
+    mcp.tool(name="get_calliope_work_order_personal_context")(
+        _mcp_get_calliope_work_order_personal_context
+    )
+    mcp.tool(name="finish_calliope_work_order_run")(_mcp_finish_calliope_work_order_run)
     mcp.tool(name="live_app_template")(_mcp_live_app_template)
     mcp.tool(name="create_live_app")(_mcp_create_live_app)
     mcp.tool(name="update_live_app")(_mcp_update_live_app)
@@ -16935,7 +18521,12 @@ def _selftest():
 _INSTRUCTIONS = (
     "rvbbit warehouse — a governed, semantic, time-travel data warehouse. Discover tables/columns "
     "by what their data is about with search_data; get official numbers with metric(); explore SQL "
-    "with validate_sql then run_sql (read-only). Use system_learning_status and ask_system_learning "
+    "with validate_sql then run_sql (read-only). A signed-in Admins Team member may use "
+    "administer_local_sql for appliance-local RVBBIT DBA work when no narrower typed action exists. "
+    "Its SELECT/WITH-shaped statements run directly on the writable local connection; explicit "
+    "DDL/DML/CALL/DO/GRANT/REVOKE is frozen first and requires explicit user approval before the "
+    "same tool executes the receipt. Never place credentials or remote source DSNs in SQL. Use "
+    "system_learning_status and ask_system_learning "
     "before tuning or diagnosing RVBBIT workloads: they expose learned routing, acceleration, layout, "
     "and operator breadcrumbs from the same Brain corpus the SQL Desktop shows. "
     "TOOL DISCOVERY: this server exposes ~80 tools — when unsure which to use, call "
@@ -16958,6 +18549,22 @@ _INSTRUCTIONS = (
     "calliope_session_access_update; the viewer lists are complete replacements, the owner remains "
     "implicit and solely able to run or change the notebook, and Everyone requires explicit "
     "confirmation. Brief, workflow-run, and action notebooks are not shareable. "
+    "CALLIOPE PLAYBOOKS: capability_search may return identity-filtered cap_playbook entries. "
+    "Load one with read_calliope_playbook before using it; it is an intent-level method, not a "
+    "fixed tool graph, so choose currently available tools at run time. draft_calliope_playbook "
+    "creates or revises a private immutable method from successful notebook work. A revision does "
+    "not replace the searchable version until its owner explicitly asks to approve it with "
+    "approve_calliope_playbook. Sharing uses exact Teams or observed people, Everyone requires "
+    "confirmation, and archived Playbooks disappear from discovery without losing history. "
+    "CALLIOPE SKETCHES: proactive Sketch creation is authorized only when the surrounding "
+    "instructions identify the current surface as the Calliope web notebook. In Google Chat, "
+    "scheduled work, or another direct MCP client, use a Sketch only when the human explicitly "
+    "requests one. create_calliope_sketch is for a diagram, process, system map, spatial explanation, "
+    "or shared visual scratchpad that is clearer than prose but lighter than a dashboard. A "
+    "notebook has one persistent human-editable Sketch. Read its latest revision "
+    "before update_calliope_sketch and use only typed operations; use label on shapes/connectors, "
+    "from_id/to_id for auto-routed connectors, and snake_case fields inside style; never author raw "
+    "Excalidraw JSON. "
     "TO BUILD A LIVE APP: call `live_app_template(runtime_kind='html')` FIRST, edit the template, "
     "and call create_live_app. Hosted HTML apps live at /d/<slug>, are versioned, and call "
     "rvbbitQuery(sql) for live read-only data — one FLAT query per data concern (batch them with "
@@ -16986,9 +18593,50 @@ _INSTRUCTIONS = (
 )
 
 
+def _mcp_transport_security(public_url: str = ""):
+    """Keep DNS-rebinding protection on while admitting named appliance peers."""
+    from mcp.server.transport_security import TransportSecuritySettings
+
+    allowed_hosts = [
+        "127.0.0.1:*",
+        "localhost:*",
+        "[::1]:*",
+        "warehouse-mcp:*",
+        "rvbbit-warehouse-mcp:*",
+    ]
+    allowed_origins = [
+        "http://127.0.0.1:*",
+        "http://localhost:*",
+        "http://[::1]:*",
+    ]
+    parsed = urlsplit(str(public_url or "").strip())
+    if parsed.scheme in {"http", "https"} and parsed.hostname:
+        if parsed.netloc not in allowed_hosts:
+            allowed_hosts.append(parsed.netloc)
+        host_with_any_port = f"{parsed.hostname}:*"
+        if host_with_any_port not in allowed_hosts:
+            allowed_hosts.append(host_with_any_port)
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+        if origin not in allowed_origins:
+            allowed_origins.append(origin)
+    for candidate in os.environ.get("WAREHOUSE_MCP_ALLOWED_HOSTS", "").split(","):
+        candidate = candidate.strip()
+        if candidate and candidate not in allowed_hosts:
+            allowed_hosts.append(candidate)
+    return TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=allowed_hosts,
+        allowed_origins=allowed_origins,
+    )
+
+
 def _build_mcp():
     from mcp.server.fastmcp import FastMCP
-    m = FastMCP("rvbbit-warehouse", instructions=_INSTRUCTIONS)
+    m = FastMCP(
+        "rvbbit-warehouse",
+        instructions=_INSTRUCTIONS,
+        transport_security=_mcp_transport_security(),
+    )
     _register(m)
     _ensure_activity_table()
     _ensure_team_tables()
@@ -16996,7 +18644,32 @@ def _build_mcp():
     _ensure_artifact_access_tables()
     _start_semantic_enrichment_worker()
     _start_artifact_catalog_worker()
+    _start_business_topology_worker()
     return m
+
+
+def _start_business_topology_worker():
+    """Start the durable SQL-leased excavation worker once per process."""
+    try:
+        import business_topology_jobs
+        # Query-facing Warehouse deployments may intentionally use a read-only
+        # role.  Excavation also needs to claim jobs, persist progress, resolve
+        # the registered Hutch secret, and stage proposal bundles, so allow a
+        # dedicated appliance-internal DSN without weakening the public MCP
+        # query connection.
+        worker_dsn = (
+            os.environ.get("WAREHOUSE_BUSINESS_TOPOLOGY_DSN", "").strip() or DSN
+        )
+        if business_topology_jobs.start_worker(worker_dsn):
+            print(
+                "Business Topology workflow worker enabled (SQL-leased, resumable)",
+                file=sys.stderr,
+            )
+    except Exception as exc:  # noqa: BLE001 - MCP remains useful on older installs
+        print(
+            f"Business Topology workflow worker unavailable: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
 
 
 def _calliope_cube_pivot(
@@ -18805,7 +20478,8 @@ def _build_mcp_oauth(public: str):
     m = FastMCP("rvbbit-warehouse",
                 instructions=_INSTRUCTIONS,
                 auth_server_provider=provider,
-                auth=auth.make_auth_settings(public))
+                auth=auth.make_auth_settings(public),
+                transport_security=_mcp_transport_security(public))
     _register(m)
     _ensure_activity_table()
     _ensure_team_tables()
@@ -18813,6 +20487,7 @@ def _build_mcp_oauth(public: str):
     _ensure_artifact_access_tables()
     _start_semantic_enrichment_worker()
     _start_artifact_catalog_worker()
+    _start_business_topology_worker()
     import calliope
     calendar_grant = None
     workspace_grant = None

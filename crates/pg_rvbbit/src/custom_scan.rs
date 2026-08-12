@@ -267,10 +267,7 @@ impl Drop for HeapTailScan {
                 self.scan = std::ptr::null_mut();
             }
             if !self.rel.is_null() {
-                pg_sys::table_close(
-                    self.rel,
-                    pg_sys::AccessShareLock as pg_sys::LOCKMODE,
-                );
+                pg_sys::table_close(self.rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
                 self.rel = std::ptr::null_mut();
             }
         }
@@ -661,7 +658,10 @@ unsafe extern "C-unwind" fn begin_custom_scan(
             match fetch_row_group_paths(table_oid, needs_row_group_stats, None, asof) {
                 Ok(parquet_rgs) => (parquet_rgs, SCAN_LAYOUT.to_string()),
                 Err(e) => {
-                    pgrx::error!("rvbbit custom scan: vortex tombstone fallback failed: {}", e)
+                    pgrx::error!(
+                        "rvbbit custom scan: vortex tombstone fallback failed: {}",
+                        e
+                    )
                 }
             }
         } else {
@@ -791,14 +791,15 @@ fn heap_tail_config_for_table(
     }
     let append_only = retained && !has_update && !has_delete && !has_truncate;
     let overlay_readable = retained
-        && (append_only || overlay_ready_for_table(table_oid).map_err(|e| format!("SPI overlay ready: {e}"))?);
+        && (append_only
+            || overlay_ready_for_table(table_oid)
+                .map_err(|e| format!("SPI overlay ready: {e}"))?);
     if overlay_readable {
         let watermark_xid = parse_xid_numeric(&watermark)
             .ok_or_else(|| format!("invalid heap-tail watermark {watermark:?}"))?;
         if watermark_xid == 0 {
             return Err(
-                "dirty table has no acceleration watermark; use heap scan or refresh"
-                    .to_string(),
+                "dirty table has no acceleration watermark; use heap scan or refresh".to_string(),
             );
         }
         let reference_xmax = parse_xid_numeric(&reference_xmax)
@@ -3126,7 +3127,8 @@ unsafe fn emit_indexed_row(
             let Some(batch) = state.cached_batches.get(row_ref.batch_idx).cloned() else {
                 continue;
             };
-            qual_readers = build_qual_readers_for_batch(&batch, &state.pg_attrs, &state.pushed_quals);
+            qual_readers =
+                build_qual_readers_for_batch(&batch, &state.pg_attrs, &state.pushed_quals);
             qual_rhs_readers =
                 build_qual_rhs_readers_for_batch(&batch, &state.pg_attrs, &state.pushed_quals);
             column_readers =
@@ -4367,12 +4369,7 @@ unsafe extern "C-unwind" fn explain_custom_scan(
     pg_sys::ExplainPropertyBool(label.as_ptr(), state.heap_tail.is_some(), es);
     if let Some(tail) = state.heap_tail.as_ref() {
         let label = std::ffi::CString::new("Heap Tail Rows").unwrap();
-        pg_sys::ExplainPropertyInteger(
-            label.as_ptr(),
-            std::ptr::null(),
-            tail.emitted,
-            es,
-        );
+        pg_sys::ExplainPropertyInteger(label.as_ptr(), std::ptr::null(), tail.emitted, es);
     }
 }
 
@@ -4399,7 +4396,10 @@ mod tests {
         let gen: i64 = Spi::get_one("SELECT rvbbit.tombstone('mvcc1c'::regclass, 0::bigint, 3)")
             .unwrap()
             .unwrap();
-        assert!(gen >= 1, "tombstone() should return an allocated generation, got {gen}");
+        assert!(
+            gen >= 1,
+            "tombstone() should return an allocated generation, got {gen}"
+        );
     }
 
     // mvcc-08: xid_to_fxid reconstructs the full 64-bit xid; its low 32 bits must
@@ -4418,7 +4418,10 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert!(ok, "xid_to_fxid low 32 bits must equal the bare xmin in any epoch");
+        assert!(
+            ok,
+            "xid_to_fxid low 32 bits must equal the bare xmin in any epoch"
+        );
     }
 
     // resources-02/ops-02: reap_logs deletes rows older than max_age and leaves
@@ -4435,21 +4438,27 @@ mod tests {
             "INSERT INTO rvbbit.accel_tick_runs (table_name, action, ran_at) VALUES ('t', 'skip', now())",
         )
         .unwrap();
-        let before: i64 =
-            Spi::get_one("SELECT count(*) FROM rvbbit.accel_tick_runs WHERE ran_at < now() - interval '14 days'")
-                .unwrap()
-                .unwrap();
+        let before: i64 = Spi::get_one(
+            "SELECT count(*) FROM rvbbit.accel_tick_runs WHERE ran_at < now() - interval '14 days'",
+        )
+        .unwrap()
+        .unwrap();
         assert!(before >= 1, "should have an old row to reap");
         Spi::run("SELECT rvbbit.reap_logs(interval '14 days')").unwrap();
-        let old_left: i64 =
-            Spi::get_one("SELECT count(*) FROM rvbbit.accel_tick_runs WHERE ran_at < now() - interval '14 days'")
-                .unwrap()
-                .unwrap();
-        assert_eq!(old_left, 0, "reap_logs should delete rows older than max_age");
-        let recent: i64 =
-            Spi::get_one("SELECT count(*) FROM rvbbit.accel_tick_runs WHERE ran_at >= now() - interval '1 day'")
-                .unwrap()
-                .unwrap();
+        let old_left: i64 = Spi::get_one(
+            "SELECT count(*) FROM rvbbit.accel_tick_runs WHERE ran_at < now() - interval '14 days'",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            old_left, 0,
+            "reap_logs should delete rows older than max_age"
+        );
+        let recent: i64 = Spi::get_one(
+            "SELECT count(*) FROM rvbbit.accel_tick_runs WHERE ran_at >= now() - interval '1 day'",
+        )
+        .unwrap()
+        .unwrap();
         assert!(recent >= 1, "reap_logs must keep recent rows");
     }
 
@@ -4475,7 +4484,10 @@ mod tests {
         let n: i64 = Spi::get_one("SELECT rvbbit.export_to_parquet('sf_keys'::regclass)")
             .unwrap()
             .unwrap();
-        assert_eq!(n, 2, "export_to_parquet should write both rows of the uuid/numeric/enum table");
+        assert_eq!(
+            n, 2,
+            "export_to_parquet should write both rows of the uuid/numeric/enum table"
+        );
     }
 
     // Production regression: Salesforce array columns such as term_ids are
@@ -4504,6 +4516,9 @@ mod tests {
         let n: i64 = Spi::get_one("SELECT rvbbit.export_to_parquet('sf_arrays'::regclass)")
             .unwrap()
             .unwrap();
-        assert_eq!(n, 3, "export_to_parquet should write PostgreSQL array columns");
+        assert_eq!(
+            n, 3,
+            "export_to_parquet should write PostgreSQL array columns"
+        );
     }
 }

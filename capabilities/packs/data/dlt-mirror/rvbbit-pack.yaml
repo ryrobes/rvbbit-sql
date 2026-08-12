@@ -1,0 +1,76 @@
+api_version: rvbbit.pack/v1
+id: data/dlt-mirror
+name: dlt_mirror
+title: dlt SQL Mirror Worker
+description: "Pinned dlt worker for scheduled SQL database mirrors into RVBBIT-registered Postgres heap tables."
+license: apache-2.0
+system_runtime: true
+capability_role: data_mover
+tags:
+- runtime
+- data-mover
+- mirror
+- dlt
+- postgres
+- mysql
+- mssql
+- oracle
+- db2
+- cpu
+- system-runtime
+capability: capability.yaml
+source:
+  provider: github
+  model: dlt-hub/dlt
+  revision: 1.29.1
+runtime:
+  mode: build
+  template: dlt-mirror
+  handler: dlt_mirror
+  device: cpu
+  port: 9182
+  health_path: /health
+exports:
+  runtime: dlt_mirror
+install:
+  mode: build
+  warren: true
+  docker: true
+acceptance:
+  target_selector:
+    capability: true
+    docker: true
+    gpu: false
+  tests:
+  - name: dlt_mirror_registered_ready
+    description: Assert Warren registered the dlt mirror worker and its SQL control plane exists.
+    sql: |
+      DO $$
+      DECLARE
+          source text;
+      BEGIN
+          SELECT runtime_source
+          INTO source
+          FROM rvbbit.python_runtimes
+          WHERE name = 'dlt_mirror'
+            AND language = 'data_mover'
+            AND status = 'ready'
+            AND endpoint_url IS NOT NULL
+            AND endpoint_url <> '';
+
+          IF source IS NULL THEN
+              RAISE EXCEPTION 'dlt_mirror runtime is not registered as ready';
+          END IF;
+          IF to_regclass('rvbbit.mirror_jobs') IS NULL THEN
+              RAISE EXCEPTION 'dlt mirror control plane is not installed';
+          END IF;
+          IF source = 'warren' AND NOT EXISTS (
+              SELECT 1
+              FROM rvbbit.warren_inventory
+              WHERE runtime_name = 'dlt_mirror'
+                AND deployment_status = 'running'
+          ) THEN
+              RAISE EXCEPTION 'dlt_mirror deployment is not running in Warren inventory';
+          END IF;
+      END
+      $$;

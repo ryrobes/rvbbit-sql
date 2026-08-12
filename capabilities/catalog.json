@@ -610,6 +610,84 @@
         "teardown_sql": [],
         "tests": [
           {
+            "description": "Assert Warren registered the dlt mirror worker and its SQL control plane exists.",
+            "name": "dlt_mirror_registered_ready",
+            "sql": "DO $$\nDECLARE\n    source text;\nBEGIN\n    SELECT runtime_source\n    INTO source\n    FROM rvbbit.python_runtimes\n    WHERE name = 'dlt_mirror'\n      AND language = 'data_mover'\n      AND status = 'ready'\n      AND endpoint_url IS NOT NULL\n      AND endpoint_url <> '';\n\n    IF source IS NULL THEN\n        RAISE EXCEPTION 'dlt_mirror runtime is not registered as ready';\n    END IF;\n    IF to_regclass('rvbbit.mirror_jobs') IS NULL THEN\n        RAISE EXCEPTION 'dlt mirror control plane is not installed';\n    END IF;\n    IF source = 'warren' AND NOT EXISTS (\n        SELECT 1\n        FROM rvbbit.warren_inventory\n        WHERE runtime_name = 'dlt_mirror'\n          AND deployment_status = 'running'\n    ) THEN\n        RAISE EXCEPTION 'dlt_mirror deployment is not running in Warren inventory';\n    END IF;\nEND\n$$;\n"
+          }
+        ]
+      },
+      "acceptance_tests": [
+        "dlt_mirror_registered_ready"
+      ],
+      "backend_name": null,
+      "backend_transport": "rvbbit",
+      "capability_role": "data_mover",
+      "catalog_visibility": "public",
+      "description": "Pinned dlt worker for scheduled SQL database mirrors into RVBBIT-registered Postgres heap tables.",
+      "device": "cpu",
+      "endpoint_path": "/",
+      "gpu_placement": null,
+      "gpu_required": false,
+      "health_path": "/health",
+      "id": "data/dlt-mirror",
+      "install_docker": true,
+      "install_mode": "build",
+      "install_warren": true,
+      "kind": "runtime_sidecar",
+      "license": "apache-2.0",
+      "manifest_path": "capabilities/packs/data/dlt-mirror/capability.yaml",
+      "model_size_bytes": null,
+      "name": "dlt_mirror",
+      "operators": [],
+      "pack_api_version": "rvbbit.pack/v1",
+      "pack_id": "data/dlt-mirror",
+      "pack_manifest_path": "capabilities/packs/data/dlt-mirror/rvbbit-pack.yaml",
+      "pack_path": "capabilities/packs/data/dlt-mirror",
+      "provider_model": null,
+      "provider_name": null,
+      "provider_set_default": false,
+      "repo_url": null,
+      "resources": {},
+      "runtime_handler": "dlt_mirror",
+      "runtime_image": null,
+      "runtime_language": "data_mover",
+      "runtime_mode": "build",
+      "runtime_name": "dlt_mirror",
+      "runtime_port": 9182,
+      "runtime_template": "dlt-mirror",
+      "source_model": "dlt-hub/dlt",
+      "source_provider": "github",
+      "source_revision": "1.29.1",
+      "source_url": null,
+      "system_runtime": true,
+      "tags": [
+        "runtime",
+        "data-mover",
+        "mirror",
+        "dlt",
+        "postgres",
+        "mysql",
+        "mssql",
+        "oracle",
+        "db2",
+        "cpu",
+        "system-runtime"
+      ],
+      "title": "dlt SQL Mirror Worker",
+      "vram_headroom_pct": null,
+      "vram_required_bytes": null
+    },
+    {
+      "acceptance": {
+        "setup_sql": [],
+        "target_selector": {
+          "capability": true,
+          "docker": true,
+          "gpu": false
+        },
+        "teardown_sql": [],
+        "tests": [
+          {
             "description": "Assert Warren registered the Fletch data mover runtime.",
             "name": "fletch_data_mover_registered_ready",
             "sql": "DO $$\nDECLARE\n    source text;\nBEGIN\n    SELECT runtime_source\n    INTO source\n    FROM rvbbit.python_runtimes\n    WHERE name = 'fletch_data_mover'\n      AND language = 'data_mover'\n      AND status = 'ready'\n      AND endpoint_url IS NOT NULL\n      AND endpoint_url <> '';\n\n    IF source IS NULL THEN\n        RAISE EXCEPTION 'fletch_data_mover runtime is not registered as ready';\n    END IF;\n\n    IF source = 'warren' AND NOT EXISTS (\n        SELECT 1\n        FROM rvbbit.warren_inventory\n        WHERE runtime_name = 'fletch_data_mover'\n          AND deployment_status = 'running'\n    ) THEN\n        RAISE EXCEPTION 'fletch_data_mover deployment is not running in Warren inventory';\n    END IF;\nEND\n$$;\n"

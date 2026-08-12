@@ -23,7 +23,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         zstd libzstd-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Rust toolchain (stable). Pinned to keep CI reproducible; bump as needed.
+# Rust toolchain. Pinned to keep local, CI, and image builds reproducible.
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
         | sh -s -- -y --default-toolchain 1.95.0 --profile minimal
 ENV PATH="/root/.cargo/bin:${PATH}"
@@ -124,6 +124,7 @@ COPY capabilities/catalog.json /usr/share/rvbbit/capabilities/catalog.json
 COPY capabilities/packs/ /usr/share/rvbbit/capabilities/packs/
 COPY capabilities/templates/ /usr/share/rvbbit/capabilities/templates/
 COPY capabilities/tools/ /usr/share/rvbbit/capabilities/tools/
+RUN chmod -R a+rX /usr/share/rvbbit/capabilities
 
 # Pre-load extension on first boot.
 COPY docker/init/ /docker-entrypoint-initdb.d/

@@ -10,4 +10,3 @@ extension_sql_file!(
     name = "accel_worker_fair_claims",
     requires = ["bounded_heavy_maintenance_slots"]
 );
-

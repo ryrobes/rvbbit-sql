@@ -7,6 +7,7 @@ import importlib.util
 import json
 import sys
 import types
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -126,6 +127,18 @@ def test_calliope_page_renders_the_shared_account_control(monkeypatch, tmp_path)
         "private, no-store, max-age=0, must-revalidate"
     )
 
+    setup_response = asyncio.run(
+        routes[("/calliope/setup", ("GET",))](Request())
+    )
+    setup_page = setup_response.body.decode("utf-8")
+    assert '<body data-warehouse-page="calliope" data-calliope-mode="setup">' in setup_page
+    assert "<title>Set up Calliope · RVBBIT.AI</title>" in setup_page
+    assert '<a class="brand" aria-disabled="true"' in setup_page
+    assert 'id="setup-rail"' in setup_page
+    assert 'data-warehouse-account' not in setup_page
+    assert "__CALLIOPE_MODE__" not in setup_page
+    assert "__CALLIOPE_BRAND_LINK__" not in setup_page
+
     class VersionedAssetRequest(Request):
         query_params = {"v": calliope._ASSET_VERSION}
 
@@ -144,6 +157,873 @@ def test_calliope_page_renders_the_shared_account_control(monkeypatch, tmp_path)
     assert fallback.headers["cache-control"] == (
         "private, no-cache, max-age=0, must-revalidate"
     )
+
+
+def test_setup_shell_reuses_calliope_stage_chat_and_durable_session_contract():
+    page = (calliope._ASSET_DIR / "index.html").read_text(encoding="utf-8")
+    script = (calliope._ASSET_DIR / "calliope.js").read_text(encoding="utf-8")
+    css = (calliope._ASSET_DIR / "calliope.css").read_text(encoding="utf-8")
+    source = (_HERE / "calliope.py").read_text(encoding="utf-8")
+    root = _HERE.parents[1]
+    migration = (
+        root / "crates/pg_rvbbit/sql/migrations/0288_calliope_setup_sessions.sql"
+    ).read_text(encoding="utf-8")
+    registry = (root / "crates/pg_rvbbit/src/migrations.rs").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'id="setup-todo-list"' in page
+    assert 'id="stage" class="stage"' in page
+    assert 'id="messages" class="messages"' in page
+    assert 'data-calliope-mode="__CALLIOPE_MODE__"' in page
+    assert 'document.body.dataset.calliopeMode === "setup"' in script
+    assert '"/api/calliope/setup"' in script
+    assert '"/api/calliope/sessions?purpose=setup"' in script
+    assert "data-setup-prompt" in script
+    assert 'body[data-calliope-mode="setup"] .setup-rail' in css
+    assert 'body[data-calliope-mode="setup"] .top-context>:not(.setup-context)' in css
+    assert '@mcp.custom_route("/calliope/setup", methods=["GET"])' in source
+    assert '@mcp.custom_route("/api/calliope/setup", methods=["POST"])' in source
+    assert "AND s.purpose=%s" in source
+    assert "WHERE purpose = 'setup'" in migration
+    assert "calliope_sessions_owner_setup_idx" in migration
+    assert '"0288_calliope_setup_sessions"' in registry
+
+
+def test_setup_checklist_is_derived_from_real_turn_surface_and_mirror_receipts():
+    session_id = "5915e4aa-1c86-4d8e-9ea3-f6f08bb47397"
+
+    class Result:
+        def __init__(self, row):
+            self.row = row
+
+        def fetchone(self):
+            return self.row
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def execute(self, sql, _params=None):
+            if "AS completed_turns" in sql:
+                return Result({"completed_turns": 2})
+            if "AS surface_count" in sql:
+                return Result({
+                    "surface_count": 3,
+                    "company_receipts": 1,
+                    "proof_receipts": 1,
+                    "preflight_status": "ready",
+                    "proof_status": "ready",
+                })
+            if "to_regclass('rvbbit.mirror_connections')" in sql:
+                return Result({"connections": True, "jobs": True, "runs": True})
+            if "AS successful_runs" in sql:
+                return Result({"connections": 1, "jobs": 2, "successful_runs": 1})
+            raise AssertionError(sql)
+
+    snapshot = calliope._setup_workspace_snapshot(
+        Connection,
+        "admin@example.com",
+        {
+            "id": session_id,
+            "owner_email": "admin@example.com",
+            "title": "Set up your company brain",
+            "purpose": "setup",
+        },
+    )
+
+    statuses = {item["id"]: item["status"] for item in snapshot["items"]}
+    assert snapshot["mode"] == "setup"
+    assert snapshot["session"]["id"] == session_id
+    assert snapshot["session"]["purpose"] == "setup"
+    assert snapshot["progress"] == {
+        "completed": 5,
+        "total": 6,
+        "ready": True,
+        "launched": False,
+    }
+    assert statuses["preflight"] == "ready"
+    assert statuses["administrator"] == "ready"
+    assert statuses["company"] == "ready"
+    assert statuses["database"] == "ready"
+    assert statuses["knowledge"] == "optional"
+    assert statuses["proof"] == "ready"
+    assert statuses["launch"] == "current"
+
+    class NoReceiptConnection(Connection):
+        def execute(self, sql, params=None):
+            if "AS surface_count" in sql:
+                return Result({
+                    "surface_count": 3,
+                    "company_receipts": 0,
+                    "proof_receipts": 0,
+                    "preflight_status": "",
+                    "proof_status": "",
+                })
+            return super().execute(sql, params)
+
+    without_receipts = calliope._setup_workspace_snapshot(
+        NoReceiptConnection,
+        "admin@example.com",
+        snapshot["session"],
+    )
+    unverified = {item["id"]: item["status"] for item in without_receipts["items"]}
+    assert unverified["company"] == "current"
+    assert unverified["proof"] == "upcoming"
+    assert unverified["launch"] == "upcoming"
+    assert without_receipts["progress"]["ready"] is False
+
+
+def test_setup_instructions_keep_secrets_and_remote_sources_out_of_hermes():
+    ordinary = calliope._instructions([], None)
+    setup = calliope._instructions(
+        [],
+        None,
+        setup_mode=True,
+        setup_context={
+            "available": True,
+            "next_required_item": {"id": "company", "status": "current"},
+        },
+    )
+
+    assert "Hermes conversation memory supports continuity" in ordinary
+    assert "it is not the company brain" in ordinary
+    assert "CALLIOPE_HOSTED_SETUP_BEGIN" not in ordinary
+    assert "CALLIOPE_HOSTED_SETUP_BEGIN" in setup
+    assert "Never ask the user to paste a password, token, DSN" in setup
+    assert "must never connect to, query, or introspect a production source system" in setup
+    assert "Remote discovery and reads belong only to the dlt" in setup
+    assert "The hosted operator already supplies the LLM" in setup
+    assert "CALLIOPE_HOSTED_SETUP_STATE_BEGIN" in setup
+    assert '"next_required_item":{"id":"company","status":"current"}' in setup
+    assert "do not ask for a database source while the company profile" in setup
+
+
+def test_setup_instruction_context_has_one_deterministic_next_step_and_no_owner():
+    context = calliope._setup_instruction_context(
+        {
+            "items": [
+                {"id": "preflight", "title": "Services", "status": "ready", "required": True},
+                {"id": "administrator", "title": "Admin", "status": "ready", "required": True},
+                {"id": "company", "title": "Company", "status": "current", "required": True},
+                {"id": "database", "title": "Data", "status": "upcoming", "required": True},
+                {"id": "knowledge", "title": "Docs", "status": "optional", "required": False},
+            ],
+            "progress": {"completed": 2, "total": 6, "ready": False, "launched": False},
+            "facts": {"preflight_ready": True, "company_ready": False},
+            "company_profile": None,
+            "identity": {"email": "admin@example.com"},
+            "mutation_token": "do-not-copy",
+        },
+        active_item="company",
+    )
+
+    assert context["active_stage_item"] == "company"
+    assert context["next_required_item"]["id"] == "company"
+    assert context["required_order"] == ["preflight", "administrator", "company", "database"]
+    assert "admin@example.com" not in json.dumps(context)
+    assert "do-not-copy" not in json.dumps(context)
+
+
+def test_setup_browser_advances_stage_only_after_the_active_step_completes():
+    script = (calliope._ASSET_DIR / "calliope.js").read_text(encoding="utf-8")
+
+    assert "const previousActiveStatus" in script
+    assert "previousActiveStatus !== \"ready\" && activeNowReady" in script
+    assert 'state.setup.progress.launched ? "launch" : ""' in script
+    assert "item.required && item.status !== \"ready\"" in script
+    assert "{ setup_item: state.setup.activeItem }" in script
+
+
+def test_person_avatar_fallback_is_fetched_once_without_broken_image_requests():
+    script = (calliope._ASSET_DIR / "calliope.js").read_text(encoding="utf-8")
+
+    assert 'data-avatar-src="${escapeHtml(url)}"' in script
+    assert "const personAvatarLoads = new Map()" in script
+    assert "if (personAvatarLoads.has(url)) return personAvatarLoads.get(url)" in script
+    assert 'fetch(url, { credentials: "same-origin" })' in script
+    assert "if (!response.ok) return \"\"" in script
+
+
+def test_setup_connection_name_pattern_is_valid_under_browser_unicode_sets_mode():
+    script = (calliope._ASSET_DIR / "calliope.js").read_text(encoding="utf-8")
+
+    assert 'pattern="[a-z](?:[a-z0-9_]|-){2,62}"' in script
+    assert 'pattern="[a-z][a-z0-9_-]{2,62}"' not in script
+
+
+def test_setup_database_plan_keeps_source_names_and_requires_real_incremental_keys():
+    descriptor = calliope._setup_source_descriptor(
+        "postgresql+psycopg://report_reader:do-not-store@erp.internal:5432/acme",
+        "postgresql",
+    )
+    assert descriptor == {
+        "host": "erp.internal",
+        "port": "5432",
+        "database": "acme",
+    }
+    assert "report_reader" not in json.dumps(descriptor)
+    assert "do-not-store" not in json.dumps(descriptor)
+
+    plan = calliope._setup_mirror_plan(
+        {
+            "source_schema": "sales",
+            "destination_schema": "erp",
+            "schedule_seconds": 3600,
+            "tables": [
+                {
+                    "source_table": "Orders",
+                    "destination_table": "Orders",
+                    "load_mode": "snapshot",
+                    "primary_key": ["OrderID"],
+                },
+                {
+                    "source_table": "OrderLines",
+                    "destination_table": "OrderLines",
+                    "load_mode": "incremental_upsert",
+                    "primary_key": ["OrderLineID"],
+                    "cursor_column": "UpdatedAt",
+                },
+            ],
+        },
+        "erp_prod",
+    )
+    assert plan["destination_schema"] == "erp"
+    assert [item["destination_table"] for item in plan["tables"]] == [
+        "orders",
+        "order_lines",
+    ]
+    assert [item["source_table"] for item in plan["tables"]] == [
+        "Orders",
+        "OrderLines",
+    ]
+    assert all(not item["destination_table"].startswith("mirror_") for item in plan["tables"])
+    assert plan["job_name"] == "erp_prod_sales"
+
+    with pytest.raises(ValueError, match="requires its primary key"):
+        calliope._setup_mirror_plan(
+            {
+                "source_schema": "sales",
+                "destination_schema": "erp",
+                "tables": [
+                    {
+                        "source_table": "Orders",
+                        "load_mode": "incremental_upsert",
+                    }
+                ],
+            },
+            "erp_prod",
+        )
+    with pytest.raises(ValueError, match="reserved system schemas"):
+        calliope._setup_mirror_plan(
+            {
+                "source_schema": "sales",
+                "destination_schema": "public",
+                "tables": [{"source_table": "Orders"}],
+            },
+            "erp_prod",
+        )
+
+
+def test_setup_receipts_are_bounded_and_strip_connection_credentials():
+    receipt = calliope._bounded_setup_receipt(
+        {
+            "type": "catalog_discovery",
+            "status": "needs attention",
+            "connection_name": "erp_prod",
+            "error": (
+                "could not connect to "
+                "postgresql://report_reader:do-not-store@erp.internal/acme?api_key=also-secret"
+            ),
+            "tables": [
+                {
+                    "name": "Orders",
+                    "primary_key": ["OrderID"],
+                    "columns": [{"name": f"column_{index}"} for index in range(80)],
+                }
+                for _ in range(150)
+            ],
+        }
+    )
+    encoded = json.dumps(receipt)
+    assert "do-not-store" not in encoded
+    assert "also-secret" not in encoded
+    assert "report_reader" not in encoded
+    assert len(receipt["tables"]) == 100
+    assert len(receipt["tables"][0]["columns"]) == 32
+
+
+def test_hosted_first_boot_has_typed_state_review_routes_and_source_backed_proof():
+    script = (calliope._ASSET_DIR / "calliope.js").read_text(encoding="utf-8")
+    css = (calliope._ASSET_DIR / "calliope.css").read_text(encoding="utf-8")
+    source = (_HERE / "calliope.py").read_text(encoding="utf-8")
+    root = _HERE.parents[1]
+    migration = (
+        root / "crates/pg_rvbbit/sql/migrations/0291_calliope_first_boot.sql"
+    ).read_text(encoding="utf-8")
+    registry = (root / "crates/pg_rvbbit/src/migrations.rs").read_text(
+        encoding="utf-8"
+    )
+
+    assert "CREATE TABLE IF NOT EXISTS rvbbit.company_profile" in migration
+    assert "CREATE TABLE IF NOT EXISTS rvbbit.appliance_setup" in migration
+    assert "business_questions text[]" in migration
+    assert '"0291_calliope_first_boot"' in registry
+    for path in (
+        "/api/calliope/setup/preflight",
+        "/api/calliope/setup/company/plan",
+        "/api/calliope/setup/company/apply",
+        "/api/calliope/setup/proof/plan",
+        "/api/calliope/setup/proof/apply",
+        "/api/calliope/setup/launch/plan",
+        "/api/calliope/setup/launch/apply",
+    ):
+        assert f'@mcp.custom_route("{path}"' in source
+        assert f'"{path}"' in script
+    assert "A result qualifies only when Warehouse recorded non-empty rows" in script
+    assert "its originating question and lineage are already recorded" in script
+    assert ".setup-preflight-grid" in css
+    assert ".setup-identity-card" in css
+    assert ".setup-launch-gates" in css
+
+
+def test_setup_company_profile_plan_is_normalized_reviewable_and_non_secret():
+    plan = calliope._setup_company_profile_plan(
+        {
+            "company_name": "  Acme   Components  ",
+            "summary": "Makes components\nfor regional manufacturers.",
+            "timezone": "America/New_York",
+            "reporting_calendar": {
+                "fiscal_year_start_month": 7,
+                "week_starts_on": "Sunday",
+                "notes": " 4-4-5 close ",
+            },
+            "terminology": [
+                {"term": "Active account", "meaning": "Billed in the last 30 days"}
+            ],
+            "business_questions": [
+                "Which customers changed most this month?",
+                "Which customers changed most this month?",
+            ],
+            "source_dsn": "postgresql://user:secret@production/acme",
+        }
+    )
+
+    assert plan["company_name"] == "Acme Components"
+    assert plan["expected_profile_version"] == 0
+    assert plan["reporting_calendar"] == {
+        "fiscal_year_start_month": 7,
+        "week_starts_on": "sunday",
+        "notes": "4-4-5 close",
+    }
+    assert plan["business_questions"] == [
+        "Which customers changed most this month?"
+    ]
+    assert "source_dsn" not in plan
+    assert "secret" not in json.dumps(plan)
+
+    with pytest.raises(ValueError, match="valid IANA timezone"):
+        calliope._setup_company_profile_plan({
+            **plan,
+            "timezone": "Eastern-ish",
+        })
+    with pytest.raises(ValueError, match="appears more than once"):
+        calliope._setup_company_profile_plan({
+            **plan,
+            "terminology": [
+                {"term": "Customer", "meaning": "One meaning"},
+                {"term": "customer", "meaning": "Another meaning"},
+            ],
+        })
+
+
+def test_setup_company_profile_apply_rejects_a_stale_review():
+    plan = calliope._setup_company_profile_plan({
+        "expected_profile_version": 2,
+        "company_name": "Acme",
+        "summary": "Components reporting",
+        "timezone": "UTC",
+        "business_questions": ["Which customers changed?"],
+    })
+    writes = []
+
+    class Transaction:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    class Result:
+        def __init__(self, row):
+            self.row = row
+
+        def fetchone(self):
+            return self.row
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def transaction(self):
+            return Transaction()
+
+        def execute(self, sql, params=None):
+            if "SELECT version" in sql:
+                return Result({"version": 3})
+            writes.append((sql, params))
+            return Result({})
+
+    with pytest.raises(ValueError, match="changed after this review"):
+        calliope._apply_setup_company_profile(Connection, "admin@example.com", plan)
+    assert writes == []
+
+
+def test_setup_proof_candidate_requires_rows_sql_and_successfully_mirrored_lineage():
+    surface_id = "d54c0958-6f5a-4ef7-aee7-96c07ed76742"
+    surface = {
+        "id": surface_id,
+        "kind": "query",
+        "title": "Customers changing most",
+        "payload": {
+            "rows": [{"customer": "Acme", "delta": 12}],
+            "row_count": 1,
+            "columns": [{"name": "customer"}, {"name": "delta"}],
+            "warehouse_objects": ["ERP.Orders", "unmirrored.private_table"],
+        },
+        "source": {"sql": "select customer, delta from erp.orders"},
+        "created_at": datetime.now(timezone.utc),
+    }
+    candidate = calliope._setup_proof_candidate(
+        surface,
+        {"erp.orders": {"relation": "erp.orders"}},
+    )
+
+    assert candidate["surface_id"] == surface_id
+    assert candidate["row_count"] == 1
+    assert candidate["mirrored_relations"] == ["erp.orders"]
+    assert len(candidate["sql_hash"]) == 64
+
+    assert calliope._setup_proof_candidate(
+        {**surface, "payload": {**surface["payload"], "rows": []}},
+        {"erp.orders": {}},
+    ) is None
+    assert calliope._setup_proof_candidate(
+        {**surface, "payload": {**surface["payload"], "warehouse_objects": ["remote.orders"]}},
+        {"erp.orders": {}},
+    ) is None
+    assert calliope._setup_proof_candidate(
+        {**surface, "source": {}},
+        {"erp.orders": {}},
+    ) is None
+
+
+def test_setup_identity_marks_exact_one_email_bootstrap_without_claiming_oauth(monkeypatch):
+    monkeypatch.setenv("WAREHOUSE_TEAM_BOOTSTRAP_ADMINS", "admin@example.com")
+    monkeypatch.setenv("WAREHOUSE_ALLOWED_EMAILS", "admin@example.com")
+    identity = calliope._setup_identity_snapshot(
+        "admin@example.com", True, {"via": "shared", "name": "Admin"}
+    )
+    assert identity["assurance"] == "single_email_bootstrap"
+    assert identity["single_email_gate"] is True
+    assert identity["identity_verified_by_provider"] is False
+
+    google = calliope._setup_identity_snapshot(
+        "admin@example.com", True, {"via": "google", "name": "Admin"}
+    )
+    assert google["assurance"] == "federated_email"
+    assert google["identity_verified_by_provider"] is True
+
+
+def test_setup_preflight_actively_checks_the_managed_stack_and_canonical_bridges(monkeypatch):
+    monkeypatch.setenv("WAREHOUSE_HERMES_URL", "http://hermes:8642")
+    monkeypatch.setenv("WAREHOUSE_HERMES_API_KEY", "managed-hermes-key")
+    monkeypatch.setenv("WAREHOUSE_HERMES_MEMORY_KEY", "managed-memory-key")
+    config = calliope.CalliopeConfig.from_env()
+    inventory = {
+        "database": "rvbbit",
+        "extension_version": "4.2.10",
+        "credential_store_ready": True,
+        "backends": {
+            "embed": {
+                "auth_ready": True,
+                "source_provider": "rvbbit.ai",
+                "install_manifest": {"capability": "managed/clover"},
+            }
+        },
+        "memory": {
+            "status": "ready",
+            "endpoint_url": "http://hindsight:8888",
+        },
+        "gateway": {
+            "status": "ready",
+            "endpoint_url": "http://gateway:8092",
+        },
+        "dlt": {
+            "status": "ready",
+            "language": "data_mover",
+            "endpoint_url": "http://dlt:8080",
+        },
+    }
+    monkeypatch.setattr(calliope, "_setup_preflight_inventory", lambda _factory: inventory)
+
+    async def hermes(*_args, **_kwargs):
+        return {
+            "status": "ok",
+            "gateway_state": "running",
+            "readiness": {
+                "checks": {
+                    name: {
+                        "status": "ok",
+                        **({"state": "running"} if name == "gateway" else {}),
+                    }
+                    for name in ("model", "config", "gateway", "memory")
+                }
+            },
+        }
+
+    gateway_store = {"value": "canonical"}
+
+    async def health(endpoint):
+        detail = {}
+        if "gateway" in endpoint:
+            detail["credential_store"] = gateway_store["value"]
+        if "dlt" in endpoint:
+            detail["controller_auth_configured"] = True
+        return {"ok": True, "detail": detail}
+
+    monkeypatch.setattr(calliope, "_hermes_json", hermes)
+    monkeypatch.setattr(calliope, "_setup_http_health", health)
+    monkeypatch.setattr(
+        calliope, "_setup_backend_probe", lambda _factory, _name: {"ok": True, "latency_ms": 4}
+    )
+
+    snapshot = asyncio.run(
+        calliope._setup_preflight_snapshot(config, lambda: None, active=True)
+    )
+    assert snapshot["ready"] is True
+    assert snapshot["summary"] == {"ready": 9, "required": 9}
+    assert all(check["status"] == "ready" for check in snapshot["checks"])
+
+    gateway_store["value"] = "legacy_file"
+    stale_gateway = asyncio.run(
+        calliope._setup_preflight_snapshot(config, lambda: None, active=True)
+    )
+    gateway_check = next(
+        check for check in stale_gateway["checks"] if check["id"] == "mcp_gateway"
+    )
+    assert stale_gateway["ready"] is False
+    assert gateway_check["status"] == "blocked"
+    assert gateway_check["detail"]["error"] == (
+        "gateway is still using its legacy credential file"
+    )
+
+
+def test_setup_launch_requires_preflight_profile_mirror_and_human_verified_proof():
+    ready = {
+        "can_manage": True,
+        "facts": {
+            "preflight_ready": True,
+            "company_ready": True,
+            "database_ready": True,
+            "proof_ready": True,
+            "mirror_connections": 1,
+            "mirror_jobs": 2,
+            "successful_runs": 1,
+            "proof_receipts": 1,
+        },
+        "company_profile": {"company_name": "Acme", "version": 3},
+        "launch": {"launched": False},
+    }
+    plan = calliope._setup_launch_plan(ready, "admin@example.com")
+    assert plan["company_name"] == "Acme"
+    assert plan["profile_version"] == 3
+    assert plan["successful_runs"] == 1
+    assert plan["deferred"] == ["documents_and_services"]
+
+    with pytest.raises(ValueError, match="verified local-data answer"):
+        calliope._setup_launch_plan(
+            {**ready, "facts": {**ready["facts"], "proof_ready": False}},
+            "admin@example.com",
+        )
+
+
+def test_setup_database_stage_uses_secure_controller_not_chat_or_browser_storage():
+    page = (calliope._ASSET_DIR / "index.html").read_text(encoding="utf-8")
+    script = (calliope._ASSET_DIR / "calliope.js").read_text(encoding="utf-8")
+    css = (calliope._ASSET_DIR / "calliope.css").read_text(encoding="utf-8")
+    source = (_HERE / "calliope.py").read_text(encoding="utf-8")
+
+    assert 'id="setup-stage-controls"' in page
+    assert 'type="password"' in script
+    assert 'autocomplete="new-password"' in script
+    assert '"X-Calliope-Setup-Token"' in script
+    assert 'sourceDsn = ""' in script
+    assert 'requestBody = ""' in script
+    assert "localStorage.setItem" not in script[script.index("async function saveSetupConnection") : script.index("async function probeSetupConnection")]
+    assert "/api/calliope/setup/databases/${encodeURIComponent(connection.connection_name)}/discover" in script
+    assert "Approve & queue first mirror" in script
+    assert "no mirror_ table names" in script
+    assert 'class="setup-table-load"' in script
+    assert ".setup-table-load{display:grid" in css
+    assert '@mcp.custom_route("/api/calliope/setup/databases", methods=["POST"])' in source
+    assert "secret_persisted_in_calliope" in source
+    assert "calliope_setup_controller" in source
+    assert '"setup_receipt"' in source
+
+
+def test_setup_database_route_sends_secret_only_to_the_worker(monkeypatch, tmp_path):
+    routes = {}
+
+    class MCP:
+        @staticmethod
+        def custom_route(path, methods):
+            def register(handler):
+                routes[(path, tuple(methods))] = handler
+                return handler
+
+            return register
+
+    fake_auth = types.SimpleNamespace(
+        read_session_full=lambda request: getattr(request, "session", None),
+        google_enabled=lambda: False,
+    )
+    monkeypatch.setitem(sys.modules, "auth", fake_auth)
+    monkeypatch.setattr(calliope, "ensure_tables", lambda _factory: None)
+    monkeypatch.setattr(calliope, "_start_session_synopsis_worker", lambda _factory: None)
+    monkeypatch.setattr(calliope.calliope_dreams, "is_company_admin", lambda *_args: True)
+    monkeypatch.setenv("WAREHOUSE_HERMES_URL", "http://hermes:8642")
+    monkeypatch.setenv("WAREHOUSE_HERMES_API_KEY", "hermes-key")
+    monkeypatch.setenv("WAREHOUSE_CALLIOPE_DIR", str(tmp_path / "calliope"))
+    setup_session = {
+        "id": "5915e4aa-1c86-4d8e-9ea3-f6f08bb47397",
+        "owner_email": "admin@example.com",
+        "purpose": "setup",
+    }
+    monkeypatch.setattr(
+        calliope, "_setup_session_for_owner", lambda *_args: dict(setup_session)
+    )
+
+    captured = {"sql": [], "worker": [], "receipts": []}
+
+    class Result:
+        @staticmethod
+        def fetchone():
+            return {"connection_name": "erp_prod"}
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        @staticmethod
+        def execute(statement, params):
+            captured["sql"].append((statement, params))
+            return Result()
+
+    async def worker(_factory, method, path, payload, **kwargs):
+        captured["worker"].append((method, path, payload, kwargs))
+        return {"credential_ref": "mirror/erp_prod/SOURCE_DSN"}
+
+    monkeypatch.setattr(calliope, "_setup_mirror_worker_request", worker)
+    monkeypatch.setattr(
+        calliope,
+        "_setup_mirror_snapshot",
+        lambda _factory: {
+            "installed": True,
+            "available": True,
+            "credential_store_ready": True,
+            "worker": {"registered": True, "authenticated": True},
+            "connections": [],
+        },
+    )
+    monkeypatch.setattr(
+        calliope,
+        "_record_setup_receipt",
+        lambda _factory, _owner, _session, title, receipt: captured["receipts"].append(
+            (title, receipt)
+        ),
+    )
+    assert calliope.register_calliope_routes(
+        MCP(), lambda: Connection(), "", lambda document: document
+    ) is True
+
+    source_dsn = (
+        "postgresql+psycopg://report_reader:do-not-store@"
+        "erp.internal:5432/acme?api_key=also-secret"
+    )
+    config = calliope.CalliopeConfig.from_env()
+
+    class Request:
+        session = {
+            "identity": "admin@example.com",
+            "mapped": True,
+            "sub": "email-admin",
+        }
+        headers = {
+            "sec-fetch-site": "same-origin",
+            "x-calliope-setup-token": calliope._setup_mutation_token(
+                config, "admin@example.com", setup_session["id"]
+            ),
+        }
+
+        @staticmethod
+        async def json():
+            return {
+                "connection_name": "erp_prod",
+                "label": "Production ERP",
+                "dialect": "postgresql",
+                "environment": "production",
+                "source_dsn": source_dsn,
+            }
+
+    handler = routes[("/api/calliope/setup/databases", ("POST",))]
+    response = asyncio.run(handler(Request()))
+    result = json.loads(response.body)
+    encoded_result = json.dumps(result)
+    encoded_sql = json.dumps(captured["sql"])
+    encoded_receipts = json.dumps(captured["receipts"])
+
+    assert response.status_code == 201
+    assert captured["worker"][0][2] == {"source_dsn": source_dsn}
+    assert captured["worker"][0][3]["secret_values"] == (source_dsn,)
+    assert source_dsn not in encoded_sql
+    assert "do-not-store" not in encoded_sql
+    assert "also-secret" not in encoded_sql
+    assert "do-not-store" not in encoded_receipts
+    assert "also-secret" not in encoded_receipts
+    assert "do-not-store" not in encoded_result
+    assert "also-secret" not in encoded_result
+    descriptor = json.loads(captured["sql"][0][1][3])
+    assert descriptor == {
+        "host": "erp.internal",
+        "port": "5432",
+        "database": "acme",
+        "environment": "production",
+        "configured_by": "admin@example.com",
+    }
+    assert result["secret_persisted_in_calliope"] is False
+
+
+def test_setup_company_route_requires_the_signed_exact_review(monkeypatch, tmp_path):
+    routes = {}
+
+    class MCP:
+        @staticmethod
+        def custom_route(path, methods):
+            def register(handler):
+                routes[(path, tuple(methods))] = handler
+                return handler
+
+            return register
+
+    fake_auth = types.SimpleNamespace(
+        read_session_full=lambda request: getattr(request, "session", None),
+        google_enabled=lambda: False,
+    )
+    monkeypatch.setitem(sys.modules, "auth", fake_auth)
+    monkeypatch.setattr(calliope, "ensure_tables", lambda _factory: None)
+    monkeypatch.setattr(calliope, "_start_session_synopsis_worker", lambda _factory: None)
+    monkeypatch.setattr(calliope.calliope_dreams, "is_company_admin", lambda *_args: True)
+    monkeypatch.setenv("WAREHOUSE_HERMES_URL", "http://hermes:8642")
+    monkeypatch.setenv("WAREHOUSE_HERMES_API_KEY", "hermes-key")
+    monkeypatch.setenv("WAREHOUSE_CALLIOPE_DIR", str(tmp_path / "calliope"))
+    setup_session = {
+        "id": "5915e4aa-1c86-4d8e-9ea3-f6f08bb47397",
+        "owner_email": "admin@example.com",
+        "purpose": "setup",
+    }
+    monkeypatch.setattr(
+        calliope, "_setup_session_for_owner", lambda *_args: dict(setup_session)
+    )
+    applied = []
+    receipts = []
+
+    def apply_profile(_factory, owner, plan):
+        applied.append((owner, plan))
+        return {
+            **plan,
+            "profile_key": "company",
+            "version": 1,
+            "status": "reviewed",
+            "reviewed_by": owner,
+        }
+
+    monkeypatch.setattr(calliope, "_apply_setup_company_profile", apply_profile)
+    monkeypatch.setattr(
+        calliope,
+        "_record_setup_receipt",
+        lambda _factory, _owner, _session, title, receipt, **kwargs: receipts.append(
+            (title, receipt, kwargs)
+        ),
+    )
+    assert calliope.register_calliope_routes(
+        MCP(), lambda: None, "", lambda document: document
+    ) is True
+    config = calliope.CalliopeConfig.from_env()
+
+    class Request:
+        session = {
+            "identity": "admin@example.com",
+            "mapped": True,
+            "sub": "email-admin",
+        }
+        headers = {
+            "sec-fetch-site": "same-origin",
+            "x-calliope-setup-token": calliope._setup_mutation_token(
+                config, "admin@example.com", setup_session["id"]
+            ),
+        }
+
+        def __init__(self, body):
+            self.body = body
+
+        async def json(self):
+            return self.body
+
+    proposed = {
+        "expected_profile_version": 0,
+        "company_name": "Acme",
+        "summary": "Components reporting",
+        "timezone": "UTC",
+        "business_questions": ["Which customers changed most?"],
+    }
+    plan_response = asyncio.run(
+        routes[("/api/calliope/setup/company/plan", ("POST",))](Request(proposed))
+    )
+    review = json.loads(plan_response.body)
+    assert plan_response.status_code == 200
+
+    tampered = {**review["plan"], "company_name": "Changed after review"}
+    rejected = asyncio.run(
+        routes[("/api/calliope/setup/company/apply", ("POST",))](Request({
+            "plan": tampered,
+            "plan_token": review["plan_token"],
+        }))
+    )
+    assert rejected.status_code == 400
+    assert applied == []
+
+    accepted = asyncio.run(
+        routes[("/api/calliope/setup/company/apply", ("POST",))](Request({
+            "plan": review["plan"],
+            "plan_token": review["plan_token"],
+        }))
+    )
+    result = json.loads(accepted.body)
+    assert accepted.status_code == 200
+    assert applied == [("admin@example.com", review["plan"])]
+    assert result["profile"]["company_name"] == "Acme"
+    assert receipts[0][1]["setup_item"] == "company"
+    assert receipts[0][2]["setup_item"] == "company"
 
 
 def test_chat_composer_accepts_clipboard_images_through_the_upload_pipeline():
@@ -715,6 +1595,34 @@ def test_projects_wrapped_query_and_batch_results_into_separate_surfaces():
     assert surfaces[0]["payload"]["rows"] == [["North", 42]]
     assert surfaces[1]["source"]["sql"] == "select day, amount from marts.daily"
     assert surfaces[0]["lineage_key"].startswith("query:")
+    assert all(surface["payload"]["default_view"] == "table" for surface in surfaces)
+
+
+def test_query_surfaces_require_explicit_chart_intent():
+    result = {
+        "columns": [{"name": "month"}, {"name": "revenue"}],
+        "rows": [["2026-01", 120], ["2026-02", 145]],
+        "row_count": 2,
+    }
+
+    ordinary = calliope._project_tool_result(
+        "run_sql",
+        result,
+        {"sql": "select month, revenue from marts.sales"},
+        "query-table",
+    )
+    chart = calliope._project_tool_result(
+        "run_sql",
+        result,
+        {
+            "sql": "select month, revenue from marts.sales",
+            "default_view": "chart",
+        },
+        "query-chart",
+    )
+
+    assert ordinary[0]["payload"]["default_view"] == "table"
+    assert chart[0]["payload"]["default_view"] == "chart"
 
 
 def test_named_batch_results_keep_distinct_lineages_for_identical_sql():
@@ -2162,6 +3070,9 @@ def test_evidence_and_query_surfaces_share_a_large_themed_reader():
     assert "function formatSql" in script
     assert "function highlightSql" in script
     assert 'class="sql-view sql-code"' in script
+    assert 'const chart = requestedView === "chart" ? classifyChart(surface) : null;' in script
+    assert 'default_view: source.payload?.default_view === "chart" ? "chart" : "table"' in script
+    assert 'chart && !isMetadataQuery(surface) ? "chart" : "table"' not in script
     assert '["cube", "db_table", "db_column"]' in script
     assert ".surface-viewer-dialog" in css
     assert ".viewer-document-body" in css

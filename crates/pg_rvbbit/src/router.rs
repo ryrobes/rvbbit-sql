@@ -2587,11 +2587,13 @@ fn route_optimize_auto(
         // One bad logged query (dropped table, changed schema, syntax the
         // engines reject) must be counted + skipped — never abort the pass.
         let sql_cl = sql.clone();
-        let r: Value = pgrx::PgTryBuilder::new(move || route_optimize_query(&sql_cl, samples, 15.0).0)
-            .catch_others(|caught| {
-                json!({"ok": false, "reason": format!("shape replay failed: {caught:?}")})
-            })
-            .execute();
+        let r: Value = pgrx::PgTryBuilder::new(move || {
+            route_optimize_query(&sql_cl, samples, 15.0).0
+        })
+        .catch_others(
+            |caught| json!({"ok": false, "reason": format!("shape replay failed: {caught:?}")}),
+        )
+        .execute();
         if apply_sp && !parallel_mode_wedged() {
             let _ = Spi::run(&format!(
                 "SELECT set_config('search_path', {}, false)",
@@ -2654,17 +2656,17 @@ fn route_optimize_auto(
     let wedged = parallel_mode_wedged();
     if !wedged {
         let _ = Spi::run(&format!(
-        "UPDATE rvbbit.route_optimize_runs \
+            "UPDATE rvbbit.route_optimize_runs \
          SET finished_at = now(), shapes_tested = {}, pinned = {}, errors = {}, elapsed_sec = {}, \
              detail = {}::jsonb \
          WHERE run_id = {}",
-        tested,
-        pinned,
-        errors,
-        started.elapsed().as_secs(),
-        sql_lit(&json!(detail).to_string()),
-        run_id,
-    ));
+            tested,
+            pinned,
+            errors,
+            started.elapsed().as_secs(),
+            sql_lit(&json!(detail).to_string()),
+            run_id,
+        ));
     }
 
     JsonB(json!({
@@ -5130,7 +5132,11 @@ pub(crate) fn route_runtime_stamp(relation_oids: &[u32]) -> String {
 }
 
 fn normalized_relation_oids(relation_oids: &[u32]) -> Vec<u32> {
-    let mut out = relation_oids.iter().copied().filter(|oid| *oid > 0).collect::<Vec<_>>();
+    let mut out = relation_oids
+        .iter()
+        .copied()
+        .filter(|oid| *oid > 0)
+        .collect::<Vec<_>>();
     out.sort_unstable();
     out.dedup();
     out
@@ -5144,7 +5150,11 @@ fn route_table_state_sql(relation_oids: &[u32]) -> Option<String> {
     if relation_oids.is_empty() {
         return None;
     }
-    let oid_list = relation_oids.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
+    let oid_list = relation_oids
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
     Some(format!(
         "SELECT coalesce(string_agg( \
                     c.oid::text || ':' || (c.relpages::bigint * current_setting('block_size')::bigint)::text || ':' || \
@@ -5199,9 +5209,9 @@ fn route_table_state_stamp(relation_oids: &[u32]) -> String {
         }
     }
     let table_state = Spi::get_one::<String>(&sql)
-    .ok()
-    .flatten()
-    .unwrap_or_else(|| "none".to_string());
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "none".to_string());
     if !ttl.is_zero() {
         ROUTE_TABLE_STATE_MEMO.with(|memo| {
             let mut memo = memo.borrow_mut();
@@ -6767,14 +6777,19 @@ fn ml_models() -> std::rc::Rc<std::collections::HashMap<String, crate::route_mod
         std::collections::HashMap::new();
     if relations_present(&["rvbbit.route_model"]) {
         let _ = Spi::connect(|client| -> Result<(), pgrx::spi::Error> {
-            let rows = client.select("SELECT engine, params::text FROM rvbbit.route_model", None, &[])?;
+            let rows = client.select(
+                "SELECT engine, params::text FROM rvbbit.route_model",
+                None,
+                &[],
+            )?;
             for row in rows {
                 let engine: String = row.get(1)?.unwrap_or_default();
                 let params: String = row.get(2)?.unwrap_or_default();
                 if engine.is_empty() || params.is_empty() {
                     continue;
                 }
-                if let Ok(model) = serde_json::from_str::<crate::route_model::EngineModel>(&params) {
+                if let Ok(model) = serde_json::from_str::<crate::route_model::EngineModel>(&params)
+                {
                     map.insert(engine, model);
                 }
             }
@@ -6791,7 +6806,10 @@ fn ml_models() -> std::rc::Rc<std::collections::HashMap<String, crate::route_mod
 /// non-native engine is predicted at least `route_ml_min_margin` faster. Returns
 /// None (fall through to heuristics) when disabled, unmodeled, or no eligible
 /// modeled engine exists.
-fn ml_route_decision(features: &RouteFeatures, tables: &[RvbbitTableMetric]) -> Option<RouteDecision> {
+fn ml_route_decision(
+    features: &RouteFeatures,
+    tables: &[RvbbitTableMetric],
+) -> Option<RouteDecision> {
     if !route_ml_enabled() {
         return None;
     }
@@ -6829,7 +6847,8 @@ fn ml_route_decision(features: &RouteFeatures, tables: &[RvbbitTableMetric]) -> 
     if cand != Candidate::RvbbitNative {
         if let Some(np) = native_pred {
             let leave_native = pred < np + (1.0 - route_ml_min_margin()).ln();
-            if !leave_native && candidate_availability(Candidate::RvbbitNative, features, tables).0 {
+            if !leave_native && candidate_availability(Candidate::RvbbitNative, features, tables).0
+            {
                 return Some(decision(
                     Candidate::RvbbitNative,
                     "ml",
@@ -6853,17 +6872,43 @@ fn ml_route_decision(features: &RouteFeatures, tables: &[RvbbitTableMetric]) -> 
 /// `feature_value` above (every name here must resolve) and with the FEATURE_NAMES
 /// list in scripts/train_route_model.py.
 const ROUTE_FEATURE_NAMES: &[&str] = &[
-    "ln_table_rows", "ln_table_bytes", "ln_row_group_count",
-    "aggregate_count", "count_count", "count_distinct_count",
-    "sum_count", "avg_count", "min_count", "max_count",
-    "join_count", "from_count", "in_count", "between_count", "or_count",
-    "and_count", "comparison_count", "like_count", "not_like_count",
-    "regex_count", "exists_count",
-    "referenced_text_col_count", "group_text_col_count",
-    "order_text_col_count", "count_distinct_text_count",
-    "group_by", "order_by", "having", "distinct", "where", "select_star",
-    "offset_present", "plan_has_join", "plan_has_sort", "plan_has_group",
-    "plan_has_subplan", "plan_has_hash",
+    "ln_table_rows",
+    "ln_table_bytes",
+    "ln_row_group_count",
+    "aggregate_count",
+    "count_count",
+    "count_distinct_count",
+    "sum_count",
+    "avg_count",
+    "min_count",
+    "max_count",
+    "join_count",
+    "from_count",
+    "in_count",
+    "between_count",
+    "or_count",
+    "and_count",
+    "comparison_count",
+    "like_count",
+    "not_like_count",
+    "regex_count",
+    "exists_count",
+    "referenced_text_col_count",
+    "group_text_col_count",
+    "order_text_col_count",
+    "count_distinct_text_count",
+    "group_by",
+    "order_by",
+    "having",
+    "distinct",
+    "where",
+    "select_star",
+    "offset_present",
+    "plan_has_join",
+    "plan_has_sort",
+    "plan_has_group",
+    "plan_has_subplan",
+    "plan_has_hash",
 ];
 
 /// Build the SQL that yields (engine, features_json, median_ms) training rows from
@@ -7016,7 +7061,10 @@ fn train_route_model(
     for (engine, samples) in per_engine.iter() {
         let n = samples.len();
         if n < min_samples {
-            summary.insert(engine.clone(), json!({"n": n, "status": "skipped_low_samples"}));
+            summary.insert(
+                engine.clone(),
+                json!({"n": n, "status": "skipped_low_samples"}),
+            );
             continue;
         }
         let model = crate::route_model::train_gbm(samples, feature_names.clone(), &cfg);
@@ -7965,9 +8013,7 @@ fn choose_no_profile_route(
         && gpu_gqe_prior_shape_applies(features, route_gpu_gqe_prior_min_rows())
         && gqe_prior_warm()
     {
-        if let Some(candidate) =
-            first_available_candidate(&[Candidate::GpuGqe], features, tables)
-        {
+        if let Some(candidate) = first_available_candidate(&[Candidate::GpuGqe], features, tables) {
             return decision(
                 candidate,
                 "no-profile-gpu-gqe-prior",

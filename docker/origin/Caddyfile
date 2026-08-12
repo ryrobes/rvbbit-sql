@@ -25,7 +25,7 @@
 	@warehouse {
 		path /mcp /mcp/* /login /auth/* /authorize /authorize/* /token /register \
   /.well-known/* /apps /apps/* /d/* /api/d/* /api/apps/* /thumbs/* /pdfs/* /bg/* /theme/* /charts/* /health \
-  /gallery /calliope /calliope/* /api/calliope/*
+  /gallery /api/gallery/* /calliope /calliope/* /api/calliope/*
 	}
 	handle @warehouse {
 		# flush immediately: /mcp is streamable HTTP — buffering kills it.

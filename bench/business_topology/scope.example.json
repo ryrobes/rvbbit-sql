@@ -1,0 +1,13 @@
+{
+  "schema_version": "rvbbit.business-topology.scope.v1",
+  "relations": [
+    {
+      "relation": "source_a.party_records",
+      "split_group": "source-family-a"
+    },
+    {
+      "relation": "source_b.activity_log",
+      "split_group": "source-family-b"
+    }
+  ]
+}

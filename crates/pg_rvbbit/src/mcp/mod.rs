@@ -44,9 +44,7 @@ fn gateway_token() -> Option<String> {
 }
 
 /// Attach the gateway bearer token to a request when one is configured.
-fn with_gateway_auth(
-    req: reqwest::blocking::RequestBuilder,
-) -> reqwest::blocking::RequestBuilder {
+fn with_gateway_auth(req: reqwest::blocking::RequestBuilder) -> reqwest::blocking::RequestBuilder {
     match gateway_token() {
         Some(token) => req.bearer_auth(token),
         None => req,
@@ -846,7 +844,15 @@ fn build_wrapper_ddl(server: &str, schema_ident: &str, tool: &ToolMeta) -> Resul
     let mut seen_lower = std::collections::HashSet::new();
 
     if let Some(props) = props {
-        for (name, prop) in props {
+        // PostgreSQL only permits parameters without defaults before parameters
+        // with defaults. JSON Schema property order is not semantic, and many
+        // MCP servers publish an optional property before a required one. Keep
+        // the schema's stable order within each group, but always emit required
+        // arguments first so every valid MCP input schema can become a valid
+        // typed SQL function.
+        let mut ordered_props: Vec<_> = props.iter().collect();
+        ordered_props.sort_by_key(|(name, _)| !required.contains(*name));
+        for (name, prop) in ordered_props {
             let lower = name.to_lowercase();
             if !seen_lower.insert(lower.clone()) {
                 return Err(format!(

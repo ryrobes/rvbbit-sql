@@ -174,7 +174,10 @@ fn vortex_array_to_record_batch(
         {
             // Vortex stores timestamps as Int64 unix-epoch micros; native expects
             // a TimestampMicrosecondArray (epoch handling lives in its Timestamp arm).
-            Some(DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())))
+            Some(DataType::Timestamp(
+                TimeUnit::Microsecond,
+                Some("UTC".into()),
+            ))
         } else {
             None
         };
@@ -250,7 +253,10 @@ fn filter_to_expr(f: &FilterRepr) -> Option<Expression> {
     }
 }
 
-fn fold(xs: &[FilterRepr], combine: fn(Expression, Expression) -> Expression) -> Option<Expression> {
+fn fold(
+    xs: &[FilterRepr],
+    combine: fn(Expression, Expression) -> Expression,
+) -> Option<Expression> {
     let mut acc: Option<Expression> = None;
     for x in xs {
         let e = filter_to_expr(x)?;
@@ -304,8 +310,14 @@ fn set_membership(q: &QualRepr) -> Option<Expression> {
             .iter()
             .map(|x| expr::eq(expr::col(q.col.as_str()), int_lit(*x, *w)))
             .collect(),
-        LitRepr::F64Set(xs) => xs.iter().map(|x| expr::eq(expr::col(q.col.as_str()), expr::lit(*x))).collect(),
-        LitRepr::TextSet(xs) => xs.iter().map(|x| expr::eq(expr::col(q.col.as_str()), expr::lit(x.as_str()))).collect(),
+        LitRepr::F64Set(xs) => xs
+            .iter()
+            .map(|x| expr::eq(expr::col(q.col.as_str()), expr::lit(*x)))
+            .collect(),
+        LitRepr::TextSet(xs) => xs
+            .iter()
+            .map(|x| expr::eq(expr::col(q.col.as_str()), expr::lit(x.as_str())))
+            .collect(),
         _ => return None,
     };
     eqs.into_iter().reduce(expr::or)
@@ -317,7 +329,11 @@ mod tests {
     use crate::scan_types::{CmpOp, FilterRepr, IntWidth, LitRepr, QualRepr};
 
     fn qual(col: &str, op: CmpOp, val: LitRepr) -> FilterRepr {
-        FilterRepr::Qual(QualRepr { col: col.into(), op, val })
+        FilterRepr::Qual(QualRepr {
+            col: col.into(),
+            op,
+            val,
+        })
     }
 
     #[test]
@@ -337,18 +353,23 @@ mod tests {
 
     #[test]
     fn in_set_and_like_push() {
-        assert!(
-            translate(&qual("a", CmpOp::In, LitRepr::IntSet(vec![1, 2, 3], IntWidth::I16)))
-                .is_some()
-        );
+        assert!(translate(&qual(
+            "a",
+            CmpOp::In,
+            LitRepr::IntSet(vec![1, 2, 3], IntWidth::I16)
+        ))
+        .is_some());
         assert!(translate(&qual("s", CmpOp::Like, LitRepr::Text("foo%".into()))).is_some());
     }
 
     #[test]
     fn empty_in_does_not_push() {
-        assert!(
-            translate(&qual("a", CmpOp::In, LitRepr::IntSet(vec![], IntWidth::I64))).is_none()
-        );
+        assert!(translate(&qual(
+            "a",
+            CmpOp::In,
+            LitRepr::IntSet(vec![], IntWidth::I64)
+        ))
+        .is_none());
     }
 
     #[test]
