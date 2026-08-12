@@ -1815,9 +1815,17 @@ fn route_explain_value_inner(
     out.insert("route_source".into(), json!("none"));
     out.insert("reason".into(), Value::Null);
     out.insert("safe_select".into(), json!(false));
+    out.insert("read_only_select".into(), json!(false));
     out.insert("fallback".into(), json!("postgres"));
     let profile = route_profile_selection();
     insert_profile_selection_json(&mut out, &profile);
+
+    if let Err(reason) = read_only_select(query) {
+        out.insert("reason".into(), json!(reason));
+        out.insert("candidates".into(), json!([]));
+        return Value::Object(out);
+    }
+    out.insert("read_only_select".into(), json!(true));
 
     if let Err(reason) = safe_select(query) {
         out.insert("reason".into(), json!(reason));
@@ -1942,6 +1950,7 @@ fn route_doc_from_decision(
     out.insert("route_source".into(), json!(decision.source));
     out.insert("reason".into(), json!(decision.reason));
     out.insert("safe_select".into(), json!(true));
+    out.insert("read_only_select".into(), json!(true));
     out.insert("fallback".into(), json!("postgres"));
     insert_profile_selection_json(&mut out, profile);
     out.insert(
@@ -5875,7 +5884,11 @@ fn explain_sql(query: &str) -> Result<String, String> {
     .map_err(|e| e.to_string())
 }
 
-fn safe_select(sql: &str) -> Result<(), String> {
+/// Statements accepted by a PostgreSQL transaction that Warehouse will force
+/// read-only. This is deliberately broader than accelerator eligibility:
+/// RVBBIT semantic operators, JSON syntax, and stable/volatile read expressions
+/// belong on PostgreSQL even though Duck/DataFusion cannot route them.
+fn read_only_select(sql: &str) -> Result<(), String> {
     let stripped = sql.trim();
     let lowered = sql_stringless(stripped).to_lowercase();
     if !(lowered.starts_with("select") || lowered.starts_with("with")) {
@@ -5907,6 +5920,26 @@ fn safe_select(sql: &str) -> Result<(), String> {
         "currval",
         "set_config",
         "current_setting",
+        "pg_sleep",
+    ];
+    for token in blacklist {
+        if has_word(&lowered, token) {
+            return Err(format!("unsupported token: {token}"));
+        }
+    }
+    if lowered.contains("pg_") {
+        return Err("unsupported token: pg_".into());
+    }
+    Ok(())
+}
+
+/// Subset of read-only PostgreSQL syntax that the accelerator router can
+/// faithfully analyze and execute. A failure here is a PostgreSQL fallback,
+/// not evidence that the statement is unsafe.
+fn safe_select(sql: &str) -> Result<(), String> {
+    read_only_select(sql)?;
+    let lowered = sql_stringless(sql.trim()).to_lowercase();
+    let blacklist = [
         "random",
         "now",
         "clock_timestamp",
@@ -5919,7 +5952,6 @@ fn safe_select(sql: &str) -> Result<(), String> {
         "localtime",
         "localtimestamp",
         "generate_series",
-        "pg_sleep",
         "gen_random_uuid",
         "uuid_generate_v4",
     ];
@@ -5929,7 +5961,7 @@ fn safe_select(sql: &str) -> Result<(), String> {
         }
     }
     for token in [
-        "rvbbit.", "pg_", " means ", " about ", "::json", "::jsonb", "->", "$$",
+        "rvbbit.", " means ", " about ", "::json", "::jsonb", "->", "$$",
     ] {
         if lowered.contains(token) {
             return Err(format!("unsupported token: {token}"));
@@ -9616,6 +9648,22 @@ mod route_unit_tests {
     #[test]
     fn route_rejects_non_select() {
         assert!(safe_select("delete from t").is_err());
+    }
+
+    #[test]
+    fn route_distinguishes_postgres_fallback_from_unsafe_sql() {
+        let semantic = "SELECT rvbbit.clover_forecast('[1,2,3]'::text, '2'::text)";
+        assert!(read_only_select(semantic).is_ok());
+        assert_eq!(
+            safe_select(semantic),
+            Err("unsupported token: rvbbit.".to_string())
+        );
+        assert!(read_only_select("SELECT now(), '{}'::jsonb").is_ok());
+        assert!(
+            read_only_select("WITH gone AS (DELETE FROM t RETURNING *) SELECT * FROM gone")
+                .is_err()
+        );
+        assert!(read_only_select("SELECT pg_sleep(1)").is_err());
     }
 
     #[test]

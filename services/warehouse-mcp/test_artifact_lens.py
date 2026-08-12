@@ -134,6 +134,42 @@ def test_as_of_accepts_only_one_normalized_iso_timestamp():
     }
 
 
+def test_read_only_connection_is_frozen_before_any_statement(monkeypatch):
+    events = []
+
+    class _Connection:
+        def __init__(self):
+            self._read_only = False
+
+        @property
+        def read_only(self):
+            return self._read_only
+
+        @read_only.setter
+        def read_only(self, value):
+            self._read_only = value
+            events.append(("read_only", value))
+
+        def execute(self, statement):
+            events.append(("execute", statement))
+
+    connection = _Connection()
+    monkeypatch.setattr(server.psycopg, "connect", lambda *_args, **_kwargs: connection)
+    monkeypatch.setattr(
+        server,
+        "_set_request_tracking_user",
+        lambda conn: conn.execute("request tracking"),
+    )
+
+    assert server._conn(read_only=True) is connection
+    assert events[0] == ("read_only", True)
+    assert events[1] == ("execute", "request tracking")
+    assert events[2] == (
+        "execute",
+        f"SET statement_timeout = {server.STMT_TIMEOUT_MS}",
+    )
+
+
 def test_validate_sql_keeps_as_of_directive_out_of_read_only_gate(monkeypatch):
     calls = []
 
@@ -174,6 +210,56 @@ def test_validate_sql_keeps_as_of_directive_out_of_read_only_gate(monkeypatch):
             ("select * from public.orders",),
         )
     ]
+
+
+def test_validate_sql_separates_postgres_fallback_from_router_eligibility(monkeypatch):
+    class _Result:
+        @staticmethod
+        def fetchone():
+            return {
+                "e": {
+                    "safe_select": False,
+                    "read_only_select": True,
+                    "chosen_candidate": None,
+                    "route_source": "none",
+                    "reason": "unsupported token: rvbbit.",
+                    "candidates": [],
+                }
+            }
+
+    class _Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        @staticmethod
+        def execute(_statement, _params):
+            return _Result()
+
+    monkeypatch.setattr(server, "_conn", lambda *_args, **_kwargs: _Connection())
+    result = server.tool_validate_sql(
+        "SELECT rvbbit.clover_forecast('[1,2,3]'::text, '2'::text)"
+    )
+
+    assert result["safe_select"] is True
+    assert result["read_only_select"] is True
+    assert result["router_eligible"] is False
+    assert result["engine"] == "postgres"
+    assert result["route_source"] == "postgres_fallback"
+    assert result["router_reason"] == "unsupported token: rvbbit."
+
+
+def test_old_router_fallback_is_exact_and_does_not_admit_mutations():
+    assert server._route_explain_read_only_select({
+        "safe_select": False,
+        "reason": "unsupported token: rvbbit.",
+    }) is True
+    assert server._route_explain_read_only_select({
+        "safe_select": False,
+        "reason": "unsupported token: delete",
+    }) is False
 
 
 def test_run_sql_returns_planner_resolved_warehouse_lineage(monkeypatch):
@@ -249,6 +335,65 @@ def test_run_sql_returns_planner_resolved_warehouse_lineage(monkeypatch):
         "commerce.customers",
         "commerce.orders",
     ]
+
+
+def test_postgres_fallback_runs_read_only_and_flushes_delayed_receipts(monkeypatch):
+    connection_args = []
+
+    class _Description:
+        name = "forecast"
+        type_code = 3802
+
+    class _Cursor:
+        description = [_Description()]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, _statement):
+            return None
+
+        def fetchmany(self, _limit):
+            return [{"forecast": {"median": [4, 5]}}]
+
+        def fetchone(self):
+            return None
+
+    class _Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def cursor(self):
+            return _Cursor()
+
+    monkeypatch.setattr(server, "tool_validate_sql", lambda *_args: {
+        "valid": True,
+        "safe_select": True,
+        "router_eligible": False,
+        "engine": "postgres",
+    })
+    monkeypatch.setattr(server, "_session_pg_role", lambda: None)
+    monkeypatch.setattr(server, "_referenced_tables", lambda _sql: [])
+    monkeypatch.setattr(
+        server,
+        "_conn",
+        lambda **kwargs: connection_args.append(kwargs) or _Connection(),
+    )
+    monkeypatch.setattr(server, "_flush_delayed_semantic_receipts", lambda: 1)
+
+    result = server.tool_run_sql(
+        "SELECT rvbbit.clover_forecast('[1,2,3]'::text, '2'::text)"
+    )
+
+    assert connection_args == [{"read_only": True, "role": None}]
+    assert result["engine"] == "postgres"
+    assert result["semantic_receipts_flushed"] == 1
 
 
 def test_publish_quarantines_bad_optional_semantics_instead_of_rejecting_artifact():

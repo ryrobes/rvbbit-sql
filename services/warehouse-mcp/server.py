@@ -91,6 +91,12 @@ _TYPE = {16: "bool", 20: "int8", 21: "int2", 23: "int4", 25: "text", 700: "float
 
 def _conn(read_only: bool = False, role: str | None = None):
     c = psycopg.connect(DSN, row_factory=dict_row, autocommit=not read_only)
+    if read_only:
+        # Set the transaction characteristic before SET ROLE, request tracking,
+        # or any other statement starts the transaction.  Setting
+        # default_transaction_read_only after a SELECT only affects the *next*
+        # transaction and silently leaves this one writable.
+        c.read_only = True
     if role:
         # Burrow mode (docs/BURROW_PLAN.md): execute as the caller's PG role —
         # their GRANTs/RLS govern the query. Connection is per-call, so plain
@@ -100,7 +106,6 @@ def _conn(read_only: bool = False, role: str | None = None):
     if read_only:
         # belt: txn read-only blocks any write/DDL even for a superuser DSN.
         # suspenders (prod): the mapped role simply lacks write grants.
-        c.execute("SET default_transaction_read_only = on")
         c.execute(f"SET statement_timeout = {STMT_TIMEOUT_MS}")
     return c
 
@@ -344,6 +349,31 @@ def _freshness(cur, schema: str, rel: str):
 
 # ── tools ───────────────────────────────────────────────────────────────────
 
+def _capability_search_match(row) -> dict:
+    match = {
+        "kind": row["kind"],
+        "name": row["name"],
+        "score": round(float(row["score"] or 0), 3),
+        "doc": row["doc"],
+    }
+    if match["kind"] == "cap_operator":
+        # Operator names are catalog identities, while their callable SQL
+        # surface lives in the rvbbit schema. Return both explicitly and make
+        # the displayed signature executable as shown; an unqualified name
+        # depends on search_path and fails in the hosted warehouse.
+        sql_name = str(match["name"])
+        if "." not in sql_name:
+            sql_name = f"rvbbit.{sql_name}"
+        match["sql_name"] = sql_name
+        signature = f"signature: {match['name']}("
+        qualified_signature = f"signature: {sql_name}("
+        if isinstance(match["doc"], str) and signature in match["doc"]:
+            match["doc"] = match["doc"].replace(
+                signature, qualified_signature, 1
+            )
+    return match
+
+
 def tool_capability_search(
     query: str, limit: int = 8, kinds=None, _caller_override=None
 ) -> dict:
@@ -421,11 +451,8 @@ def tool_capability_search(
             ).fetchall()
     out = {
         "query": query,
-        "matches": [
-            {"kind": r["kind"], "name": r["name"], "score": round(float(r["score"] or 0), 3), "doc": r["doc"]}
-            for r in rows
-        ],
-        "hint": "Results are already filtered for this caller. cap_playbook results are approved reusable methods (load with read_calliope_playbook); cap_operator results are SQL functions (use via run_sql); cap_pack results are installable capabilities; cap_mcp_tool results are tools on MCP servers already installed in the warehouse.",
+        "matches": [_capability_search_match(r) for r in rows],
+        "hint": "Results are already filtered for this caller. cap_playbook results are approved reusable methods (load with read_calliope_playbook); cap_operator results are schema-qualified SQL functions (call sql_name, always rvbbit.<name>, via run_sql); cap_pack results are installable capabilities; cap_mcp_tool results are tools on MCP servers already installed in the warehouse.",
     }
     if rebuilt:
         out["index_rebuilt"] = "capability index was stale — rebuilt automatically before this search"
@@ -2676,6 +2703,45 @@ def tool_brain_crawl_folder(path, source=None, roles=None, base_folder=None,
             "note": (None if roles else "no roles given → docs are DEFAULT-DENY (visible to no one) until a role is granted")}
 
 
+_ROUTER_ONLY_POSTGRES_REASONS = {
+    f"unsupported token: {token}"
+    for token in (
+        "rvbbit.", " means ", " about ", "::json", "::jsonb", "->", "$$",
+        "random", "now", "clock_timestamp", "statement_timestamp",
+        "transaction_timestamp", "timeofday", "current_date", "current_time",
+        "current_timestamp", "localtime", "localtimestamp", "generate_series",
+        "gen_random_uuid", "uuid_generate_v4",
+    )
+}
+
+
+def _route_explain_read_only_select(ex: dict) -> bool:
+    """Separate PostgreSQL read safety from accelerator route eligibility.
+
+    New pg_rvbbit builds report both fields.  The exact-reason fallback keeps a
+    Warehouse rolling upgrade compatible with older extension images, whose
+    route gate had already passed its mutation checks before returning one of
+    these PostgreSQL-only syntax reasons.
+    """
+    if "read_only_select" in ex:
+        return bool(ex.get("read_only_select"))
+    if ex.get("safe_select"):
+        return True
+    return ex.get("reason") in _ROUTER_ONLY_POSTGRES_REASONS
+
+
+def _flush_delayed_semantic_receipts() -> int | None:
+    """Persist receipts queued by operators running in a read-only query."""
+    try:
+        with _conn() as c:
+            row = c.execute(
+                "SELECT rvbbit.flush_receipt_queue(256) AS flushed"
+            ).fetchone()
+        return int((row or {}).get("flushed") or 0)
+    except Exception:  # noqa: BLE001 - audit upkeep never breaks a query result
+        return None
+
+
 def tool_validate_sql(sql: str, as_of=None) -> dict:
     """Plan, don't execute — route_explain dry-run so Claude can self-correct cheaply."""
     try:
@@ -2690,13 +2756,22 @@ def tool_validate_sql(sql: str, as_of=None) -> dict:
         return {"valid": False, "safe_select": False, "error": str(e)}
     except Exception as e:  # noqa: BLE001
         return {"valid": False, "safe_select": False, "error": str(e)}
+    router_eligible = bool(ex.get("safe_select"))
+    read_only_select = _route_explain_read_only_select(ex)
+    postgres_fallback = read_only_select and not router_eligible
     return {
         "valid": True,
-        "safe_select": bool(ex.get("safe_select")),
-        "engine": ex.get("chosen_candidate"),
-        "route_source": ex.get("route_source"),
+        "safe_select": read_only_select,
+        "read_only_select": read_only_select,
+        "router_eligible": router_eligible,
+        "engine": ex.get("chosen_candidate") or ("postgres" if postgres_fallback else None),
+        "route_source": "postgres_fallback" if postgres_fallback else ex.get("route_source"),
         "rvbbit_tables": ex.get("rvbbit_tables"),
-        "reason": ex.get("reason"),
+        "reason": (
+            "read-only PostgreSQL fallback; excluded only from accelerator routing"
+            if postgres_fallback else ex.get("reason")
+        ),
+        "router_reason": ex.get("reason") if postgres_fallback else None,
         "candidates": [c.get("name") for c in (ex.get("candidates") or [])],
         "as_of_applied": normalized_as_of,
     }
@@ -2728,12 +2803,17 @@ def tool_run_sql(sql: str, as_of=None, limit=None) -> dict:
     # SQL or trusting prose.  Planner resolution also catches ordinary heap
     # relations, views, and joins rather than only RVBBIT acceleration targets.
     warehouse_objects = _referenced_tables(sql)
-    return {"columns": cols, "rows": rows, "row_count": len(rows), "truncated": truncated,
-            "engine": v.get("engine"), "elapsed_ms": int((time.time() - t0) * 1000),
-            "as_of_applied": normalized_as_of,
-            "warehouse_objects": warehouse_objects,
-            "rvbbit_tables": v.get("rvbbit_tables") or [],
-            "lineage": {"warehouse_objects": warehouse_objects}}
+    result = {"columns": cols, "rows": rows, "row_count": len(rows), "truncated": truncated,
+              "engine": v.get("engine"), "elapsed_ms": int((time.time() - t0) * 1000),
+              "as_of_applied": normalized_as_of,
+              "warehouse_objects": warehouse_objects,
+              "rvbbit_tables": v.get("rvbbit_tables") or [],
+              "lineage": {"warehouse_objects": warehouse_objects}}
+    if v.get("router_eligible") is False:
+        flushed = _flush_delayed_semantic_receipts()
+        if flushed is not None:
+            result["semantic_receipts_flushed"] = flushed
+    return result
 
 
 def tool_run_sql_multi(queries, as_of=None, limit=None, result_mode="full", preview_rows=3) -> dict:

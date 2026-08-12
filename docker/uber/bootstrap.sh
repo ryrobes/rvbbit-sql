@@ -234,7 +234,7 @@ ORDER BY ordinal
 \gexec
 SQL
 
-    if [[ "$(psql_scalar -c "SELECT EXISTS (SELECT 1 FROM rvbbit.backends WHERE name='embed' AND auth_header_env='RVBBIT_CLOVER_KEY') AND EXISTS (SELECT 1 FROM rvbbit.backends WHERE name='clover_llm' AND auth_header_env='RVBBIT_CLOVER_KEY') AND EXISTS (SELECT 1 FROM rvbbit.operators WHERE name='clover_llm_ask');")" != "t" ]]; then
+    if [[ "$(psql_scalar -c "SELECT EXISTS (SELECT 1 FROM rvbbit.backends WHERE name='embed' AND auth_header_env='RVBBIT_CLOVER_KEY') AND EXISTS (SELECT 1 FROM rvbbit.backends WHERE name='clover_llm' AND auth_header_env='RVBBIT_CLOVER_KEY') AND EXISTS (SELECT 1 FROM rvbbit.backends WHERE name='forecast' AND auth_header_env='RVBBIT_CLOVER_KEY') AND EXISTS (SELECT 1 FROM rvbbit.operators WHERE name='clover_llm_ask') AND EXISTS (SELECT 1 FROM rvbbit.operators WHERE name='clover_forecast') AND to_regprocedure('rvbbit.clover_forecast(text,text,jsonb)') IS NOT NULL;")" != "t" ]]; then
         log "managed Clover registration verification failed"
         return 1
     fi
@@ -265,6 +265,20 @@ SQL
     else
         log "managed Clover registration verified"
     fi
+}
+
+refresh_hosted_capability_index() {
+    if ! is_true "$hosted_services"; then
+        return 0
+    fi
+    log "refreshing hosted capability index"
+    psql_scalar -c "SELECT rvbbit.capability_crawl();" >/dev/null
+    if [[ -n "${RVBBIT_CLOVER_KEY:-}" ]] &&
+       [[ "$(psql_scalar -c "SELECT EXISTS (SELECT 1 FROM rvbbit.catalog_docs WHERE graph_id='rvbbit_capabilities' AND kind='cap_operator' AND rel_name='clover_forecast' AND doc LIKE '%signature: rvbbit.clover_forecast(%');")" != "t" ]]; then
+        log "managed Clover capability discovery verification failed"
+        return 1
+    fi
+    log "hosted capability index verified"
 }
 
 configure_hosted_clover_defaults() {
@@ -596,5 +610,6 @@ for raw_capability in "${capabilities[@]}"; do
     deploy_capability "$capability"
 done
 
+refresh_hosted_capability_index
 verify_baseline
 log "baseline capabilities ready"

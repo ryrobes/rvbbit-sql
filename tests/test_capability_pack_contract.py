@@ -712,6 +712,9 @@ def test_hosted_bootstrap_reapplies_shipped_clover_on_existing_volumes():
     assert "chmod -R a+rX /usr/share/rvbbit/capabilities" in postgres_dockerfile
     assert "jsonb_array_elements_text(c.manifest #> '{managed,install,sql}')" in bootstrap
     assert "rvbbit.backend_probe('embed')" in bootstrap
+    assert "name='forecast' AND auth_header_env='RVBBIT_CLOVER_KEY'" in bootstrap
+    assert "name='clover_forecast'" in bootstrap
+    assert "rvbbit.clover_forecast(text,text,jsonb)" in bootstrap
     assert 'RVBBIT_CLOVER_REQUIRED_MODEL:-' in bootstrap
     assert "configure_hosted_clover_defaults" in bootstrap
     assert "rvbbit.bind_extract_entities_to_clover()" in bootstrap
@@ -721,8 +724,30 @@ def test_hosted_bootstrap_reapplies_shipped_clover_on_existing_volumes():
     assert "CREATE EXTENSION IF NOT EXISTS pg_trgm WITH SCHEMA public" in bootstrap
     assert "ALTER EXTENSION pg_trgm SET SCHEMA public" in bootstrap
     assert "rvbbit.register_memory_service" in bootstrap
+    assert "refresh_hosted_capability_index" in bootstrap
+    assert "SELECT rvbbit.capability_crawl();" in bootstrap
+    assert "signature: rvbbit.clover_forecast(" in bootstrap
     assert 'RVBBIT_CLOVER_INSTALL_SOURCE:-live' in init
     assert 'CLOVER_INSTALL_SOURCE" = "shipped"' in init
+
+
+def test_operator_capability_documents_are_schema_qualified():
+    migration = (
+        ROOT
+        / "crates"
+        / "pg_rvbbit"
+        / "sql"
+        / "migrations"
+        / "0294_schema_qualified_operator_capabilities.sql"
+    ).read_text(encoding="utf-8")
+    registry = (ROOT / "crates" / "pg_rvbbit" / "src" / "migrations.rs").read_text(
+        encoding="utf-8"
+    )
+
+    assert "CREATE OR REPLACE FUNCTION rvbbit.capability_doc" in migration
+    assert "THEN 'rvbbit.' || p_signature" in migration
+    assert "UPDATE rvbbit.catalog_docs" in migration
+    assert "0294_schema_qualified_operator_capabilities" in registry
 
 
 def test_product_images_and_repository_pin_the_same_rust_toolchain():

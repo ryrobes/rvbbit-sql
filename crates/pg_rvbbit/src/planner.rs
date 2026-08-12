@@ -231,8 +231,27 @@ unsafe fn query_references_system_column(
     if root.is_null() || rel.is_null() || (*root).parse.is_null() {
         return false;
     }
+    // `pull_varattnos` only accepts an expression tree. Passing the Query node
+    // itself trips PostgreSQL's "unplanned subquery" assertion in assert-enabled
+    // builds (including pgrx tests). `pull_vars_of_level` is the query-aware API;
+    // inspect its current-level Vars before using pull_varattnos on the
+    // relation-local expression trees below.
+    let query_vars = pg_sys::pull_vars_of_level((*root).parse as *mut pg_sys::Node, 0);
+    if !query_vars.is_null() {
+        for i in 0..(*query_vars).length {
+            let node = pg_sys::list_nth(query_vars, i) as *mut pg_sys::Node;
+            if !node.is_null() && (*node).type_ == pg_sys::NodeTag::T_Var {
+                let var = node as *mut pg_sys::Var;
+                if (*var).varno == rti as i32 && (*var).varlevelsup == 0 && (*var).varattno < 0 {
+                    pg_sys::list_free(query_vars);
+                    return true;
+                }
+            }
+        }
+        pg_sys::list_free(query_vars);
+    }
+
     let mut attnums: *mut pg_sys::Bitmapset = std::ptr::null_mut();
-    pg_sys::pull_varattnos((*root).parse as *mut pg_sys::Node, rti, &mut attnums);
     // For a relation inside EXISTS/other subqueries, the outer Query tree can
     // carry the Var at a different level. The relation-local planner nodes are
     // already normalized to this `rti`, so inspect them as the authoritative

@@ -97,6 +97,24 @@ def test_capability_search_inherits_the_frozen_subject_without_a_public_argument
     ]
 
 
+def test_operator_discovery_returns_an_executable_schema_qualified_name():
+    match = server._capability_search_match({
+        "kind": "cap_operator",
+        "name": "clover_forecast",
+        "score": 0.4921,
+        "doc": (
+            "capability clover_forecast\n"
+            "kind: cap_operator\n"
+            "signature: clover_forecast(series text, horizon text) → jsonb"
+        ),
+    })
+
+    assert match["name"] == "clover_forecast"
+    assert match["sql_name"] == "rvbbit.clover_forecast"
+    assert "signature: rvbbit.clover_forecast(" in match["doc"]
+    assert match["score"] == 0.492
+
+
 def test_tool_visibility_batches_names_under_the_frozen_subject(monkeypatch):
     class VisibilityConnection(_Connection):
         def execute(self, query, params=None):

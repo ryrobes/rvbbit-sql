@@ -1193,6 +1193,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0293_hosted_onboarding_followthrough",
         include_str!("../sql/migrations/0293_hosted_onboarding_followthrough.sql"),
     ),
+    (
+        "0294_schema_qualified_operator_capabilities",
+        include_str!("../sql/migrations/0294_schema_qualified_operator_capabilities.sql"),
+    ),
 ];
 
 const SCHEMA_MIGRATIONS_DDL: &str = "\

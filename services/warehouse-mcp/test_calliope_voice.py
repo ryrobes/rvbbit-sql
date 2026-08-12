@@ -134,11 +134,67 @@ def test_expressive_instruction_follows_personality_without_a_fixed_tag_script()
     assert "neutral conversational delivery" in fast
 
 
+def test_voice_context_uses_spoken_history_with_canonical_fallback():
+    previous_turns_newest_first = [
+        {
+            "user_message": "What changed after the promotion?",
+            "assistant_message": "The full newest answer with tool detail.",
+            "response_receipt": {
+                "tools": [{"name": "warehouse_query", "arguments": {"secret": "nope"}}],
+                "voice": {"script": "The promotion lifted revenue, but margin softened."},
+            },
+        },
+        {
+            "user_message": "How did the baseline look?",
+            "assistant_message": "The baseline was steady at twelve million dollars.",
+            "response_receipt": {"tools": [{"name": "warehouse_query"}]},
+        },
+        {
+            "user_message": "Start with the quarterly trend.",
+            "assistant_message": "The full oldest answer.",
+            "response_receipt": {
+                "voice": {"script": "Quarterly revenue rose in each of the last three periods."}
+            },
+        },
+    ]
+
+    messages = calliope._voice_context_messages(
+        previous_turns_newest_first,
+        "So what should we do next?",
+    )
+
+    assert messages == [
+        {"role": "user", "content": "Start with the quarterly trend."},
+        {
+            "role": "assistant",
+            "content": "Quarterly revenue rose in each of the last three periods.",
+        },
+        {"role": "user", "content": "How did the baseline look?"},
+        {
+            "role": "assistant",
+            "content": "The baseline was steady at twelve million dollars.",
+        },
+        {"role": "user", "content": "What changed after the promotion?"},
+        {
+            "role": "assistant",
+            "content": "The promotion lifted revenue, but margin softened.",
+        },
+        {"role": "user", "content": "So what should we do next?"},
+    ]
+    assert "warehouse_query" not in json.dumps(messages)
+    assert "full newest answer" not in json.dumps(messages)
+
+
 def test_voice_builder_uses_calliope_chat_without_any_output_cap(monkeypatch, tmp_path):
     captured = {}
     source = "SOURCE_OPEN " + ("source-data " * 2_100) + "FINAL_SOURCE_FACT"
     rewrite = " ".join(f"spoken-fact-{index}" for index in range(180))
     rewrite += " FINAL_SPOKEN_FACT"
+    context = [
+        {"role": "user", "content": "How did the first quarter look?"},
+        {"role": "assistant", "content": "It was strong, with one caveat."},
+        {"role": "user", "content": "What happened next?"},
+    ]
 
     class Response:
         status_code = 200
@@ -184,15 +240,28 @@ def test_voice_builder_uses_calliope_chat_without_any_output_cap(monkeypatch, tm
         "fast",
         "This must not enter fast mode",
         "hosted@example.com",
+        context,
     )
 
     assert captured["url"] == "https://clover.example/v1/chat/completions"
     assert captured["headers"]["Authorization"] == "Bearer clover-secret"
     assert "clover-secret" not in captured["url"]
     assert captured["json"]["model"] == "calliope"
-    assert captured["json"]["messages"][1] == {"role": "user", "content": source}
+    assert captured["json"]["messages"][1:4] == context
+    assert captured["json"]["messages"][4] == {
+        "role": "assistant",
+        "content": source,
+    }
+    assert captured["json"]["messages"][5] == {
+        "role": "user",
+        "content": (
+            "Rewrite Calliope's immediately preceding answer for spoken delivery. "
+            "Return only the words to speak."
+        ),
+    }
     instruction = captured["json"]["messages"][0]["content"]
     assert "Completeness wins over a length target" in instruction
+    assert "Use those earlier messages only for conversational continuity" in instruction
     assert "This must not enter fast mode" not in instruction
     assert "max_tokens" not in captured["json"]
     assert "max_output_tokens" not in captured["json"]
@@ -341,6 +410,9 @@ def test_saved_voice_receipt_keeps_hash_not_browser_personality(monkeypatch, tmp
         def fetchone(self):
             return self.row
 
+        def fetchall(self):
+            return self.row
+
     class Connection:
         def __enter__(self):
             return self
@@ -355,25 +427,37 @@ def test_saved_voice_receipt_keeps_hash_not_browser_personality(monkeypatch, tmp
                 return Result({
                     "id": turn_id,
                     "session_id": session_id,
+                    "ordinal": 4,
+                    "user_message": "Is that improvement durable?",
                     "assistant_message": "Revenue improved, but the result remains preliminary.",
                     "status": "complete",
                     "response_receipt": {"tools": [{"name": "metric", "count": 1}]},
                 })
+            if query.startswith("SELECT user_message"):
+                return Result([{
+                    "user_message": "How is revenue tracking?",
+                    "assistant_message": "Revenue is improving, with one caveat.",
+                    "response_receipt": {
+                        "voice": {"script": "Revenue is up, although the evidence is early."}
+                    },
+                }])
             if query.startswith("UPDATE rvbbit.calliope_turns"):
                 stored["json"] = params[0]
                 stored["params"] = params
                 return Result({"id": turn_id})
             raise AssertionError(query)
 
-    monkeypatch.setattr(
-        calliope,
-        "_generate_voice_script",
-        lambda *_args: (
+    generated = {}
+
+    def generate_voice_script(*args):
+        generated["context"] = args[5]
+        return (
             "Revenue improved, though the result is still preliminary.",
             "clover",
             "calliope",
-        ),
-    )
+        )
+
+    monkeypatch.setattr(calliope, "_generate_voice_script", generate_voice_script)
     config = calliope.CalliopeConfig(
         hermes_url="http://hermes:8642",
         hermes_api_key="hermes-key",
@@ -395,11 +479,21 @@ def test_saved_voice_receipt_keeps_hash_not_browser_personality(monkeypatch, tmp
     )
 
     assert reused is False
-    assert render["version"] == 4
+    assert render["version"] == 5
     assert render["mode"] == "expressive"
     assert render["tts_model"] == "eleven_v3"
     assert render["tts_stability"] == 0.3
     assert "personality_hash" in render
+    assert "context_hash" in render
+    assert render["context_message_count"] == 3
+    assert generated["context"] == [
+        {"role": "user", "content": "How is revenue tracking?"},
+        {
+            "role": "assistant",
+            "content": "Revenue is up, although the evidence is early.",
+        },
+        {"role": "user", "content": "Is that improvement durable?"},
+    ]
     assert render["rewrite_elapsed_ms"] >= 0
     assert "Sound like" not in stored["json"]
     assert json.loads(stored["json"])["script"] == render["script"]

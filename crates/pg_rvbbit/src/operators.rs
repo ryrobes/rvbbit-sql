@@ -969,7 +969,8 @@ fn lookup_cached(hash: &[u8]) -> Option<String> {
     Spi::get_one::<String>(&sql).ok().flatten()
 }
 
-// Receipts are INSERTs, which PG forbids during parallel queries.
+// Receipts are INSERTs, which PG forbids during parallel queries and in the
+// read-only transactions used by governed agent queries.
 // `IsInParallelMode()` is true for BOTH the leader and workers when a
 // parallel scan is active. PG18 keeps it inline-static so pgrx can't
 // link to it. Workaround uses two detectors:
@@ -980,9 +981,8 @@ fn lookup_cached(hash: &[u8]) -> Option<String> {
 //      the leader sets it before launching a parallel query so the
 //      leader's own UDF calls during the parallel scan also skip.
 //
-// The L1 cache still works per-backend; receipts get logged for any
-// non-parallel calls. Worker→leader audit queue is a real follow-up
-// when receipts at scale matter more than maximum parallelism.
+// The L1 cache still works per-backend. Calls that cannot write enqueue a
+// durable receipt for a writable maintenance/companion connection to flush.
 #[allow(non_upper_case_globals)]
 extern "C" {
     static ParallelWorkerNumber: i32;
@@ -1003,18 +1003,29 @@ fn get_skip_receipts() -> bool {
     SKIP_RECEIPTS.with(|c| c.get())
 }
 
+fn delayed_receipt_reason(
+    parallel_worker_number: i32,
+    skip_receipts: bool,
+    transaction_read_only: bool,
+) -> Option<&'static str> {
+    if parallel_worker_number >= 0 {
+        Some("parallel_worker")
+    } else if skip_receipts {
+        Some("skip_receipts")
+    } else if transaction_read_only {
+        Some("read_only_transaction")
+    } else {
+        None
+    }
+}
+
 fn log_receipt(op: &OpDef, hash: &[u8], res: &WorkResult, inputs: &serde_json::Value) {
     let record = crate::costs::record_from_work(op, hash, res, inputs);
     let pwn = unsafe { ParallelWorkerNumber };
-    if pwn >= 0 || SKIP_RECEIPTS.with(|c| c.get()) {
-        if let Err(e) = crate::costs::enqueue_receipt(
-            &record,
-            if pwn >= 0 {
-                "parallel_worker"
-            } else {
-                "skip_receipts"
-            },
-        ) {
+    let skip = SKIP_RECEIPTS.with(|c| c.get());
+    let read_only = unsafe { pgrx::pg_sys::XactReadOnly };
+    if let Some(reason) = delayed_receipt_reason(pwn, skip, read_only) {
+        if let Err(e) = crate::costs::enqueue_receipt(&record, reason) {
             pgrx::warning!("rvbbit: failed to queue delayed receipt: {}", e);
         }
         return;
@@ -1023,6 +1034,28 @@ fn log_receipt(op: &OpDef, hash: &[u8], res: &WorkResult, inputs: &serde_json::V
     if let Err(e) = crate::costs::write_receipt_now(&record, crate::costs::MissingQueryId::Generate)
     {
         pgrx::warning!("rvbbit: failed to log receipt: {}", e);
+    }
+}
+
+#[cfg(test)]
+mod delayed_receipt_tests {
+    use super::delayed_receipt_reason;
+
+    #[test]
+    fn queues_parallel_skipped_and_read_only_receipts() {
+        assert_eq!(
+            delayed_receipt_reason(0, false, false),
+            Some("parallel_worker")
+        );
+        assert_eq!(
+            delayed_receipt_reason(-1, true, false),
+            Some("skip_receipts")
+        );
+        assert_eq!(
+            delayed_receipt_reason(-1, false, true),
+            Some("read_only_transaction")
+        );
+        assert_eq!(delayed_receipt_reason(-1, false, false), None);
     }
 }
 

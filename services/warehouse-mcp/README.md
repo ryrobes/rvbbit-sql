@@ -899,6 +899,10 @@ synthesizing with ElevenLabs v3.
 The semantic rewrite calls Clover's `calliope` chat model directly with the appliance's
 managed Clover credential. It never uses the short-form `rvbbit.clover_llm_apply` operator,
 falls through to `rvbbit.summarize`, or assumes an appliance-local OpenRouter credential.
+For conversational continuity, the rewrite receives the current user message plus at most
+three preceding chat turns as ordinary user/assistant messages. Earlier Calliope turns use
+their saved spoken rendering when one exists and otherwise their complete canonical answer;
+tool calls, artifacts, and receipt payloads are excluded from this voice-only context.
 Warehouse sends no `max_tokens` value. Concision is semantic guidance, not a word, sentence,
 character, source, or expression-tag cutoff: Warehouse preserves the complete Clover rewrite,
 and if Clover reports a length stop or cannot produce one, uses the complete canonical answer

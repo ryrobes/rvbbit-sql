@@ -108,7 +108,9 @@ _DEFAULT_VOICE_PREPARE_TIMEOUT_SECONDS = 30
 _VOICE_SAMPLE_RATE = 24_000
 _VOICE_MODES = {"fast", "expressive"}
 _VOICE_STREAM_PROTOCOL = "timed-pcm-ndjson-v1"
-_VOICE_RENDER_VERSION = 4
+_VOICE_RENDER_VERSION = 5
+_VOICE_CONTEXT_PREVIOUS_TURNS = 3
+_VOICE_CONTEXT_MESSAGE_LIMIT = (_VOICE_CONTEXT_PREVIOUS_TURNS * 2) + 1
 _VOICE_FAST_STABILITY = 0.4
 _DEFAULT_VOICE_EXPRESSIVE_STABILITY = 0.3
 _MAX_VOICE_ALIGNMENT_ENTRIES = 8_000
@@ -1537,6 +1539,9 @@ def _fallback_voice_script(source: str, mode: str) -> str:
 def _voice_rewrite_instruction(mode: str, personality: str) -> str:
     common = (
         "Rewrite the supplied Calliope answer as a concise conversational spoken digest. "
+        "A short user-and-assistant conversation may precede the current answer. Use those earlier "
+        "messages only for conversational continuity, references, and tone; rewrite only Calliope's "
+        "immediately preceding answer, and do not recap old content unless the current answer needs it. "
         "Keep it as brief as the source permits, but use as many complete sentences and words as "
         "needed to preserve every material fact, number, qualification, uncertainty, and warning. "
         "Completeness wins over a length target; never invent, strengthen, or silently omit a claim. "
@@ -1604,12 +1609,70 @@ def _voice_rewrite_content(payload: Any) -> tuple[str, str | None, str | None]:
     )
 
 
+def _voice_context_messages(
+    previous_turns: Any,
+    current_user_message: Any,
+) -> list[dict[str, str]]:
+    """Build a small, ordinary chat window without tool or receipt payloads."""
+    messages: list[dict[str, str]] = []
+    rows = list(previous_turns or [])
+    for row in reversed(rows[-_VOICE_CONTEXT_PREVIOUS_TURNS:]):
+        row = row if isinstance(row, dict) else {}
+        user_message = str(row.get("user_message") or "").strip()
+        if user_message:
+            messages.append({"role": "user", "content": user_message})
+
+        receipt = row.get("response_receipt")
+        receipt = receipt if isinstance(receipt, dict) else {}
+        voice = receipt.get("voice")
+        voice = voice if isinstance(voice, dict) else {}
+        assistant_message = str(
+            voice.get("script") or row.get("assistant_message") or ""
+        ).strip()
+        if assistant_message:
+            messages.append({"role": "assistant", "content": assistant_message})
+
+    current_user = str(current_user_message or "").strip()
+    if current_user:
+        messages.append({"role": "user", "content": current_user})
+    return messages[-_VOICE_CONTEXT_MESSAGE_LIMIT:]
+
+
+def _voice_rewrite_messages(
+    instruction: str,
+    source: str,
+    context_messages: Any,
+) -> list[dict[str, str]]:
+    """Present history and the current answer as normal chat messages."""
+    messages = [{"role": "system", "content": instruction}]
+    for item in list(context_messages or [])[-_VOICE_CONTEXT_MESSAGE_LIMIT:]:
+        item = item if isinstance(item, dict) else {}
+        role = str(item.get("role") or "").strip().lower()
+        content = str(item.get("content") or "").strip()
+        if role in {"user", "assistant"} and content:
+            messages.append({"role": role, "content": content})
+    messages.extend(
+        (
+            {"role": "assistant", "content": source},
+            {
+                "role": "user",
+                "content": (
+                    "Rewrite Calliope's immediately preceding answer for spoken delivery. "
+                    "Return only the words to speak."
+                ),
+            },
+        )
+    )
+    return messages
+
+
 def _generate_voice_script(
     config: CalliopeConfig,
     source: str,
     mode: str,
     personality: str,
     owner: str,
+    context_messages: Any = None,
 ) -> tuple[str, str, str | None]:
     """Create one uncapped Clover chat projection without mutating the answer."""
     source = str(source or "")
@@ -1636,10 +1699,11 @@ def _generate_voice_script(
                     },
                     json={
                         "model": config.voice_rewrite_model,
-                        "messages": [
-                            {"role": "system", "content": instruction},
-                            {"role": "user", "content": source},
-                        ],
+                        "messages": _voice_rewrite_messages(
+                            instruction,
+                            source,
+                            context_messages,
+                        ),
                     },
                 )
             if response.status_code >= 400:
@@ -1680,20 +1744,41 @@ def _voice_turn(
     with conn_factory() as conn:
         _set_voice_statement_timeout(conn, timeout_seconds)
         row = conn.execute(
-            "SELECT t.id,t.session_id,t.assistant_message,t.status,t.response_receipt "
+            "SELECT t.id,t.session_id,t.ordinal,t.user_message,t.assistant_message,"
+            "t.status,t.response_receipt "
             "FROM rvbbit.calliope_turns t "
             "JOIN rvbbit.calliope_sessions s ON s.id=t.session_id "
             "WHERE t.id=%s::uuid AND t.session_id=%s::uuid "
             "AND lower(s.owner_email)=lower(%s)",
             (normalized_turn, normalized_session, owner),
         ).fetchone()
+        previous_turns = []
+        if row:
+            previous_turns = conn.execute(
+                "SELECT user_message,assistant_message,response_receipt "
+                "FROM rvbbit.calliope_turns "
+                "WHERE session_id=%s::uuid AND ordinal < %s "
+                "AND turn_kind='chat' AND status IN ('complete','partial') "
+                "AND assistant_message IS NOT NULL "
+                "ORDER BY ordinal DESC LIMIT %s",
+                (
+                    normalized_session,
+                    int(row.get("ordinal") or 0),
+                    _VOICE_CONTEXT_PREVIOUS_TURNS,
+                ),
+            ).fetchall()
     if not row:
         raise LookupError("That Calliope response is no longer available.")
     if str(row.get("status") or "") not in {"complete", "partial"}:
         raise ValueError("Calliope must finish the response before it can be spoken.")
     if not str(row.get("assistant_message") or "").strip():
         raise ValueError("That response does not contain anything to speak.")
-    return dict(row)
+    turn = dict(row)
+    turn["voice_context"] = _voice_context_messages(
+        previous_turns,
+        turn.get("user_message"),
+    )
+    return turn
 
 
 def _voice_render(
@@ -1716,6 +1801,10 @@ def _voice_render(
         config.voice_prepare_timeout_seconds,
     )
     source = str(turn.get("assistant_message") or "")
+    context_messages = turn.get("voice_context")
+    context_messages = (
+        context_messages if isinstance(context_messages, list) else []
+    )
     personality = (
         _clean_voice_personality(personality_value)
         if mode == "expressive"
@@ -1728,6 +1817,16 @@ def _voice_render(
     )
     source_hash = hashlib.sha256(
         (f"calliope.voice-source.v{_VOICE_RENDER_VERSION}\0" + source).encode("utf-8")
+    ).hexdigest()
+    context_hash = hashlib.sha256(
+        (
+            f"calliope.voice-context.v{_VOICE_RENDER_VERSION}\0"
+            + json.dumps(
+                context_messages,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        ).encode("utf-8")
     ).hexdigest()
     personality_hash = hashlib.sha256(
         (f"calliope.voice-personality.v{_VOICE_RENDER_VERSION}\0" + personality).encode("utf-8")
@@ -1745,6 +1844,7 @@ def _voice_render(
     if (
         str(existing.get("version") or "") == str(_VOICE_RENDER_VERSION)
         and existing.get("source_hash") == source_hash
+        and existing.get("context_hash") == context_hash
         and existing.get("personality_hash") == personality_hash
         and existing.get("mode") == mode
         and existing.get("tts_model") == tts_model
@@ -1762,6 +1862,7 @@ def _voice_render(
         mode,
         personality,
         owner,
+        context_messages,
     )
     rewrite_elapsed_ms = max(0, round((time.monotonic() - rewrite_started) * 1_000))
     if not script:
@@ -1772,6 +1873,8 @@ def _voice_render(
         "mode": mode,
         "script": script,
         "source_hash": source_hash,
+        "context_hash": context_hash,
+        "context_message_count": len(context_messages),
         "personality_hash": personality_hash,
         "rewrite_provider": provider,
         "rewrite_model": rewrite_model,
